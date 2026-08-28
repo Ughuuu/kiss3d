@@ -191,16 +191,21 @@ impl Window {
     }
 
     pub(crate) fn get_egui_modifiers(&self) -> egui::Modifiers {
+        let ctrl = self.get_key(Key::LControl) == Action::Press
+            || self.get_key(Key::RControl) == Action::Press;
+        // On macOS the platform command modifier is the ⌘ (Super) key, which
+        // arrives as LWin/RWin; everywhere else it is Ctrl.
+        let super_down = self.get_key(Key::LWin) == Action::Press
+            || self.get_key(Key::RWin) == Action::Press;
+        let mac_cmd = cfg!(target_os = "macos") && super_down;
         egui::Modifiers {
             alt: self.get_key(Key::LAlt) == Action::Press
                 || self.get_key(Key::RAlt) == Action::Press,
-            ctrl: self.get_key(Key::LControl) == Action::Press
-                || self.get_key(Key::RControl) == Action::Press,
+            ctrl,
             shift: self.get_key(Key::LShift) == Action::Press
                 || self.get_key(Key::RShift) == Action::Press,
-            mac_cmd: false,
-            command: self.get_key(Key::LControl) == Action::Press
-                || self.get_key(Key::RControl) == Action::Press,
+            mac_cmd,
+            command: if cfg!(target_os = "macos") { mac_cmd } else { ctrl },
         }
     }
 
