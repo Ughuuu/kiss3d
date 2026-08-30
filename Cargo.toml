@@ -70,6 +70,12 @@ pollster = "1"
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))'.dependencies]
 rfd = { version = "0.17", optional = true }
 
+# android-activity (under winit) requires the app to pick exactly one glue
+# backend and compiles nothing without it. NativeActivity is the pure-Rust
+# choice: no Java/Gradle subclass needed, same default bevy ships.
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30", features = ["android-native-activity"] }
+
 [target.wasm32-unknown-unknown.dependencies]
 oneshot = { version = "0.2.0", features = ["async"] }
 # We depend on getrandom 0.3 only to enable its wasm_js feature.
