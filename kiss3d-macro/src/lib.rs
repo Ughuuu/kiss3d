@@ -78,6 +78,17 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             ::kiss3d::wasm_bindgen_futures::spawn_local(__kiss3d_async_main())
         }
 
+        // Android never calls fn main: android-activity invokes the
+        // `android_main` symbol on its own thread with the activity handle,
+        // which window creation needs (see kiss3d::window::init_android).
+        // Build the crate as a cdylib for this to be reachable.
+        #[cfg(target_os = "android")]
+        #[no_mangle]
+        fn android_main(app: ::kiss3d::winit::platform::android::activity::AndroidApp) {
+            ::kiss3d::window::init_android(app);
+            ::kiss3d::pollster::block_on(__kiss3d_async_main())
+        }
+
         async fn __kiss3d_async_main() #body
     };
 

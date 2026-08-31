@@ -88,6 +88,35 @@ thread_local! {
     static PENDING_WINDOW_EVENTS: RefCell<std::collections::HashMap<winit::window::WindowId, Vec<PendingEvent>>> = RefCell::new(std::collections::HashMap::new());
 }
 
+// Android lifecycle plumbing. winit can only build an EventLoop from the
+// `AndroidApp` that `android_main` receives, so it is stashed here first
+// (see `init_android`). Resumed/Suspended arrive without a window id, so they
+// are queued here rather than through PENDING_WINDOW_EVENTS; `poll_events`
+// drains them to drop and recreate the surface, whose native window only
+// exists between Resumed and Suspended.
+#[cfg(target_os = "android")]
+thread_local! {
+    static ANDROID_APP: RefCell<Option<winit::platform::android::activity::AndroidApp>> =
+        const { RefCell::new(None) };
+    static LIFECYCLE_EVENTS: RefCell<Vec<LifecycleEvent>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(target_os = "android")]
+#[derive(Clone, Copy, Debug)]
+enum LifecycleEvent {
+    Resumed,
+    Suspended,
+}
+
+/// Stores the `AndroidApp` handle that `android_main` received, so opening a
+/// window can build winit's event loop from it (a bare `EventLoop::new`
+/// panics on Android by design). Must run on the `android_main` thread before
+/// the first window opens; `#[kiss3d::main]` generates exactly that call.
+#[cfg(target_os = "android")]
+pub fn init_android(app: winit::platform::android::activity::AndroidApp) {
+    ANDROID_APP.with(|cell| *cell.borrow_mut() = Some(app));
+}
+
 /// Internal event type that stores both the event data and state updates needed.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug, PartialEq)]
@@ -161,8 +190,62 @@ impl WgpuCanvas {
             EVENT_LOOP.with(|event_loop_cell| {
                 let mut event_loop_opt = event_loop_cell.borrow_mut();
                 if event_loop_opt.is_none() {
-                    *event_loop_opt = Some(EventLoop::new().expect("Failed to create event loop"));
+                    // Android refuses a bare EventLoop::new: the loop must be
+                    // built from android_main's AndroidApp handle.
+                    #[cfg(target_os = "android")]
+                    {
+                        use winit::platform::android::EventLoopBuilderExtAndroid;
+                        let app = ANDROID_APP.with(|cell| cell.borrow().clone()).expect(
+                            "call kiss3d::window::init_android(app) from android_main \
+                             before opening a window (#[kiss3d::main] does this)",
+                        );
+                        *event_loop_opt = Some(
+                            EventLoop::builder()
+                                .with_android_app(app)
+                                .build()
+                                .expect("Failed to create event loop"),
+                        );
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        *event_loop_opt =
+                            Some(EventLoop::new().expect("Failed to create event loop"));
+                    }
                 }
+
+                // Android's native window only exists once the activity is
+                // resumed; a window created before that has no handle wgpu can
+                // make a surface from. Pump until the first Resumed arrives.
+                #[cfg(target_os = "android")]
+                {
+                    use winit::platform::pump_events::EventLoopExtPumpEvents;
+
+                    struct WaitForResume(bool);
+
+                    impl ApplicationHandler for WaitForResume {
+                        fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
+                            self.0 = true;
+                        }
+
+                        fn window_event(
+                            &mut self,
+                            _event_loop: &ActiveEventLoop,
+                            _window_id: winit::window::WindowId,
+                            _event: WinitWindowEvent,
+                        ) {
+                        }
+                    }
+
+                    let event_loop = event_loop_opt.as_mut().unwrap();
+                    let mut waiter = WaitForResume(false);
+                    while !waiter.0 {
+                        let _ = event_loop.pump_app_events(
+                            Some(std::time::Duration::from_millis(16)),
+                            &mut waiter,
+                        );
+                    }
+                }
+
                 let event_loop = event_loop_opt.as_ref().unwrap();
                 #[allow(deprecated)]
                 event_loop
@@ -1008,7 +1091,22 @@ impl WgpuCanvas {
             struct EventCollector;
 
             impl ApplicationHandler for EventCollector {
-                fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+                fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
+                    // Only Android acts on these: its surface dies with the
+                    // activity. Desktop delivers a Resumed at startup and
+                    // nothing on minimize, so there is nothing to do there.
+                    #[cfg(target_os = "android")]
+                    LIFECYCLE_EVENTS.with(|events| {
+                        events.borrow_mut().push(LifecycleEvent::Resumed);
+                    });
+                }
+
+                #[cfg(target_os = "android")]
+                fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+                    LIFECYCLE_EVENTS.with(|events| {
+                        events.borrow_mut().push(LifecycleEvent::Suspended);
+                    });
+                }
 
                 fn window_event(
                     &mut self,
@@ -1121,6 +1219,38 @@ impl WgpuCanvas {
                     let _ = event_loop.pump_app_events(timeout, &mut collector);
                 }
             });
+
+            // Android: the native window lives only between Resumed and
+            // Suspended, so the surface must die and be reborn with it. While
+            // it is gone `get_current_texture` returns None and frames skip.
+            #[cfg(target_os = "android")]
+            {
+                let lifecycle: Vec<LifecycleEvent> =
+                    LIFECYCLE_EVENTS.with(|events| events.borrow_mut().drain(..).collect());
+                for event in lifecycle {
+                    match event {
+                        LifecycleEvent::Suspended => {
+                            self.surface = None;
+                        }
+                        LifecycleEvent::Resumed => {
+                            if self.surface.is_none() {
+                                if let Some(window) = &self.window {
+                                    let ctxt = Context::get();
+                                    let surface = ctxt
+                                        .instance
+                                        .create_surface(window.clone())
+                                        .expect("Failed to recreate surface after resume");
+                                    let size = window.inner_size();
+                                    self.surface_config.width = size.width.max(1);
+                                    self.surface_config.height = size.height.max(1);
+                                    surface.configure(&ctxt.device, &self.surface_config);
+                                    self.surface = Some(surface);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Now process only this window's events
             let events = PENDING_WINDOW_EVENTS.with(|storage| {
