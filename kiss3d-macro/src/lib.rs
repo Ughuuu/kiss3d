@@ -66,10 +66,19 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Generate the expanded code
     let result = quote! {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
         #(#attrs)*
         #vis fn main() {
             ::kiss3d::pollster::block_on(__kiss3d_async_main())
+        }
+
+        // iOS cannot block_on: winit's run_app calls UIApplicationMain, which
+        // owns the main thread and never returns, so the loop drives the
+        // future instead (see kiss3d::window::run_ios).
+        #[cfg(target_os = "ios")]
+        #(#attrs)*
+        #vis fn main() {
+            ::kiss3d::window::run_ios(__kiss3d_async_main())
         }
 
         #[cfg(target_arch = "wasm32")]

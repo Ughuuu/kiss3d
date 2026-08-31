@@ -21,11 +21,11 @@ use super::Window;
 /// Grace period during which the first frame keeps retrying surface acquisition
 /// before giving up. A freshly created window — particularly on macOS — may need
 /// the event loop to be pumped a few times before its surface is presentable.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 const STARTUP_SURFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Delay between surface acquisition attempts while waiting for the first frame.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 const SURFACE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 impl Window {
@@ -1322,6 +1322,12 @@ impl Window {
             }
         }
 
+        // iOS's analogue of the requestAnimationFrame wait above: the app
+        // future is polled once per winit loop turn (see `window::ios`), so
+        // yielding here paces the render loop to one frame per turn.
+        #[cfg(target_os = "ios")]
+        super::ios::next_frame().await;
+
         !self.should_close()
     }
 
@@ -1554,6 +1560,10 @@ impl Window {
             }
         }
 
+        // Same pacing as the rasterizer path: one frame per winit loop turn.
+        #[cfg(target_os = "ios")]
+        super::ios::next_frame().await;
+
         !self.should_close()
     }
 
@@ -1578,10 +1588,13 @@ impl Window {
             return None;
         }
 
-        #[cfg(target_arch = "wasm32")]
+        // On wasm and iOS the loop belongs to the platform, so there is no
+        // pumping it from in here: skip the frame and let the next loop turn
+        // retry instead of sleeping inside a callback.
+        #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
         return None;
 
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
         {
             let deadline = std::time::Instant::now() + STARTUP_SURFACE_TIMEOUT;
             loop {
