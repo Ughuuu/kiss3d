@@ -15,6 +15,10 @@ use std::pin::Pin;
 use std::ptr;
 use std::task::{Context as TaskContext, Poll, Waker};
 
+use objc2::rc::Retained;
+use objc2::{define_class, msg_send, MainThreadMarker, MainThreadOnly};
+use objc2_foundation::{NSObjectProtocol, NSString};
+use objc2_ui_kit::{UIKeyInput, UITextInputTraits, UIView};
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -135,4 +139,107 @@ pub fn run_ios(fut: impl Future<Output = ()> + 'static) {
         started: false,
     };
     let _ = event_loop.run_app(&mut app);
+}
+
+/// Text produced by the system keyboard, drained by `poll_events` into the
+/// regular event stream — typed text reaches the app the same way desktop
+/// typing does.
+pub(crate) enum TextEvent {
+    Char(char),
+    Backspace,
+}
+
+thread_local! {
+    static TEXT_EVENTS: std::cell::RefCell<Vec<TextEvent>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    // The hidden UIKeyInput view, created on the first keyboard request and
+    // kept attached: becoming/resigning first responder is what shows and
+    // hides the keyboard.
+    static KEY_VIEW: std::cell::RefCell<Option<Retained<KeyInputView>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn take_text_events() -> Vec<TextEvent> {
+    TEXT_EVENTS.with(|events| events.borrow_mut().drain(..).collect())
+}
+
+// winit has no IME support on iOS, so the keyboard is summoned the way UIKit
+// intends: only a first responder that adopts UIKeyInput gets one, so a
+// zero-sized subview adopts it and the system delivers typed text to
+// `insertText:`. The view must not be `hidden` — a hidden view is refused
+// first-responder status — but at zero size it draws nothing.
+define_class!(
+    #[unsafe(super(UIView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "Kiss3dKeyInputView"]
+    pub(crate) struct KeyInputView;
+
+    /// UIResponder override: without it the keyboard can never appear.
+    impl KeyInputView {
+        #[unsafe(method(canBecomeFirstResponder))]
+        fn can_become_first_responder(&self) -> bool {
+            true
+        }
+    }
+
+    unsafe impl NSObjectProtocol for KeyInputView {}
+
+    unsafe impl UITextInputTraits for KeyInputView {}
+
+    unsafe impl UIKeyInput for KeyInputView {
+        #[unsafe(method(hasText))]
+        fn has_text(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(insertText:))]
+        fn insert_text(&self, text: &NSString) {
+            TEXT_EVENTS.with(|events| {
+                let mut events = events.borrow_mut();
+                for c in text.to_string().chars() {
+                    events.push(TextEvent::Char(c));
+                }
+            });
+        }
+
+        #[unsafe(method(deleteBackward))]
+        fn delete_backward(&self) {
+            TEXT_EVENTS.with(|events| events.borrow_mut().push(TextEvent::Backspace));
+        }
+    }
+);
+
+/// Show or hide the system keyboard for `window`.
+pub(crate) fn set_keyboard_visible(window: &Window, visible: bool) {
+    use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+
+    // Everything here is UIKit: reachable only from the main thread, which
+    // is the only thread winit callbacks (and therefore the app future) run
+    // on. The guard is belt and braces, not a code path.
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::UiKit(ui_kit) = handle.as_raw() else {
+        return;
+    };
+    // Valid while `window` is alive, which the borrow guarantees.
+    let parent: &UIView = unsafe { ui_kit.ui_view.cast().as_ref() };
+
+    KEY_VIEW.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if visible {
+            let view = cell.get_or_insert_with(|| {
+                let view: Retained<KeyInputView> =
+                    unsafe { msg_send![KeyInputView::alloc(mtm), init] };
+                parent.addSubview(&view);
+                view
+            });
+            unsafe { view.becomeFirstResponder() };
+        } else if let Some(view) = cell.as_ref() {
+            unsafe { view.resignFirstResponder() };
+        }
+    });
 }

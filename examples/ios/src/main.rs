@@ -27,6 +27,8 @@ async fn main() {
     let mut c = scene.add_cube(1.0, 1.0, 1.0).set_color(RED);
     let rot = Quat::from_axis_angle(Vec3::Y, 0.014);
     let mut taps: u32 = 0;
+    let mut text = String::new();
+    let mut keyboard_shown = false;
 
     log::info!("kiss3d ios example: window open, entering render loop");
     while window.render_3d(&mut scene, &mut camera).await {
@@ -37,7 +39,18 @@ async fn main() {
                     taps += 1;
                     log::info!("tap registered: {taps}");
                 }
+                // Focusing this summons the system keyboard (see below); what
+                // it types lands here and in the console.
+                if ui.text_edit_singleline(&mut text).changed() {
+                    log::info!("typed: {text}");
+                }
             });
         });
+        let wants = window.is_egui_capturing_keyboard();
+        if wants != keyboard_shown {
+            keyboard_shown = wants;
+            log::info!("keyboard visible: {wants}");
+            window.set_keyboard_visible(wants);
+        }
     }
 }

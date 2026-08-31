@@ -337,6 +337,15 @@ impl Window {
         self.canvas.set_fullscreen(fullscreen);
     }
 
+    /// Shows or hides the platform's on-screen keyboard.
+    ///
+    /// # Platform-specific
+    /// Android and iOS summon the system keyboard; typed text then arrives as
+    /// ordinary `Char`/`Key` events. Desktop and web are no-ops.
+    pub fn set_keyboard_visible(&self, visible: bool) {
+        self.canvas.set_keyboard_visible(visible);
+    }
+
     /// Whether the window is currently fullscreen.
     pub fn is_fullscreen(&self) -> bool {
         self.canvas.is_fullscreen()

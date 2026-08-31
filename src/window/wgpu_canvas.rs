@@ -1314,6 +1314,30 @@ impl WgpuCanvas {
                 }
             }
 
+            // iOS: text the system keyboard produced (window::ios) joins the
+            // stream as ordinary typing, so text fields cannot tell a soft
+            // keyboard from a hardware one.
+            #[cfg(target_os = "ios")]
+            for text_event in super::ios::take_text_events() {
+                match text_event {
+                    super::ios::TextEvent::Char(c) => {
+                        let _ = self.out_events.send(WindowEvent::Char(c));
+                    }
+                    super::ios::TextEvent::Backspace => {
+                        let _ = self.out_events.send(WindowEvent::Key(
+                            Key::Back,
+                            Action::Press,
+                            Modifiers::empty(),
+                        ));
+                        let _ = self.out_events.send(WindowEvent::Key(
+                            Key::Back,
+                            Action::Release,
+                            Modifiers::empty(),
+                        ));
+                    }
+                }
+            }
+
             // Now process only this window's events
             let events = PENDING_WINDOW_EVENTS.with(|storage| {
                 storage
@@ -1762,6 +1786,34 @@ impl WgpuCanvas {
         if let Some(window) = &self.window {
             window.set_window_icon(Some(icon));
         }
+    }
+
+    /// Show or hide the platform's on-screen keyboard.
+    ///
+    /// Android asks the activity (`show_soft_input`, working since
+    /// android-activity 0.6.1); iOS goes through the hidden UIKeyInput view in
+    /// `window::ios`, since winit has no IME support there. Desktop and web
+    /// no-op: hardware keyboards need no summoning and the browser manages
+    /// its own.
+    pub fn set_keyboard_visible(&self, visible: bool) {
+        #[cfg(target_os = "android")]
+        {
+            ANDROID_APP.with(|app| {
+                if let Some(app) = &*app.borrow() {
+                    if visible {
+                        app.show_soft_input(true);
+                    } else {
+                        app.hide_soft_input(false);
+                    }
+                }
+            });
+        }
+        #[cfg(target_os = "ios")]
+        if let Some(window) = &self.window {
+            super::ios::set_keyboard_visible(window, visible);
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let _ = visible;
     }
 
     /// Enter or leave borderless fullscreen on the current monitor.
