@@ -177,11 +177,28 @@ impl Window {
             WindowEvent::Touch(id, x, y, action, _) => {
                 use crate::event::TouchAction;
 
-                // The first finger down becomes the egui pointer: moved-then-
-                // pressed on Start, released-then-gone on End, so widgets see
-                // the same sequence a mouse would produce.
                 let pos = egui::Pos2::new((x as f32) / scale_factor, (y as f32) / scale_factor);
                 let events = &mut self.egui_context.raw_input.events;
+
+                // Every touch is reported as a raw touch first: egui derives
+                // pinch-zoom and rotate from the full set (MultiTouchInfo), the
+                // same way egui-winit feeds it.
+                events.push(egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(0),
+                    id: egui::TouchId(id),
+                    phase: match action {
+                        TouchAction::Start => egui::TouchPhase::Start,
+                        TouchAction::Move => egui::TouchPhase::Move,
+                        TouchAction::End => egui::TouchPhase::End,
+                        TouchAction::Cancel => egui::TouchPhase::Cancel,
+                    },
+                    pos,
+                    force: None,
+                });
+
+                // The first finger down additionally becomes the egui pointer:
+                // moved-then-pressed on Start, released-then-gone on End, so
+                // widgets see the same sequence a mouse would produce.
                 match action {
                     TouchAction::Start => {
                         if self.egui_context.pointer_touch_id.is_none() {

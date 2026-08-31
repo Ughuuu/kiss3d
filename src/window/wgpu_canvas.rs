@@ -93,6 +93,10 @@ thread_local! {
     // so each window can retrieve only its own events after pump_app_events runs
     // (or, on iOS, after winit's own loop delivers them).
     static PENDING_WINDOW_EVENTS: RefCell<std::collections::HashMap<winit::window::WindowId, Vec<PendingEvent>>> = RefCell::new(std::collections::HashMap::new());
+    // Files dropped onto a window, kept out of PendingEvent because WindowEvent
+    // is Copy and a PathBuf is not. Drained by `take_dropped_files`.
+    static DROPPED_FILES: RefCell<Vec<(winit::window::WindowId, std::path::PathBuf)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 // Android lifecycle plumbing. winit can only build an EventLoop from the
@@ -220,6 +224,10 @@ pub(crate) fn collect_window_event(window_id: winit::window::WindowId, event: Wi
         }
         WinitWindowEvent::ModifiersChanged(new_modifiers) => {
             vec![PendingEvent::Modifiers(new_modifiers.state())]
+        }
+        WinitWindowEvent::DroppedFile(path) => {
+            DROPPED_FILES.with(|dropped| dropped.borrow_mut().push((window_id, path)));
+            vec![]
         }
         _ => vec![],
     };
@@ -1754,6 +1762,48 @@ impl WgpuCanvas {
         if let Some(window) = &self.window {
             window.set_window_icon(Some(icon));
         }
+    }
+
+    /// Enter or leave borderless fullscreen on the current monitor.
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        if let Some(window) = &self.window {
+            let mode = fullscreen.then(|| winit::window::Fullscreen::Borderless(None));
+            window.set_fullscreen(mode);
+        }
+    }
+
+    /// Whether the window is currently fullscreen.
+    pub fn is_fullscreen(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.fullscreen().is_some())
+    }
+
+    /// Files dropped onto the window since the last call, in drop order.
+    /// Always empty on the web: browsers deliver file drops to the page, not
+    /// the canvas, so a web build wanting them needs DOM listeners instead.
+    pub fn take_dropped_files(&self) -> Vec<std::path::PathBuf> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(window_id) = self.window_id else {
+                return Vec::new();
+            };
+            return DROPPED_FILES.with(|dropped| {
+                let mut dropped = dropped.borrow_mut();
+                let mut taken = Vec::new();
+                dropped.retain(|(id, path)| {
+                    if *id == window_id {
+                        taken.push(path.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                taken
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        Vec::new()
     }
 
     /// Set the cursor grabbing behaviour.

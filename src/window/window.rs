@@ -332,6 +332,25 @@ impl Window {
         self.canvas.set_cursor_grab(grab);
     }
 
+    /// Enters or leaves borderless fullscreen on the current monitor.
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        self.canvas.set_fullscreen(fullscreen);
+    }
+
+    /// Whether the window is currently fullscreen.
+    pub fn is_fullscreen(&self) -> bool {
+        self.canvas.is_fullscreen()
+    }
+
+    /// Files dropped onto the window since the last call, in drop order.
+    ///
+    /// # Platform-specific
+    /// Always empty on the web: browsers deliver file drops to the page, not
+    /// the canvas.
+    pub fn dropped_files(&self) -> Vec<std::path::PathBuf> {
+        self.canvas.take_dropped_files()
+    }
+
     /// Sets the cursor position in window coordinates.
     ///
     /// # Arguments
