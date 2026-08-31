@@ -349,27 +349,49 @@ impl WgpuCanvas {
 
             (surface, surface_format)
         } else {
-            // First window - create the full wgpu context
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            });
+            // First window - create the full wgpu context.
+            //
+            // Instance, surface and adapter are requested together because on
+            // Android the backends are tried one at a time: an all-backends
+            // instance creates a Vulkan and a GL surface for the same
+            // ANativeWindow, and vkCreateAndroidSurfaceKHR connects the
+            // window's buffer queue even when the Vulkan adapter turns out
+            // unusable (emulators without GPU passthrough), after which the
+            // GL fallback's eglCreateWindowSurface fails with "already
+            // connected to another API". Separate instances mean the failed
+            // candidate's surface is dropped — and the window disconnected —
+            // before the next backend touches it.
+            let request = |backends| {
+                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends,
+                    ..wgpu::InstanceDescriptor::new_without_display_handle()
+                });
+                let window = window.clone();
+                async move {
+                    let surface = instance.create_surface(window).ok()?;
+                    let adapter = instance
+                        .request_adapter(&wgpu::RequestAdapterOptions {
+                            power_preference: wgpu::PowerPreference::default(),
+                            compatible_surface: Some(&surface),
+                            force_fallback_adapter: false,
+                            apply_limit_buckets: false,
+                        })
+                        .await
+                        .ok()?;
+                    Some((instance, surface, adapter))
+                }
+            };
 
-            // Create surface
-            let surface = instance
-                .create_surface(window.clone())
-                .expect("Failed to create surface");
+            #[cfg(target_os = "android")]
+            let picked = match request(wgpu::Backends::VULKAN).await {
+                Some(picked) => Some(picked),
+                None => request(wgpu::Backends::GL).await,
+            };
+            #[cfg(not(target_os = "android"))]
+            let picked = request(wgpu::Backends::all()).await;
 
-            // Request adapter (async on all platforms)
-            let adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::default(),
-                    compatible_surface: Some(&surface),
-                    force_fallback_adapter: false,
-                    apply_limit_buckets: false,
-                })
-                .await
-                .expect("Failed to find an appropriate adapter");
+            let (instance, surface, adapter) =
+                picked.expect("Failed to create a surface and find an adapter for it");
 
             // Request the adapter's full limits on every platform. The path tracer,
             // the shadow-mapped material, and the storage-backed point/wireframe
@@ -431,8 +453,17 @@ impl WgpuCanvas {
             wgpu::PresentMode::AutoNoVsync
         };
 
+        // COPY_SRC powers surface screenshots, but downlevel surfaces (GLES on
+        // Android) only offer RENDER_ATTACHMENT, and asking for more is a
+        // validation error. Request it only where the surface supports it;
+        // reading the surface back is simply unavailable elsewhere.
+        let mut surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+            surface_usage |= wgpu::TextureUsages::COPY_SRC;
+        }
+
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: surface_usage,
             format: surface_format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width,
@@ -1422,8 +1453,18 @@ impl WgpuCanvas {
     }
 
     /// Copies the surface frame texture into the readback texture for later
-    /// reading via [`read_pixels`](Self::read_pixels).
+    /// reading via [`read_pixels`](Self::read_pixels). A no-op when the
+    /// surface has no `COPY_SRC` usage (downlevel GL; see the surface
+    /// configuration in `open`) — snapshots of on-screen frames are simply
+    /// unavailable there, and attempting the copy is a validation error.
     pub fn copy_frame_to_readback(&self, frame: &wgpu::SurfaceTexture) {
+        if !self
+            .surface_config
+            .usage
+            .contains(wgpu::TextureUsages::COPY_SRC)
+        {
+            return;
+        }
         self.copy_texture_to_readback(&frame.texture);
     }
 
