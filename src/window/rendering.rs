@@ -351,26 +351,27 @@ impl Window {
         // Supply the skybox environment to the default material for image-based
         // lighting (or clear it when no skybox is set).
         {
-            let default_mat = MaterialManager3d::get_global_manager(|mm| mm.get_default());
-            let mut mat = default_mat.borrow_mut();
-            if let Some(env) = self.skybox.ibl_env() {
-                mat.set_environment_lighting(Some(crate::resource::EnvLight {
-                    view: &env.view,
-                    sampler: &env.sampler,
-                    mip_count: env.mip_count,
-                    intensity: self.skybox.intensity(),
-                    rotation: self.skybox.rotation(),
-                }));
-            } else {
-                mat.set_environment_lighting(None);
-            }
+            let env = self.skybox.ibl_env();
+            let intensity = self.skybox.intensity();
+            let rotation = self.skybox.rotation();
+            MaterialManager3d::get_global_manager(|mm| {
+                mm.for_each(|mat| match env {
+                    Some(env) => mat.set_environment_lighting(Some(crate::resource::EnvLight {
+                        view: &env.view,
+                        sampler: &env.sampler,
+                        mip_count: env.mip_count,
+                        intensity,
+                        rotation,
+                    })),
+                    None => mat.set_environment_lighting(None),
+                });
+            });
         }
 
         // Supply the reflection probes (parallax-corrected localized env maps) to
         // the default material, or clear them when none are registered.
         {
-            let default_mat = MaterialManager3d::get_global_manager(|mm| mm.get_default());
-            let mut mat = default_mat.borrow_mut();
+            let mut supply = |mat: &mut (dyn crate::resource::Material3d + 'static)| {
             match self.reflection_probes.as_ref() {
                 Some(probes) if !probes.is_empty() => {
                     let records: Vec<crate::resource::ProbeData> = probes
@@ -394,6 +395,8 @@ impl Window {
                 }
                 _ => mat.set_reflection_probes(None),
             }
+            };
+            MaterialManager3d::get_global_manager(|mm| mm.for_each(&mut supply));
         }
 
         // SSAO / SSR share the geometry G-buffer prepass. Ensure the prepass
@@ -419,13 +422,10 @@ impl Window {
             ssao.resize(w, h);
         }
         {
-            let default_mat = MaterialManager3d::get_global_manager(|mm| mm.get_default());
-            let mut mat = default_mat.borrow_mut();
-            if self.ssao_enabled {
-                mat.set_ssao(Some(self.ssao.as_ref().unwrap().ao_view()));
-            } else {
-                mat.set_ssao(None);
-            }
+            let ao = self
+                .ssao_enabled
+                .then(|| self.ssao.as_ref().unwrap().ao_view());
+            MaterialManager3d::get_global_manager(|mm| mm.for_each(|mat| mat.set_ssao(ao)));
         }
 
         // Create a light collection for this frame
@@ -447,9 +447,9 @@ impl Window {
                 self.probe_capture = Some(crate::renderer::ProbeCapture::new(FACE));
             }
             // Force the non-clustered shading path for the capture frame uniforms.
-            MaterialManager3d::get_global_manager(|mm| mm.get_default())
-                .borrow_mut()
-                .set_capture_mode(true);
+            MaterialManager3d::get_global_manager(|mm| {
+                mm.for_each(|mat| mat.set_capture_mode(true));
+            });
 
             // Each cube face must be its own queue submission. The frame uniform
             // (and the object-uniform buffer) are shared and uploaded with
@@ -724,13 +724,11 @@ impl Window {
                 let lights_buf = clustered.lights_buffer().clone();
                 let grid_buf = clustered.grid_buffer().clone();
                 let index_buf = clustered.index_buffer().clone();
-                let default_mat = MaterialManager3d::get_global_manager(|mm| mm.get_default());
-                default_mat.borrow_mut().set_clustered_buffers(
-                    &lights_buf,
-                    &grid_buf,
-                    &index_buf,
-                    realloc,
-                );
+                MaterialManager3d::get_global_manager(|mm| {
+                    mm.for_each(|mat| {
+                        mat.set_clustered_buffers(&lights_buf, &grid_buf, &index_buf, realloc);
+                    });
+                });
             }
 
             // Phase 3: Render - issue draw calls using a SINGLE render pass.
@@ -1063,11 +1061,11 @@ impl Window {
                         // layers already drawn), then draw this layer sampling it.
                         t.build(&mut encoder, scene_resolved, &mut self.gpu_timer);
                         {
-                            let default_mat =
-                                MaterialManager3d::get_global_manager(|mm| mm.get_default());
-                            default_mat
-                                .borrow_mut()
-                                .set_transmission_background(Some(t.view()));
+                            MaterialManager3d::get_global_manager(|mm| {
+                                mm.for_each(|mat| {
+                                    mat.set_transmission_background(Some(t.view()));
+                                });
+                            });
                         }
                         let glass_ts = self.gpu_timer.render_scope("transmission");
                         let mut glass_pass =
@@ -1725,15 +1723,15 @@ impl Window {
         // Fixed-light path for the capture frames (the mirror camera has no clustered
         // cull data). Reflector surfaces skip themselves during capture (handled in
         // the material via `capture_mode`).
-        MaterialManager3d::get_global_manager(|mm| mm.get_default())
-            .borrow_mut()
-            .set_capture_mode(true);
+        MaterialManager3d::get_global_manager(|mm| {
+            mm.for_each(|mat| mat.set_capture_mode(true));
+        });
 
         for (mut mcam, color_view, depth_view, clip) in jobs {
             // Clip geometry behind this mirror's plane.
-            MaterialManager3d::get_global_manager(|mm| mm.get_default())
-                .borrow_mut()
-                .set_clip_plane(Some(clip));
+            MaterialManager3d::get_global_manager(|mm| {
+                mm.for_each(|mat| mat.set_clip_plane(Some(clip)));
+            });
 
             // Prepare + flush the scene for the mirror camera.
             MaterialManager3d::get_global_manager(|mm| mm.begin_frame());
@@ -1891,10 +1889,9 @@ impl Window {
                 let t = self.transmission.as_ref().unwrap();
                 t.build(&mut menc, &color_view, &mut self.gpu_timer);
                 {
-                    let default_mat = MaterialManager3d::get_global_manager(|mm| mm.get_default());
-                    default_mat
-                        .borrow_mut()
-                        .set_transmission_background(Some(t.view()));
+                    MaterialManager3d::get_global_manager(|mm| {
+                        mm.for_each(|mat| mat.set_transmission_background(Some(t.view())));
+                    });
                 }
                 let glass_ctx = RenderContext {
                     surface_format: crate::post_processing::HDR_FORMAT,
@@ -1944,13 +1941,13 @@ impl Window {
             ctxt.submit(std::iter::once(menc.finish()));
         }
 
-        // Restore the default material's state.
-        {
-            let default_mat = MaterialManager3d::get_global_manager(|mm| mm.get_default());
-            let mut m = default_mat.borrow_mut();
-            m.set_capture_mode(false);
-            m.set_clip_plane(None);
-        }
+        // Restore every material's state.
+        MaterialManager3d::get_global_manager(|mm| {
+            mm.for_each(|mat| {
+                mat.set_capture_mode(false);
+                mat.set_clip_plane(None);
+            });
+        });
 
         // Bump the frame counter so the per-pass loop re-prepares the main camera
         // (reflector objects then pick up the view-proj set on their Reflector above).
