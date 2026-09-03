@@ -371,8 +371,10 @@ impl Window {
         // Supply the reflection probes (parallax-corrected localized env maps) to
         // the default material, or clear them when none are registered.
         {
-            let mut supply = |mat: &mut (dyn crate::resource::Material3d + 'static)| {
-            match self.reflection_probes.as_ref() {
+            let mut supply = |mat: &mut (dyn crate::resource::Material3d + 'static)| match self
+                .reflection_probes
+                .as_ref()
+            {
                 Some(probes) if !probes.is_empty() => {
                     let records: Vec<crate::resource::ProbeData> = probes
                         .probes()
@@ -394,7 +396,6 @@ impl Window {
                     }));
                 }
                 _ => mat.set_reflection_probes(None),
-            }
             };
             MaterialManager3d::get_global_manager(|mm| mm.for_each(&mut supply));
         }

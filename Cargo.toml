@@ -72,7 +72,7 @@ rfd = { version = "0.17", optional = true }
 
 # android-activity (under winit) requires the app to pick exactly one glue
 # backend and compiles nothing without it. NativeActivity is the pure-Rust
-# choice: no Java/Gradle subclass needed, same default bevy ships.
+# choice: no Java/Gradle subclass needed.
 # 0.6.1 minimum: that release fixed show_soft_input on NativeActivity, which
 # `set_keyboard_visible` relies on.
 [target.'cfg(target_os = "android")'.dependencies]

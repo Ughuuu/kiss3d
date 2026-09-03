@@ -1840,7 +1840,7 @@ impl WgpuCanvas {
             let Some(window_id) = self.window_id else {
                 return Vec::new();
             };
-            return DROPPED_FILES.with(|dropped| {
+            DROPPED_FILES.with(|dropped| {
                 let mut dropped = dropped.borrow_mut();
                 let mut taken = Vec::new();
                 dropped.retain(|(id, path)| {
@@ -1852,7 +1852,7 @@ impl WgpuCanvas {
                     }
                 });
                 taken
-            });
+            })
         }
         #[cfg(target_arch = "wasm32")]
         Vec::new()
