@@ -590,7 +590,20 @@ impl WgpuCanvas {
             width,
             height,
             present_mode,
-            alpha_mode: surface_caps.alpha_modes[0],
+            // Opaque wherever the surface offers it. A window on macOS or
+            // Windows lists it first anyway, but a WebGPU canvas lists
+            // premultiplied first, and then the browser composites the page
+            // through every pixel whose alpha the renderer never set — which
+            // is all of them, since the post-processing pass marks empty
+            // background with a = 0 and nothing downstream restores it.
+            alpha_mode: if surface_caps
+                .alpha_modes
+                .contains(&wgpu::CompositeAlphaMode::Opaque)
+            {
+                wgpu::CompositeAlphaMode::Opaque
+            } else {
+                surface_caps.alpha_modes[0]
+            },
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
