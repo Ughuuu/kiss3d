@@ -20,6 +20,9 @@ pub(crate) struct EguiContext {
     /// cursor, so the first finger down plays that role until it lifts;
     /// other fingers are ignored rather than fighting over the pointer.
     pub(crate) pointer_touch_id: Option<u64>,
+    /// What a rerun of the open pass begins with: the pass's input less its
+    /// events, as `Context::run` hands the later passes of a frame.
+    pub(crate) rerun_input: RawInput,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) start_time: std::time::Instant,
 }
@@ -31,6 +34,7 @@ impl EguiContext {
             raw_input: RawInput::default(),
             pass_active: false,
             pointer_touch_id: None,
+            rerun_input: RawInput::default(),
             #[cfg(not(target_arch = "wasm32"))]
             start_time: std::time::Instant::now(),
         }
@@ -369,9 +373,9 @@ impl Window {
     ///
     /// # Note
     /// Only available when the `egui` feature is enabled.
-    pub fn draw_ui<F>(&mut self, ui_fn: F)
+    pub fn draw_ui<F>(&mut self, mut ui_fn: F)
     where
-        F: FnOnce(&egui::Context),
+        F: FnMut(&egui::Context),
     {
         // Open the egui pass lazily so that several `draw_ui` (and
         // `draw_inspector`) calls in the same frame all run their widgets into
@@ -379,11 +383,32 @@ impl Window {
         // `finish_egui_pass`. Beginning a fresh pass per call would have the
         // second call's `end_frame` overwrite the first call's shapes (and the
         // `std::mem::take` below would starve it of input).
-        if !self.egui_context.pass_active {
+        let opened = !self.egui_context.pass_active;
+        if opened {
             self.begin_egui_pass();
         }
 
         ui_fn(self.egui_context.renderer.context());
+
+        // A pass that only learned a size — a new `Area`, which draws none of
+        // itself while it is measured, a `Grid`, a `Resize` — asks to be
+        // discarded and run again before the frame is shown. `Context::run`
+        // does that for its callers; with the pass open here, this does, or
+        // the frame shows the gap. Only the call that opened the pass reruns:
+        // a rerun replays one closure, and an earlier call's shapes are gone.
+        let max_passes = self
+            .egui_context
+            .renderer
+            .context()
+            .options(|options| options.max_passes.get());
+        let mut passes = 1;
+        while opened && passes < max_passes && self.egui_context.renderer.context().will_discard() {
+            self.egui_context
+                .renderer
+                .rerun_frame(self.egui_context.rerun_input.clone());
+            ui_fn(self.egui_context.renderer.context());
+            passes += 1;
+        }
     }
 
     /// Begins a new egui pass, feeding it the events accumulated since the last
@@ -420,7 +445,11 @@ impl Window {
         raw_input.time = time;
         raw_input.predicted_dt = 1.0 / 60.0;
 
-        self.egui_context.renderer.begin_frame(raw_input);
+        // `take` leaves what `Context::run` hands a later pass of the same
+        // frame: the time, and none of the events.
+        let first = raw_input.take();
+        self.egui_context.rerun_input = raw_input;
+        self.egui_context.renderer.begin_frame(first);
         self.egui_context.pass_active = true;
     }
 

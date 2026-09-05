@@ -112,6 +112,21 @@ impl EguiRenderer {
     /// [`egui::TextureId`] that `ui.image((id, size))` can draw — no CPU copy
     /// involved. The texture stays registered until
     /// [`Self::unregister_native_texture`].
+    /// Throw the open pass away and begin it again with `raw_input`, as
+    /// `Context::run` does when a pass asks to be discarded: its shapes are
+    /// dropped, its texture uploads kept (the font atlas may have grown), and
+    /// its pass count carried over so egui knows how many it has run.
+    pub fn rerun_frame(&mut self, raw_input: RawInput) {
+        let output = self.egui_ctx.end_pass();
+        self.textures_delta.append(output.textures_delta);
+        let passes = output.platform_output.num_completed_passes;
+        // `end_pass` took the viewport's output; `will_discard` reads the
+        // count back off the fresh one.
+        self.egui_ctx
+            .output_mut(|output| output.num_completed_passes = passes);
+        self.egui_ctx.begin_pass(raw_input);
+    }
+
     pub fn register_native_texture(
         &mut self,
         view: &wgpu::TextureView,
