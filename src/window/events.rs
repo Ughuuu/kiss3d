@@ -2,7 +2,7 @@
 
 use crate::camera::Camera2d;
 use crate::camera::Camera3d;
-use crate::event::{Action, EventManager, ImeEvent, Key, MouseButton, WindowEvent};
+use crate::event::{Action, EventManager, Key, MouseButton, WindowEvent};
 
 use super::Window;
 
@@ -97,6 +97,7 @@ impl Window {
         let ime = self.canvas.take_ime_events();
         #[cfg(feature = "egui")]
         for event in &ime {
+            use crate::event::ImeEvent;
             // egui counts the caret in characters where winit counts bytes.
             let event = match event {
                 ImeEvent::Preedit { text, cursor } => egui::ImeEvent::Preedit {
