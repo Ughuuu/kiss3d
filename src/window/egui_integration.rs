@@ -377,6 +377,11 @@ impl Window {
     where
         F: FnMut(&egui::Context),
     {
+        // A frame that calls this none of the times shows the last pass's
+        // shapes again, which is what lets a host redraw its UI only when
+        // something changed; the shapes are dropped by the next pass, not by
+        // rendering them (`EguiRenderer::begin_frame`).
+        //
         // Open the egui pass lazily so that several `draw_ui` (and
         // `draw_inspector`) calls in the same frame all run their widgets into
         // the *same* pass. The pass is closed at render time by

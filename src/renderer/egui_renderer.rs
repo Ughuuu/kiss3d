@@ -95,6 +95,10 @@ impl EguiRenderer {
 
     /// Begin a new frame with the given raw input.
     pub fn begin_frame(&mut self, raw_input: RawInput) {
+        // The pass about to run replaces last pass's shapes, so this is where
+        // they are dropped. Not after rendering them: a host that skips a pass
+        // shows the last one again rather than nothing (`Window::draw_ui`).
+        self.shapes.clear();
         self.egui_ctx.begin_pass(raw_input);
     }
 
@@ -240,7 +244,6 @@ impl EguiRenderer {
         }
 
         self.textures_delta.clear();
-        self.shapes.clear();
     }
 }
 
