@@ -94,13 +94,10 @@ impl Window {
 
         unhandled_events.borrow_mut().clear();
         self.canvas.poll_events();
-        // Composed text rides beside the stream: kept for `ime_events`, and
-        // fed to egui, whose text fields compose the same way.
         let ime = self.canvas.take_ime_events();
         #[cfg(feature = "egui")]
         for event in &ime {
-            // egui counts the caret in characters where winit counts bytes;
-            // enabling and disabling it no longer hears.
+            // egui counts the caret in characters where winit counts bytes.
             let event = match event {
                 ImeEvent::Preedit { text, cursor } => egui::ImeEvent::Preedit {
                     text: text.clone(),

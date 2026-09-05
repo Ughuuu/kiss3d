@@ -172,9 +172,7 @@ impl SceneNodeData2d {
         }
     }
 
-    /// Whether any visible object under this node draws with a material
-    /// that reads the screen, which is what decides whether the frame's 2D
-    /// pass has to be split.
+    /// Whether any visible object under this node reads the screen.
     pub fn has_screen_reader(&self) -> bool {
         if !self.visible {
             return false;
@@ -187,12 +185,8 @@ impl SceneNodeData2d {
         self.children.iter().any(|c| c.data().has_screen_reader())
     }
 
-    /// Render the scene graph rooted by this node, splitting the pass around
-    /// every object whose material reads the screen: `begin_pass` opens a
-    /// pass that loads what is there, `copy_screen` refreshes the copy such
-    /// a material samples, and both run between the closed pass and the
-    /// next. Objects before the first reader draw exactly as [`Self::render`]
-    /// draws them.
+    /// [`Self::render`], with the pass closed, `copy_screen` run and a pass
+    /// from `begin_pass` opened before every object whose material reads the screen.
     pub fn render_with_screen(
         &mut self,
         camera: &mut dyn Camera2d,
@@ -238,8 +232,6 @@ impl SceneNodeData2d {
 
         if let Some(ref mut o) = self.object {
             if o.material().borrow().reads_screen() {
-                // Close the pass so the film holds everything drawn so far,
-                // copy it, and open the next pass over the same film.
                 drop(pass.take());
                 copy_screen(encoder);
                 *pass = Some(begin_pass(encoder));

@@ -29,15 +29,17 @@ const STARTUP_SURFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const SURFACE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 impl Window {
-    /// The frame-so-far copy a screen-reading 2D material samples, at the
-    /// film's size; a new texture, and a new generation, when that changes.
+    /// The frame-so-far copy at the film's size; a new generation on resize.
     fn screen_copy_2d(&mut self, width: u32, height: u32) -> &super::window::ScreenCopy2d {
         let stale = self
             .screen_2d
             .as_ref()
             .is_none_or(|copy| copy.width != width || copy.height != height);
         if stale {
-            let generation = self.screen_2d.as_ref().map_or(1, |copy| copy.generation + 1);
+            let generation = self
+                .screen_2d
+                .as_ref()
+                .map_or(1, |copy| copy.generation + 1);
             let texture = Context::get().create_texture(&wgpu::TextureDescriptor {
                 label: Some("2d_screen_copy"),
                 size: wgpu::Extent3d {
@@ -939,9 +941,6 @@ impl Window {
 
         // Render the 2D planar scene (into the HDR film, like the 3D scene).
         {
-            // A material that reads the screen samples a copy of the film
-            // taken just before its object draws, so the pass below is split
-            // around each such object. The copy is made only once asked.
             let reads_screen = scene_2d
                 .as_deref()
                 .is_some_and(|scene| scene.data().has_screen_reader());
@@ -978,8 +977,7 @@ impl Window {
             // exactly as a no-op Load/Store pass would.
             if let Some(scene_2d) = scene_2d {
                 let mut scene2d_ts = self.gpu_timer.render_scope("2d");
-                // One pass over the film, opened again after every screen
-                // copy; only the first carries the timestamps.
+                // Only the first pass over the film carries the timestamps.
                 let mut begin_pass = |encoder: &mut wgpu::CommandEncoder| {
                     encoder
                         .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1008,8 +1006,7 @@ impl Window {
                             .render(camera_2d, &mut render_pass, &context_2d);
                     }
                     Some(screen_view) => {
-                        // Under MSAA a pass with no draws resolves the film
-                        // into the copy; without it the film copies as is.
+                        // MSAA: an empty pass resolves the film into the copy.
                         let mut copy_screen = |encoder: &mut wgpu::CommandEncoder| {
                             if resolve_view.is_some() {
                                 let _resolve =

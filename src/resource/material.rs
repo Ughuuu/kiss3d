@@ -297,13 +297,10 @@ pub struct RenderContext2d {
     pub viewport_width: u32,
     /// The viewport height in pixels.
     pub viewport_height: u32,
-    /// The frame drawn so far, as a single-sample copy of the HDR film in
-    /// linear light, for a material whose [`Material2d::reads_screen`] says
-    /// so. Refreshed just before each such object draws; `None` when nothing
-    /// in the scene reads it.
+    /// The frame so far, a single-sample copy of the HDR film refreshed just
+    /// before each [`Material2d::reads_screen`] object draws; else `None`.
     pub screen: Option<wgpu::TextureView>,
-    /// Counts replacements of `screen` (a resize makes a new texture), so a
-    /// bind group built over it knows when to rebuild.
+    /// Bumped when `screen` is a new texture, so bind groups over it rebuild.
     pub screen_generation: u64,
 }
 
@@ -338,9 +335,8 @@ pub trait Material2d {
     /// Creates per-object GPU data for this material.
     fn create_gpu_data(&self) -> Box<dyn GpuData>;
 
-    /// Whether this material samples [`RenderContext2d::screen`]. The 2D pass
-    /// is split around each object that says so, and the film copied before
-    /// it draws, so the copy holds everything drawn beneath it this frame.
+    /// Whether this material samples [`RenderContext2d::screen`]; the 2D pass
+    /// is split around each object that does, the film copied before it.
     fn reads_screen(&self) -> bool {
         false
     }

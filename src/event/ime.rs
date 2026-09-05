@@ -1,32 +1,23 @@
-//! Composed text input: what an input method editor reports while a word is
-//! being assembled, and what it commits.
-//!
-//! Delivered beside the event stream rather than inside it, as dropped
-//! files are: [`WindowEvent`](super::WindowEvent) is `Copy`, and composed
-//! text is not. Nothing arrives until
-//! [`Window::set_ime_allowed`](crate::window::Window::set_ime_allowed) has
-//! been called with `true`.
+//! Composed text from the platform's input method, delivered beside the
+//! `Copy` event stream as dropped files are.
 
-/// One report from the platform's input method editor.
+/// One report from the input method; nothing arrives until
+/// [`Window::set_ime_allowed`](crate::window::Window::set_ime_allowed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImeEvent {
-    /// The editor took the keyboard: composition may follow.
     Enabled,
-    /// The text being composed so far, with the caret range in bytes of that
-    /// text when the editor places one. Shown in place of nothing; the next
-    /// `Preedit` or a `Commit` replaces it.
+    /// The text composed so far, replacing the last preedit; `cursor` is a
+    /// byte range of it.
     Preedit {
         text: String,
         cursor: Option<(usize, usize)>,
     },
-    /// Composed text the editor settled on: what a text field appends.
+    /// Settled text, to be appended; the preedit is gone.
     Commit(String),
-    /// The editor let go; any preedit shown is withdrawn.
     Disabled,
 }
 
 impl ImeEvent {
-    /// From winit's own report.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn from_winit(ime: winit::event::Ime) -> Self {
         match ime {

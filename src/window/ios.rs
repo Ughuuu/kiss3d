@@ -209,8 +209,7 @@ define_class!(
     }
 );
 
-/// The insets a notch, the status bar and the home indicator take, in
-/// points as `[left, top, right, bottom]`; zeros before the view is laid out.
+/// `[left, top, right, bottom]` in points; zeros before the view is laid out.
 pub(crate) fn safe_area(window: &Window) -> [f64; 4] {
     use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
 

@@ -2,7 +2,7 @@
 
 use egui::RawInput;
 
-use crate::event::{Action, Key, WindowEvent};
+use crate::event::{Action, Modifiers, WindowEvent};
 use crate::renderer::EguiRenderer;
 
 use super::Window;
@@ -34,6 +34,34 @@ impl EguiContext {
             #[cfg(not(target_arch = "wasm32"))]
             start_time: std::time::Instant::now(),
         }
+    }
+}
+
+/// Whether ⌘ (Super) is the platform's command modifier: on macOS, and on
+/// any Apple platform reached through a browser. Everywhere else it is Ctrl.
+fn command_is_super() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        super::wgpu_canvas::apple_platform()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        cfg!(target_os = "macos")
+    }
+}
+
+/// egui's view of the modifiers an event arrived with. Read from the event
+/// rather than from the key states: those are polled once a frame, so a chord
+/// tapped within one frame has already released its modifier by then.
+fn egui_modifiers(modifiers: Modifiers) -> egui::Modifiers {
+    let ctrl = modifiers.contains(Modifiers::Control);
+    let mac_cmd = command_is_super() && modifiers.contains(Modifiers::Super);
+    egui::Modifiers {
+        alt: modifiers.contains(Modifiers::Alt),
+        ctrl,
+        shift: modifiers.contains(Modifiers::Shift),
+        mac_cmd,
+        command: if command_is_super() { mac_cmd } else { ctrl },
     }
 }
 
@@ -134,7 +162,7 @@ impl Window {
                     .events
                     .push(egui::Event::PointerMoved(pos));
             }
-            WindowEvent::MouseButton(button, action, _) => {
+            WindowEvent::MouseButton(button, action, modifiers) => {
                 let button = match button {
                     crate::event::MouseButton::Button1 => egui::PointerButton::Primary,
                     crate::event::MouseButton::Button2 => egui::PointerButton::Secondary,
@@ -157,11 +185,11 @@ impl Window {
                             pos,
                             button,
                             pressed,
-                            modifiers: self.get_egui_modifiers(),
+                            modifiers: egui_modifiers(modifiers),
                         });
                 }
             }
-            WindowEvent::Scroll(x, y, _) => {
+            WindowEvent::Scroll(x, y, modifiers) => {
                 // Use Point unit since kiss3d's scroll values are already scaled
                 // (native multiplies LineDelta by 10, WASM applies various scales)
                 self.egui_context
@@ -171,7 +199,7 @@ impl Window {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::Vec2::new(x as f32, y as f32),
                         phase: egui::TouchPhase::Move,
-                        modifiers: self.get_egui_modifiers(),
+                        modifiers: egui_modifiers(modifiers),
                     });
             }
             WindowEvent::Touch(id, x, y, action, _) => {
@@ -243,41 +271,18 @@ impl Window {
                     .events
                     .push(egui::Event::Text(ch.to_string()));
             }
-            WindowEvent::Key(key, action, _modifiers) => {
+            WindowEvent::Key(key, action, modifiers) => {
                 if let Some(egui_key) = self.translate_key_to_egui(key) {
                     self.egui_context.raw_input.events.push(egui::Event::Key {
                         key: egui_key,
                         physical_key: None,
                         pressed: action == Action::Press,
                         repeat: false,
-                        modifiers: self.get_egui_modifiers(),
+                        modifiers: egui_modifiers(modifiers),
                     });
                 }
             }
             _ => {}
-        }
-    }
-
-    pub(crate) fn get_egui_modifiers(&self) -> egui::Modifiers {
-        let ctrl = self.get_key(Key::LControl) == Action::Press
-            || self.get_key(Key::RControl) == Action::Press;
-        // On macOS the platform command modifier is the ⌘ (Super) key, which
-        // arrives as LWin/RWin; everywhere else it is Ctrl.
-        let super_down =
-            self.get_key(Key::LWin) == Action::Press || self.get_key(Key::RWin) == Action::Press;
-        let mac_cmd = cfg!(target_os = "macos") && super_down;
-        egui::Modifiers {
-            alt: self.get_key(Key::LAlt) == Action::Press
-                || self.get_key(Key::RAlt) == Action::Press,
-            ctrl,
-            shift: self.get_key(Key::LShift) == Action::Press
-                || self.get_key(Key::RShift) == Action::Press,
-            mac_cmd,
-            command: if cfg!(target_os = "macos") {
-                mac_cmd
-            } else {
-                ctrl
-            },
         }
     }
 

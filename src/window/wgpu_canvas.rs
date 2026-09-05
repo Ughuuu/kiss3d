@@ -97,8 +97,7 @@ thread_local! {
     // is Copy and a PathBuf is not. Drained by `take_dropped_files`.
     static DROPPED_FILES: RefCell<Vec<(winit::window::WindowId, std::path::PathBuf)>> =
         const { RefCell::new(Vec::new()) };
-    /// Composed text the input method reported, drained per window each
-    /// frame by `take_ime_events`, as dropped files are.
+    /// Composed text per window, drained by `take_ime_events` like dropped files.
     static IME_EVENTS: RefCell<Vec<(winit::window::WindowId, crate::event::ImeEvent)>> =
         const { RefCell::new(Vec::new()) };
 }
@@ -396,10 +395,11 @@ impl WgpuCanvas {
             let document = web_window.document().expect("Failed to get document");
 
             // Try to find an existing canvas with the configured id, or create one
-            let canvas = document
+            let page_canvas = document
                 .get_element_by_id(&canvas_setup.canvas_id)
-                .and_then(|elem| elem.dyn_into::<web_sys::HtmlCanvasElement>().ok())
-                .unwrap_or_else(|| {
+                .and_then(|elem| elem.dyn_into::<web_sys::HtmlCanvasElement>().ok());
+            let created = page_canvas.is_none();
+            let canvas = page_canvas.unwrap_or_else(|| {
                     // Create a new canvas element
                     let canvas = document
                         .create_element("canvas")
@@ -417,23 +417,27 @@ impl WgpuCanvas {
                     canvas
                 });
 
-            // Style html and body to fill 100%
-            if let Some(html) = document.document_element() {
-                if let Some(html) = html.dyn_ref::<web_sys::HtmlElement>() {
-                    let style = html.style();
+            // A canvas kiss3d had to create is the whole page: size the
+            // document around it. One the page supplied sits in a layout the
+            // page owns, which keeps its margins and its scrolling.
+            if created {
+                if let Some(html) = document.document_element() {
+                    if let Some(html) = html.dyn_ref::<web_sys::HtmlElement>() {
+                        let style = html.style();
+                        let _ = style.set_property("margin", "0");
+                        let _ = style.set_property("padding", "0");
+                        let _ = style.set_property("width", "100%");
+                        let _ = style.set_property("height", "100%");
+                    }
+                }
+                if let Some(body) = document.body() {
+                    let style = body.style();
                     let _ = style.set_property("margin", "0");
                     let _ = style.set_property("padding", "0");
                     let _ = style.set_property("width", "100%");
                     let _ = style.set_property("height", "100%");
+                    let _ = style.set_property("overflow", "hidden");
                 }
-            }
-            if let Some(body) = document.body() {
-                let style = body.style();
-                let _ = style.set_property("margin", "0");
-                let _ = style.set_property("padding", "0");
-                let _ = style.set_property("width", "100%");
-                let _ = style.set_property("height", "100%");
-                let _ = style.set_property("overflow", "hidden");
             }
 
             let window_attrs = window_attrs.with_canvas(Some(canvas));
@@ -599,12 +603,8 @@ impl WgpuCanvas {
             width,
             height,
             present_mode,
-            // Opaque wherever the surface offers it. A window on macOS or
-            // Windows lists it first anyway, but a WebGPU canvas lists
-            // premultiplied first, and then the browser composites the page
-            // through every pixel whose alpha the renderer never set — which
-            // is all of them, since the post-processing pass marks empty
-            // background with a = 0 and nothing downstream restores it.
+            // Opaque where offered: a WebGPU canvas lists premultiplied first,
+            // and the page would show through every pixel left at alpha 0.
             alpha_mode: if surface_caps
                 .alpha_modes
                 .contains(&wgpu::CompositeAlphaMode::Opaque)
@@ -884,6 +884,16 @@ impl WgpuCanvas {
                     pending
                         .borrow_mut()
                         .push(WindowEvent::Key(key, Action::Press, modifiers));
+                    // macOS sends no keyup for a key released while ⌘ is held,
+                    // which would leave it pressed for good: release it now.
+                    if modifiers.contains(Modifiers::Super)
+                        && apple_platform()
+                        && !is_modifier_key(key)
+                    {
+                        pending
+                            .borrow_mut()
+                            .push(WindowEvent::Key(key, Action::Release, modifiers));
+                    }
                     // Emit a Char event for single-character (printable) keys so
                     // egui text fields receive text input. Skip when a command
                     // modifier is held so shortcuts (e.g. Ctrl+A) don't insert text,
@@ -1880,8 +1890,7 @@ impl WgpuCanvas {
         Vec::new()
     }
 
-    /// Composed text the input method reported since the last call, in
-    /// order. Always empty until `set_ime_allowed(true)`.
+    /// Composed text since the last call; empty until `set_ime_allowed(true)`.
     pub fn take_ime_events(&self) -> Vec<crate::event::ImeEvent> {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1903,17 +1912,14 @@ impl WgpuCanvas {
         }
     }
 
-    /// Ask the platform to compose text through its input method: what a
-    /// CJK keyboard needs before it sends anything. Off, keys arrive as plain
-    /// characters only.
+    /// Let the platform compose text through its input method.
     pub fn set_ime_allowed(&self, allowed: bool) {
         if let Some(window) = &self.window {
             window.set_ime_allowed(allowed);
         }
     }
 
-    /// The insets a notch, a status bar or a home indicator take, in pixels
-    /// as `[left, top, right, bottom]`. Zero everywhere but iOS.
+    /// `[left, top, right, bottom]` insets in pixels; zero everywhere but iOS.
     pub fn safe_area(&self) -> [f32; 4] {
         #[cfg(target_os = "ios")]
         {
@@ -2274,6 +2280,34 @@ fn translate_web_mouse_button(button: i16) -> MouseButton {
         4 => MouseButton::Button5,
         _ => MouseButton::Button1,
     }
+}
+
+/// Whether the browser runs on an Apple platform, where ⌘ is the command
+/// key. A page can only tell from the user agent; iPadOS reports itself as a
+/// Mac, which is right, since its keyboards carry ⌘ too.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn apple_platform() -> bool {
+    thread_local! {
+        static APPLE: bool = web_sys::window()
+            .and_then(|w| w.navigator().user_agent().ok())
+            .is_some_and(|ua| ua.contains("Mac"));
+    }
+    APPLE.with(|apple| *apple)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn is_modifier_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::LShift
+            | Key::RShift
+            | Key::LControl
+            | Key::RControl
+            | Key::LAlt
+            | Key::RAlt
+            | Key::LWin
+            | Key::RWin
+    )
 }
 
 #[cfg(target_arch = "wasm32")]

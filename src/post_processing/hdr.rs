@@ -1005,8 +1005,7 @@ impl HdrPipeline {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: HDR_FORMAT,
-            // COPY_SRC: a 2D material reading the screen takes a copy of the
-            // film mid-frame; without MSAA that copy is a plain texture copy.
+            // COPY_SRC: a screen-reading 2D material copies the film mid-frame.
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,

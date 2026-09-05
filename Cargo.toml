@@ -105,6 +105,7 @@ web-sys = { version = "0.3", features = [
     "TouchList",
     "HtmlCanvasElement",
     "HtmlElement",
+    "Navigator",
     "Window",
     "UiEvent",
     "Event",
