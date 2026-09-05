@@ -48,9 +48,25 @@ pub(super) static DEFAULT_SHADOW_RESOLUTION: u32 = 2048u32;
 /// Structure representing a window and a 3D scene.
 ///
 /// This is the main interface with the 3d engine.
+/// The single-sample copy of the HDR film that a 2D material reading the
+/// screen samples, with the generation a bind group over it compares.
+pub(super) struct ScreenCopy2d {
+    /// The view keeps its texture alive; a copy reaches it through the view.
+    pub(super) view: wgpu::TextureView,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) generation: u64,
+}
+
 pub struct Window {
     pub(super) events: Rc<Receiver<WindowEvent>>,
     pub(super) unhandled_events: Rc<RefCell<Vec<WindowEvent>>>,
+    /// This frame's composed-text reports, drained from the canvas once per
+    /// frame and kept for `ime_events`.
+    pub(super) ime_events: Rc<RefCell<Vec<crate::event::ImeEvent>>>,
+    /// The frame-so-far copy a screen-reading 2D material samples: made on
+    /// the first frame something asks, remade when the film changes size.
+    pub(super) screen_2d: Option<ScreenCopy2d>,
     pub(super) ambient_intensity: f32,
     pub(super) ambient_color: Color,
     pub(super) fog: crate::light::Fog,
@@ -358,6 +374,26 @@ impl Window {
     /// the canvas.
     pub fn dropped_files(&self) -> Vec<std::path::PathBuf> {
         self.canvas.take_dropped_files()
+    }
+
+    /// Composed text the input method reported this frame, in order: the
+    /// preedit as it changes and the text it commits. Empty until
+    /// [`Self::set_ime_allowed`] has been called with `true`. egui text
+    /// fields hear the same events on their own.
+    pub fn ime_events(&self) -> Vec<crate::event::ImeEvent> {
+        self.ime_events.borrow().clone()
+    }
+
+    /// Let the platform compose text through its input method, so a CJK
+    /// keyboard reaches text fields; a hardware keyboard is unaffected.
+    pub fn set_ime_allowed(&self, allowed: bool) {
+        self.canvas.set_ime_allowed(allowed);
+    }
+
+    /// The insets a notch, a status bar or a home indicator take, in pixels
+    /// as `[left, top, right, bottom]`. Zero everywhere but iOS.
+    pub fn safe_area(&self) -> [f32; 4] {
+        self.canvas.safe_area()
     }
 
     /// Sets the cursor position in window coordinates.
@@ -1030,6 +1066,8 @@ impl Window {
             canvas,
             events: Rc::new(event_receive),
             unhandled_events: Rc::new(RefCell::new(Vec::new())),
+            ime_events: Rc::new(RefCell::new(Vec::new())),
+            screen_2d: None,
             ambient_intensity: 0.2,
             ambient_color: crate::color::WHITE,
             fog: crate::light::Fog::default(),
@@ -1116,6 +1154,8 @@ impl Window {
             canvas,
             events: Rc::new(event_receive),
             unhandled_events: Rc::new(RefCell::new(Vec::new())),
+            ime_events: Rc::new(RefCell::new(Vec::new())),
+            screen_2d: None,
             ambient_intensity: 0.2,
             ambient_color: crate::color::WHITE,
             fog: crate::light::Fog::default(),

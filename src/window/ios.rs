@@ -209,6 +209,26 @@ define_class!(
     }
 );
 
+/// The insets a notch, the status bar and the home indicator take, in
+/// points as `[left, top, right, bottom]`; zeros before the view is laid out.
+pub(crate) fn safe_area(window: &Window) -> [f64; 4] {
+    use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+
+    if MainThreadMarker::new().is_none() {
+        return [0.0; 4];
+    }
+    let Ok(handle) = window.window_handle() else {
+        return [0.0; 4];
+    };
+    let RawWindowHandle::UiKit(ui_kit) = handle.as_raw() else {
+        return [0.0; 4];
+    };
+    // Valid while `window` is alive, which the borrow guarantees.
+    let view: &UIView = unsafe { ui_kit.ui_view.cast().as_ref() };
+    let insets = view.safeAreaInsets();
+    [insets.left, insets.top, insets.right, insets.bottom]
+}
+
 /// Show or hide the system keyboard for `window`.
 pub(crate) fn set_keyboard_visible(window: &Window, visible: bool) {
     use wgpu::rwh::{HasWindowHandle, RawWindowHandle};

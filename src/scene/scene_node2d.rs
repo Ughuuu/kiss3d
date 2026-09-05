@@ -172,6 +172,105 @@ impl SceneNodeData2d {
         }
     }
 
+    /// Whether any visible object under this node draws with a material
+    /// that reads the screen, which is what decides whether the frame's 2D
+    /// pass has to be split.
+    pub fn has_screen_reader(&self) -> bool {
+        if !self.visible {
+            return false;
+        }
+        if let Some(o) = &self.object {
+            if o.material().borrow().reads_screen() {
+                return true;
+            }
+        }
+        self.children.iter().any(|c| c.data().has_screen_reader())
+    }
+
+    /// Render the scene graph rooted by this node, splitting the pass around
+    /// every object whose material reads the screen: `begin_pass` opens a
+    /// pass that loads what is there, `copy_screen` refreshes the copy such
+    /// a material samples, and both run between the closed pass and the
+    /// next. Objects before the first reader draw exactly as [`Self::render`]
+    /// draws them.
+    pub fn render_with_screen(
+        &mut self,
+        camera: &mut dyn Camera2d,
+        encoder: &mut wgpu::CommandEncoder,
+        context: &RenderContext2d,
+        begin_pass: &mut dyn FnMut(&mut wgpu::CommandEncoder) -> wgpu::RenderPass<'static>,
+        copy_screen: &mut dyn FnMut(&mut wgpu::CommandEncoder),
+    ) {
+        if !self.visible {
+            return;
+        }
+        let mut pass = Some(begin_pass(encoder));
+        self.do_render_with_screen(
+            Pose2::IDENTITY,
+            Vec2::ONE,
+            camera,
+            encoder,
+            &mut pass,
+            context,
+            begin_pass,
+            copy_screen,
+        );
+        drop(pass);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn do_render_with_screen(
+        &mut self,
+        transform: Pose2,
+        scale: Vec2,
+        camera: &mut dyn Camera2d,
+        encoder: &mut wgpu::CommandEncoder,
+        pass: &mut Option<wgpu::RenderPass<'static>>,
+        context: &RenderContext2d,
+        begin_pass: &mut dyn FnMut(&mut wgpu::CommandEncoder) -> wgpu::RenderPass<'static>,
+        copy_screen: &mut dyn FnMut(&mut wgpu::CommandEncoder),
+    ) {
+        if !self.up_to_date {
+            self.up_to_date = true;
+            self.world_transform = transform * self.local_transform;
+            self.world_scale = scale * self.local_scale;
+        }
+
+        if let Some(ref mut o) = self.object {
+            if o.material().borrow().reads_screen() {
+                // Close the pass so the film holds everything drawn so far,
+                // copy it, and open the next pass over the same film.
+                drop(pass.take());
+                copy_screen(encoder);
+                *pass = Some(begin_pass(encoder));
+            }
+            let render_pass = pass.as_mut().expect("a pass is open between splits");
+            o.render(
+                self.world_transform,
+                self.world_scale,
+                camera,
+                render_pass,
+                context,
+            )
+        }
+
+        for c in self.children.iter_mut() {
+            let mut bc = c.data_mut();
+            if bc.visible {
+                bc.do_render_with_screen(
+                    self.world_transform,
+                    self.world_scale,
+                    camera,
+                    encoder,
+                    pass,
+                    context,
+                    begin_pass,
+                    copy_screen,
+                )
+            }
+        }
+    }
+
     /// A reference to the object possibly contained by this node.
     #[inline]
     pub fn object(&self) -> Option<&Object2d> {

@@ -97,6 +97,10 @@ thread_local! {
     // is Copy and a PathBuf is not. Drained by `take_dropped_files`.
     static DROPPED_FILES: RefCell<Vec<(winit::window::WindowId, std::path::PathBuf)>> =
         const { RefCell::new(Vec::new()) };
+    /// Composed text the input method reported, drained per window each
+    /// frame by `take_ime_events`, as dropped files are.
+    static IME_EVENTS: RefCell<Vec<(winit::window::WindowId, crate::event::ImeEvent)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 // Android lifecycle plumbing. winit can only build an EventLoop from the
@@ -227,6 +231,11 @@ pub(crate) fn collect_window_event(window_id: winit::window::WindowId, event: Wi
         }
         WinitWindowEvent::DroppedFile(path) => {
             DROPPED_FILES.with(|dropped| dropped.borrow_mut().push((window_id, path)));
+            vec![]
+        }
+        WinitWindowEvent::Ime(ime) => {
+            let event = crate::event::ImeEvent::from_winit(ime);
+            IME_EVENTS.with(|events| events.borrow_mut().push((window_id, event)));
             vec![]
         }
         _ => vec![],
@@ -1869,6 +1878,55 @@ impl WgpuCanvas {
         }
         #[cfg(target_arch = "wasm32")]
         Vec::new()
+    }
+
+    /// Composed text the input method reported since the last call, in
+    /// order. Always empty until `set_ime_allowed(true)`.
+    pub fn take_ime_events(&self) -> Vec<crate::event::ImeEvent> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(window) = &self.window else {
+                return Vec::new();
+            };
+            let id = window.id();
+            IME_EVENTS.with(|events| {
+                let mut events = events.borrow_mut();
+                let (mine, others): (Vec<_>, Vec<_>) =
+                    events.drain(..).partition(|(window, _)| *window == id);
+                *events = others;
+                mine.into_iter().map(|(_, event)| event).collect()
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Vec::new()
+        }
+    }
+
+    /// Ask the platform to compose text through its input method: what a
+    /// CJK keyboard needs before it sends anything. Off, keys arrive as plain
+    /// characters only.
+    pub fn set_ime_allowed(&self, allowed: bool) {
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(allowed);
+        }
+    }
+
+    /// The insets a notch, a status bar or a home indicator take, in pixels
+    /// as `[left, top, right, bottom]`. Zero everywhere but iOS.
+    pub fn safe_area(&self) -> [f32; 4] {
+        #[cfg(target_os = "ios")]
+        {
+            let Some(window) = &self.window else {
+                return [0.0; 4];
+            };
+            let scale = window.scale_factor();
+            super::ios::safe_area(window).map(|points| (points * scale) as f32)
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            [0.0; 4]
+        }
     }
 
     /// Set the cursor grabbing behaviour.

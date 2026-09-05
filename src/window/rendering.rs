@@ -29,6 +29,42 @@ const STARTUP_SURFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const SURFACE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 impl Window {
+    /// The frame-so-far copy a screen-reading 2D material samples, at the
+    /// film's size; a new texture, and a new generation, when that changes.
+    fn screen_copy_2d(&mut self, width: u32, height: u32) -> &super::window::ScreenCopy2d {
+        let stale = self
+            .screen_2d
+            .as_ref()
+            .is_none_or(|copy| copy.width != width || copy.height != height);
+        if stale {
+            let generation = self.screen_2d.as_ref().map_or(1, |copy| copy.generation + 1);
+            let texture = Context::get().create_texture(&wgpu::TextureDescriptor {
+                label: Some("2d_screen_copy"),
+                size: wgpu::Extent3d {
+                    width: width.max(1),
+                    height: height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: crate::post_processing::HDR_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.screen_2d = Some(super::window::ScreenCopy2d {
+                view,
+                width,
+                height,
+                generation,
+            });
+        }
+        self.screen_2d.as_ref().expect("the copy was just made")
+    }
+
     /// Renders one frame of a 3D scene.
     ///
     /// This is the main rendering function that should be called in your render loop.
@@ -903,11 +939,25 @@ impl Window {
 
         // Render the 2D planar scene (into the HDR film, like the 3D scene).
         {
+            // A material that reads the screen samples a copy of the film
+            // taken just before its object draws, so the pass below is split
+            // around each such object. The copy is made only once asked.
+            let reads_screen = scene_2d
+                .as_deref()
+                .is_some_and(|scene| scene.data().has_screen_reader());
+            let (screen_view, screen_generation) = if reads_screen {
+                let copy = self.screen_copy_2d(w, h);
+                (Some(copy.view.clone()), copy.generation)
+            } else {
+                (None, 0)
+            };
             let context_2d = RenderContext2d {
                 surface_format: Context::render_format(),
                 sample_count,
                 viewport_width: w,
                 viewport_height: h,
+                screen: screen_view.clone(),
+                screen_generation,
             };
 
             // Clear material buffers for the new frame
@@ -927,27 +977,81 @@ impl Window {
             // bandwidth — and skipping it leaves the film's contents untouched,
             // exactly as a no-op Load/Store pass would.
             if let Some(scene_2d) = scene_2d {
-                let scene2d_ts = self.gpu_timer.render_scope("2d");
-                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("2d_scene_render_pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &color_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: scene2d_ts,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-
-                scene_2d
-                    .data_mut()
-                    .render(camera_2d, &mut render_pass, &context_2d);
+                let mut scene2d_ts = self.gpu_timer.render_scope("2d");
+                // One pass over the film, opened again after every screen
+                // copy; only the first carries the timestamps.
+                let mut begin_pass = |encoder: &mut wgpu::CommandEncoder| {
+                    encoder
+                        .begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("2d_scene_render_pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &color_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: scene2d_ts.take(),
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        })
+                        .forget_lifetime()
+                };
+                match screen_view {
+                    None => {
+                        let mut render_pass = begin_pass(&mut encoder);
+                        scene_2d
+                            .data_mut()
+                            .render(camera_2d, &mut render_pass, &context_2d);
+                    }
+                    Some(screen_view) => {
+                        // Under MSAA a pass with no draws resolves the film
+                        // into the copy; without it the film copies as is.
+                        let mut copy_screen = |encoder: &mut wgpu::CommandEncoder| {
+                            if resolve_view.is_some() {
+                                let _resolve =
+                                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("2d_screen_copy_resolve"),
+                                        color_attachments: &[Some(
+                                            wgpu::RenderPassColorAttachment {
+                                                view: &color_view,
+                                                resolve_target: Some(&screen_view),
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Load,
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                                depth_slice: None,
+                                            },
+                                        )],
+                                        depth_stencil_attachment: None,
+                                        timestamp_writes: None,
+                                        occlusion_query_set: None,
+                                        multiview_mask: None,
+                                    });
+                            } else {
+                                encoder.copy_texture_to_texture(
+                                    color_view.texture().as_image_copy(),
+                                    screen_view.texture().as_image_copy(),
+                                    wgpu::Extent3d {
+                                        width: w,
+                                        height: h,
+                                        depth_or_array_layers: 1,
+                                    },
+                                );
+                            }
+                        };
+                        scene_2d.data_mut().render_with_screen(
+                            camera_2d,
+                            &mut encoder,
+                            &context_2d,
+                            &mut begin_pass,
+                            &mut copy_screen,
+                        );
+                    }
+                }
             }
 
             // Polylines and points render on top of surfaces (into the HDR film).

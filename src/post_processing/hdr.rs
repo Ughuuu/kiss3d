@@ -1005,7 +1005,11 @@ impl HdrPipeline {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            // COPY_SRC: a 2D material reading the screen takes a copy of the
+            // film mid-frame; without MSAA that copy is a plain texture copy.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let scene_view = scene_texture.create_view(&wgpu::TextureViewDescriptor::default());
