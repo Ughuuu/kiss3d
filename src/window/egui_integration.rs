@@ -2,7 +2,7 @@
 
 use egui::RawInput;
 
-use crate::event::{Action, Modifiers, WindowEvent};
+use crate::event::{Action, Key, Modifiers, WindowEvent};
 use crate::renderer::EguiRenderer;
 
 use super::Window;

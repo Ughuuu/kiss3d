@@ -400,22 +400,22 @@ impl WgpuCanvas {
                 .and_then(|elem| elem.dyn_into::<web_sys::HtmlCanvasElement>().ok());
             let created = page_canvas.is_none();
             let canvas = page_canvas.unwrap_or_else(|| {
-                    // Create a new canvas element
-                    let canvas = document
-                        .create_element("canvas")
-                        .expect("Failed to create canvas element")
-                        .dyn_into::<web_sys::HtmlCanvasElement>()
-                        .expect("Failed to cast to HtmlCanvasElement");
-                    canvas.set_id(&canvas_setup.canvas_id);
+                // Create a new canvas element
+                let canvas = document
+                    .create_element("canvas")
+                    .expect("Failed to create canvas element")
+                    .dyn_into::<web_sys::HtmlCanvasElement>()
+                    .expect("Failed to cast to HtmlCanvasElement");
+                canvas.set_id(&canvas_setup.canvas_id);
 
-                    // Append to body
-                    if let Some(body) = document.body() {
-                        body.append_child(&canvas)
-                            .expect("Failed to append canvas to body");
-                    }
+                // Append to body
+                if let Some(body) = document.body() {
+                    body.append_child(&canvas)
+                        .expect("Failed to append canvas to body");
+                }
 
-                    canvas
-                });
+                canvas
+            });
 
             // A canvas kiss3d had to create is the whole page: size the
             // document around it. One the page supplied sits in a layout the
@@ -890,9 +890,11 @@ impl WgpuCanvas {
                         && apple_platform()
                         && !is_modifier_key(key)
                     {
-                        pending
-                            .borrow_mut()
-                            .push(WindowEvent::Key(key, Action::Release, modifiers));
+                        pending.borrow_mut().push(WindowEvent::Key(
+                            key,
+                            Action::Release,
+                            modifiers,
+                        ));
                     }
                     // Emit a Char event for single-character (printable) keys so
                     // egui text fields receive text input. Skip when a command
