@@ -281,8 +281,11 @@ pub struct WgpuCanvas {
     msaa_view: Option<wgpu::TextureView>,
     /// Number of samples for MSAA
     sample_count: u32,
-    /// Texture for reading back pixels (for screenshots)
-    readback_texture: wgpu::Texture,
+    /// Texture for reading back pixels (for screenshots), made on the first
+    /// capture. It is as large as the surface, and a run that never takes a
+    /// shot never pays for it; a resize drops it rather than rebuilding one
+    /// nothing has asked for.
+    readback_texture: std::cell::RefCell<Option<wgpu::Texture>>,
     /// Staging buffer reused across `read_pixels` calls, grown on demand, so
     /// per-frame capture doesn't allocate (and free) a GPU buffer every call.
     screenshot_staging: RefCell<Option<wgpu::Buffer>>,
@@ -637,9 +640,8 @@ impl WgpuCanvas {
             (None, None)
         };
 
-        // Create readback texture for screenshots
-        let readback_texture =
-            Self::create_readback_texture(&ctxt.device, width, height, surface_format);
+        // The readback texture is built on the first capture, not here.
+        let readback_texture = std::cell::RefCell::new(None);
 
         // Set up WASM event listeners
         #[cfg(target_arch = "wasm32")]
@@ -1045,8 +1047,7 @@ impl WgpuCanvas {
         } else {
             (None, None)
         };
-        let readback_texture =
-            Self::create_readback_texture(&ctxt.device, width, height, surface_format);
+        let readback_texture = std::cell::RefCell::new(None);
 
         WgpuCanvas {
             window: None,
@@ -1135,8 +1136,8 @@ impl WgpuCanvas {
             self.msaa_view = Some(msaa_view);
         }
 
-        self.readback_texture =
-            Self::create_readback_texture(&ctxt.device, width, height, self.surface_config.format);
+        // Dropped, not rebuilt: the next capture makes one at the new size.
+        self.readback_texture.replace(None);
     }
 
     /// Changes the MSAA sample count, recreating the size-dependent attachments
@@ -1233,6 +1234,22 @@ impl WgpuCanvas {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         (texture, view)
+    }
+
+    /// The readback texture, built at the surface's current size the first
+    /// time a capture asks for it. Cloning is cheap: a `wgpu::Texture` is a
+    /// handle.
+    fn readback_texture(&self) -> wgpu::Texture {
+        let mut slot = self.readback_texture.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Self::create_readback_texture(
+                &Context::get().device,
+                self.surface_config.width,
+                self.surface_config.height,
+                self.surface_config.format,
+            ));
+        }
+        slot.as_ref().expect("just built").clone()
     }
 
     fn create_readback_texture(
@@ -1434,13 +1451,9 @@ impl WgpuCanvas {
                             self.msaa_view = Some(new_msaa_view);
                         }
 
-                        // Recreate readback texture
-                        self.readback_texture = Self::create_readback_texture(
-                            &ctxt.device,
-                            width,
-                            height,
-                            self.surface_config.format,
-                        );
+                        // Dropped, not rebuilt: the next capture makes one
+                        // at the new size.
+                        self.readback_texture.replace(None);
                     }
                 }
             }
@@ -1487,13 +1500,9 @@ impl WgpuCanvas {
                     self.msaa_view = Some(new_msaa_view);
                 }
 
-                // Recreate readback texture
-                self.readback_texture = Self::create_readback_texture(
-                    &ctxt.device,
-                    current_size.width,
-                    current_size.height,
-                    self.surface_config.format,
-                );
+                // Dropped, not rebuilt: the next capture makes one at the
+                // new size.
+                self.readback_texture.replace(None);
 
                 let _ = self.out_events.send(WindowEvent::FramebufferSize(
                     current_size.width,
@@ -1576,7 +1585,7 @@ impl WgpuCanvas {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyTextureInfo {
-                texture: &self.readback_texture,
+                texture: &self.readback_texture(),
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -1647,7 +1656,7 @@ impl WgpuCanvas {
 
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.readback_texture,
+                texture: &self.readback_texture(),
                 mip_level: 0,
                 origin: wgpu::Origin3d {
                     x: x as u32,
