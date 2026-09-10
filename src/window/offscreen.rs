@@ -118,6 +118,26 @@ impl OffscreenSurface {
             .await;
     }
 
+    /// Renders one frame through both post-processing chains: `film` on the HDR
+    /// film before bloom and the tonemap, `post` on the LDR image after them.
+    /// See [`Window::render_chains`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn render_chains(
+        &mut self,
+        scene: Option<&mut SceneNode3d>,
+        scene_2d: Option<&mut SceneNode2d>,
+        camera: Option<&mut dyn Camera3d>,
+        camera_2d: Option<&mut dyn Camera2d>,
+        renderer: Option<&mut dyn Renderer3d>,
+        film: &mut [&mut dyn PostProcessingEffect],
+        post: &mut [&mut dyn PostProcessingEffect],
+    ) {
+        let _ = self
+            .window
+            .render_chains(scene, scene_2d, camera, camera_2d, renderer, film, post)
+            .await;
+    }
+
     /// Renders one path-traced frame into the off-screen texture.
     ///
     /// Call repeatedly with the same [`RayTracer`] to accumulate samples (the
