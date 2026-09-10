@@ -11,8 +11,8 @@ use crate::prelude::FixedView2d;
 use crate::renderer::timings::{CpuTimer, RenderTimings};
 use crate::renderer::{RayTracer, Renderer3d};
 use crate::resource::{
-    MaterialManager2d, MaterialManager3d, RenderContext, RenderContext2d, RenderContext2dEncoder,
-    RenderPhase, RenderTarget,
+    MaterialManager2d, MaterialManager3d, OffscreenBuffers, RenderContext, RenderContext2d,
+    RenderContext2dEncoder, RenderPhase, RenderTarget,
 };
 use crate::scene::{SceneNode2d, SceneNode3d};
 
@@ -65,6 +65,27 @@ impl Window {
             });
         }
         self.screen_2d.as_ref().expect("the copy was just made")
+    }
+
+    /// The film-stage ping-pong pair at [`HDR_FORMAT`](crate::post_processing::HDR_FORMAT),
+    /// made the first frame a film chain is passed and resized with the window
+    /// after that. A run that never passes one allocates neither.
+    fn ensure_film_targets(&mut self, width: u32, height: u32) {
+        let format = crate::post_processing::HDR_FORMAT;
+        match &mut self.film_render_targets {
+            Some((a, b)) => {
+                a.resize(width, height, format);
+                b.resize(width, height, format);
+            }
+            None => {
+                let make = || {
+                    RenderTarget::Offscreen(Box::new(OffscreenBuffers::new(
+                        width, height, format, false,
+                    )))
+                };
+                self.film_render_targets = Some((make(), make()));
+            }
+        }
     }
 
     /// Renders one frame of a 3D scene.
@@ -354,10 +375,7 @@ impl Window {
         self.post_process_render_target_b
             .resize(w, h, self.canvas.surface_format());
         if !film_processing.is_empty() {
-            self.film_render_target
-                .resize(w, h, crate::post_processing::HDR_FORMAT);
-            self.film_render_target_b
-                .resize(w, h, crate::post_processing::HDR_FORMAT);
+            self.ensure_film_targets(w, h);
         }
         if offscreen {
             if self.offscreen_output_target.is_none() {
@@ -1345,47 +1363,37 @@ impl Window {
         // The film-stage chain, before bloom and the tonemap: a pass listed there
         // works in linear light, and what it writes is what blooms. The film is
         // copied into A because an effect reads a `RenderTarget` and the film is
-        // not one; from there the pair ping-pongs as the LDR chain does.
-        let film_view = if film_processing.is_empty() {
-            None
-        } else {
-            let film = self.hdr.scene_resolved_view().clone();
-            Self::seed_film(
-                &mut encoder,
-                self.hdr.scene_texture(),
-                &self.film_render_target,
-                w,
-                h,
-            );
-            let mut input_is_a = true;
-            for pp in film_processing.iter_mut() {
-                let (input, output) = if input_is_a {
-                    (&self.film_render_target, &self.film_render_target_b)
-                } else {
-                    (&self.film_render_target_b, &self.film_render_target)
-                };
-                let output_view = match output {
-                    RenderTarget::Offscreen(o) => &o.color_view,
-                    RenderTarget::Screen => &frame_view,
-                };
-                pp.update(0.016, w as f32, h as f32, znear, zfar);
-                let mut pp_context = PostProcessingContext {
-                    encoder: &mut encoder,
-                    output_view,
-                };
-                pp.draw(input, &mut pp_context);
-                input_is_a = !input_is_a;
+        // not one; from there the pair ping-pongs as the LDR chain does. Every
+        // effect here writes `HDR_FORMAT`, which is what its `output_format`
+        // says.
+        let film_format = crate::post_processing::HDR_FORMAT;
+        let film_view = match self.film_render_targets.as_ref() {
+            Some((a, b)) if !film_processing.is_empty() => {
+                Self::seed_film(&mut encoder, self.hdr.scene_texture(), a, w, h);
+                let mut input_is_a = true;
+                for pp in film_processing.iter_mut() {
+                    let (input, output) = if input_is_a { (a, b) } else { (b, a) };
+                    let output_view = match output {
+                        RenderTarget::Offscreen(o) => &o.color_view,
+                        RenderTarget::Screen => &frame_view,
+                    };
+                    pp.update(0.016, w as f32, h as f32, znear, zfar);
+                    let mut pp_context = PostProcessingContext {
+                        encoder: &mut encoder,
+                        output_view,
+                        output_format: film_format,
+                    };
+                    pp.draw(input, &mut pp_context);
+                    input_is_a = !input_is_a;
+                }
+                // Whichever half the last effect wrote is what the tonemap reads.
+                let landed = if input_is_a { a } else { b };
+                match landed {
+                    RenderTarget::Offscreen(o) => Some(o.color_view.clone()),
+                    RenderTarget::Screen => None,
+                }
             }
-            // Whichever half the last effect wrote is what the tonemap reads.
-            let landed = if input_is_a {
-                &self.film_render_target
-            } else {
-                &self.film_render_target_b
-            };
-            match landed {
-                RenderTarget::Offscreen(o) => Some(o.color_view.clone()),
-                RenderTarget::Screen => Some(film),
-            }
+            _ => None,
         };
         let resolve_input = film_view;
         let resolve = |hdr: &mut crate::post_processing::HdrPipeline,
@@ -1447,6 +1455,9 @@ impl Window {
                 let mut pp_context = PostProcessingContext {
                     encoder: &mut encoder,
                     output_view,
+                    // Both the ping-pong pair and the frame carry the surface
+                    // format, so every effect of this chain writes that.
+                    output_format: self.canvas.surface_format(),
                 };
                 pp.draw(input, &mut pp_context);
             }

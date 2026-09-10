@@ -1426,6 +1426,7 @@ impl HdrPipeline {
     fn run_auto_exposure(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
+        input: &wgpu::TextureView,
         gpu: &mut crate::renderer::timings::GpuTimer,
     ) -> usize {
         let ctxt = Context::get();
@@ -1453,14 +1454,16 @@ impl HdrPipeline {
             }),
         );
 
-        // Metering pass: scene -> 1x1 average luminance.
+        // Metering pass: scene -> 1x1 average luminance. Meters `input`, not the
+        // film itself, so a film-stage chain that changes brightness is what the
+        // exposure adapts to rather than something the tonemap never sees.
         let meter_bg = ctxt.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("hdr_autoexposure_meter_bg"),
             layout: &self.meter_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.scene_view),
+                    resource: wgpu::BindingResource::TextureView(input),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1581,7 +1584,7 @@ impl HdrPipeline {
         // exposure texture is sampled by the tonemap pass (binding 5).
         let auto = self.settings.auto_exposure;
         let exposure_index = if auto {
-            self.run_auto_exposure(encoder, gpu)
+            self.run_auto_exposure(encoder, input, gpu)
         } else {
             self.exposure_index
         };
