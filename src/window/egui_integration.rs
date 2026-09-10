@@ -398,6 +398,28 @@ impl Window {
         }
     }
 
+    /// Whether the UI built by one frame's [`Self::draw_ui`] calls is drawn
+    /// again on the frames that make none. Off by default.
+    ///
+    /// Turning it on lets an app run its widgets only when something changed
+    /// and keep the UI on screen in between. An app that shows its UI
+    /// conditionally (`if show_hud { window.draw_ui(..) }`) wants it off, or
+    /// has to call [`Self::clear_ui`] when it hides the UI.
+    pub fn set_ui_retained(&mut self, retained: bool) {
+        self.egui_context.renderer.set_retain_shapes(retained);
+    }
+
+    /// Whether the last frame's UI is redrawn on a frame that builds none.
+    pub fn ui_retained(&self) -> bool {
+        self.egui_context.renderer.retains_shapes()
+    }
+
+    /// Drops the UI built by the last [`Self::draw_ui`], so a retaining app
+    /// stops drawing it. A no-op unless [`Self::set_ui_retained`] is on.
+    pub fn clear_ui(&mut self) {
+        self.egui_context.renderer.clear_shapes();
+    }
+
     /// Draws an immediate mode UI using egui.
     ///
     /// Call this method from your render loop to create and display UI elements.
@@ -434,15 +456,18 @@ impl Window {
     ///
     /// # Note
     /// Only available when the `egui` feature is enabled.
+    /// # Passes
+    ///
+    /// `ui_fn` may run more than once per frame. A pass that only measured
+    /// something (a new `Area`, a `Grid`, a `Resize`) asks egui to discard it
+    /// and run it again before the frame is shown, so a closure that mutates
+    /// state has to tolerate being replayed. Only the closure that opened the
+    /// pass is replayed: when a second `draw_ui` of the same frame is the one
+    /// that asks, its measurement lands on the next frame instead.
     pub fn draw_ui<F>(&mut self, mut ui_fn: F)
     where
         F: FnMut(&egui::Context),
     {
-        // A frame that calls this none of the times shows the last pass's
-        // shapes again, which is what lets a host redraw its UI only when
-        // something changed; the shapes are dropped by the next pass, not by
-        // rendering them (`EguiRenderer::begin_frame`).
-        //
         // Open the egui pass lazily so that several `draw_ui` (and
         // `draw_inspector`) calls in the same frame all run their widgets into
         // the *same* pass. The pass is closed at render time by
@@ -456,8 +481,8 @@ impl Window {
 
         ui_fn(self.egui_context.renderer.context());
 
-        // A pass that only learned a size — a new `Area`, which draws none of
-        // itself while it is measured, a `Grid`, a `Resize` — asks to be
+        // A pass that only learned a size (a new `Area`, which draws none of
+        // itself while it is measured, a `Grid`, a `Resize`) asks to be
         // discarded and run again before the frame is shown. `Context::run`
         // does that for its callers; with the pass open here, this does, or
         // the frame shows the gap. Only the call that opened the pass reruns:

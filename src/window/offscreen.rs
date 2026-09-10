@@ -376,4 +376,23 @@ impl OffscreenSurface {
     {
         self.window.draw_ui(ui_fn);
     }
+
+    /// Redraws the last UI on the frames that build none. See
+    /// [`Window::set_ui_retained`].
+    #[cfg(feature = "egui")]
+    pub fn set_ui_retained(&mut self, retained: bool) {
+        self.window.set_ui_retained(retained);
+    }
+
+    /// Whether the last UI is redrawn on a frame that builds none.
+    #[cfg(feature = "egui")]
+    pub fn ui_retained(&self) -> bool {
+        self.window.ui_retained()
+    }
+
+    /// Drops the UI built by the last `draw_ui`. See [`Window::clear_ui`].
+    #[cfg(feature = "egui")]
+    pub fn clear_ui(&mut self) {
+        self.window.clear_ui();
+    }
 }
