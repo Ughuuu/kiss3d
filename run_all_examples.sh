@@ -35,6 +35,7 @@ EXAMPLES=(
     mouse_events
     custom_mesh
     custom_mesh_shared
+    vertex_colors
     custom_material
     procedural
     quad
