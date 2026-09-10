@@ -15,6 +15,7 @@ EXAMPLES=(
     blend_modes2d
     sprites2d
     post_processing2d
+    screen_read2d
     lighting2d
     global_illumination2d
     effect_chain2d
