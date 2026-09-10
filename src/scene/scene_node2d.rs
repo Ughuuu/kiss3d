@@ -129,45 +129,38 @@ impl SceneNodeData2d {
         render_pass: &mut wgpu::RenderPass<'_>,
         context: &RenderContext2d,
     ) {
-        if self.visible {
-            self.do_render(Pose2::IDENTITY, Vec2::ONE, camera, render_pass, context)
+        if !self.visible {
+            return;
         }
+        self.traverse(
+            Pose2::IDENTITY,
+            Vec2::ONE,
+            &mut |object, transform, scale| {
+                object.render(transform, scale, camera, render_pass, context)
+            },
+        );
     }
 
-    fn do_render(
-        &mut self,
-        transform: Pose2,
-        scale: Vec2,
-        camera: &mut dyn Camera2d,
-        render_pass: &mut wgpu::RenderPass<'_>,
-        context: &RenderContext2d,
-    ) {
+    /// Walks this subtree in draw order, propagating world transforms and
+    /// handing every visible object it holds to `draw`.
+    fn traverse<F>(&mut self, transform: Pose2, scale: Vec2, draw: &mut F)
+    where
+        F: FnMut(&mut Object2d, Pose2, Vec2),
+    {
         if !self.up_to_date {
             self.up_to_date = true;
             self.world_transform = transform * self.local_transform;
             self.world_scale = scale * self.local_scale;
         }
 
-        if let Some(ref mut o) = self.object {
-            o.render(
-                self.world_transform,
-                self.world_scale,
-                camera,
-                render_pass,
-                context,
-            )
+        if let Some(object) = &mut self.object {
+            draw(object, self.world_transform, self.world_scale);
         }
 
         for c in self.children.iter_mut() {
             let mut bc = c.data_mut();
             if bc.visible {
-                bc.do_render(
-                    self.world_transform,
-                    self.world_scale,
-                    camera,
-                    render_pass,
-                    context,
-                )
+                bc.traverse(self.world_transform, self.world_scale, draw);
             }
         }
     }
@@ -199,68 +192,20 @@ impl SceneNodeData2d {
             return;
         }
         let mut pass = Some(begin_pass(encoder));
-        self.do_render_with_screen(
+        self.traverse(
             Pose2::IDENTITY,
             Vec2::ONE,
-            camera,
-            encoder,
-            &mut pass,
-            context,
-            begin_pass,
-            copy_screen,
+            &mut |object, transform, scale| {
+                if object.material().borrow().reads_screen() {
+                    drop(pass.take());
+                    copy_screen(encoder);
+                    pass = Some(begin_pass(encoder));
+                }
+                let render_pass = pass.as_mut().expect("a pass is open between splits");
+                object.render(transform, scale, camera, render_pass, context)
+            },
         );
         drop(pass);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn do_render_with_screen(
-        &mut self,
-        transform: Pose2,
-        scale: Vec2,
-        camera: &mut dyn Camera2d,
-        encoder: &mut wgpu::CommandEncoder,
-        pass: &mut Option<wgpu::RenderPass<'static>>,
-        context: &RenderContext2d,
-        begin_pass: &mut dyn FnMut(&mut wgpu::CommandEncoder) -> wgpu::RenderPass<'static>,
-        copy_screen: &mut dyn FnMut(&mut wgpu::CommandEncoder),
-    ) {
-        if !self.up_to_date {
-            self.up_to_date = true;
-            self.world_transform = transform * self.local_transform;
-            self.world_scale = scale * self.local_scale;
-        }
-
-        if let Some(ref mut o) = self.object {
-            if o.material().borrow().reads_screen() {
-                drop(pass.take());
-                copy_screen(encoder);
-                *pass = Some(begin_pass(encoder));
-            }
-            let render_pass = pass.as_mut().expect("a pass is open between splits");
-            o.render(
-                self.world_transform,
-                self.world_scale,
-                camera,
-                render_pass,
-                context,
-            )
-        }
-
-        for c in self.children.iter_mut() {
-            let mut bc = c.data_mut();
-            if bc.visible {
-                bc.do_render_with_screen(
-                    self.world_transform,
-                    self.world_scale,
-                    camera,
-                    encoder,
-                    pass,
-                    context,
-                    begin_pass,
-                    copy_screen,
-                )
-            }
-        }
     }
 
     /// A reference to the object possibly contained by this node.
