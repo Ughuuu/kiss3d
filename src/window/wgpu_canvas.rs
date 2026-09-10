@@ -917,16 +917,19 @@ impl WgpuCanvas {
                         .borrow_mut()
                         .push(WindowEvent::Key(key, Action::Press, modifiers));
                     // macOS sends no keyup for a key released while ⌘ is held,
-                    // which would leave it pressed for good: release it now.
+                    // which would leave that key pressed for good. Remember it
+                    // and release it when ⌘ itself goes up, so it still reads
+                    // as held for as long as it really is.
                     if modifiers.contains(Modifiers::Super)
                         && apple_platform()
                         && !is_modifier_key(key)
                     {
-                        pending.borrow_mut().push(WindowEvent::Key(
-                            key,
-                            Action::Release,
-                            modifiers,
-                        ));
+                        SUPER_HELD_KEYS.with(|held| {
+                            let mut held = held.borrow_mut();
+                            if !held.contains(&key) {
+                                held.push(key);
+                            }
+                        });
                     }
                     // Emit a Char event for single-character (printable) keys so
                     // egui text fields receive text input. Skip when a command
@@ -949,11 +952,18 @@ impl WgpuCanvas {
                 let pending = pending_events.clone();
                 let closure = Closure::<dyn FnMut(_)>::new(move |event: web_sys::KeyboardEvent| {
                     let key = translate_web_key(&event.code());
-                    pending.borrow_mut().push(WindowEvent::Key(
-                        key,
-                        Action::Release,
-                        event.modifiers(),
-                    ));
+                    let modifiers = event.modifiers();
+                    pending
+                        .borrow_mut()
+                        .push(WindowEvent::Key(key, Action::Release, modifiers));
+                    // ⌘ is up, so the keys it swallowed the keyup of are too.
+                    if !modifiers.contains(Modifiers::Super) {
+                        let swallowed = SUPER_HELD_KEYS.with(|held| held.take());
+                        let mut pending = pending.borrow_mut();
+                        for key in swallowed {
+                            pending.push(WindowEvent::Key(key, Action::Release, modifiers));
+                        }
+                    }
                 });
                 let _ = web_window
                     .add_event_listener_with_callback("keyup", closure.as_ref().unchecked_ref());
@@ -2403,6 +2413,13 @@ pub(crate) fn apple_platform() -> bool {
             .is_some_and(|ua| ua.contains("Mac"));
     }
     APPLE.with(|apple| *apple)
+}
+
+thread_local! {
+    /// Keys pressed while ⌘ was held on an Apple platform. macOS never sends
+    /// their keyup, so their release is synthesized when ⌘ goes up.
+    #[cfg(target_arch = "wasm32")]
+    static SUPER_HELD_KEYS: RefCell<Vec<Key>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(target_arch = "wasm32")]

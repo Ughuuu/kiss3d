@@ -103,7 +103,12 @@ impl Window {
                 ImeEvent::Preedit { text, cursor } => egui::ImeEvent::Preedit {
                     text: text.clone(),
                     active_range_chars: cursor.map(|(start, end)| {
-                        let chars = |byte: usize| text[..byte.min(text.len())].chars().count();
+                        // Counting the chars that start before the byte index
+                        // rather than slicing at it: an index that is not a
+                        // char boundary rounds down instead of panicking.
+                        let chars = |byte: usize| {
+                            text.char_indices().take_while(|(at, _)| *at < byte).count()
+                        };
                         chars(start)..chars(end)
                     }),
                 },
