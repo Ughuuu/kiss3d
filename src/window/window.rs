@@ -392,6 +392,12 @@ impl Window {
         self.canvas.safe_area()
     }
 
+    /// How many pixels of the window the on-screen keyboard covers, from the
+    /// bottom; zero with it down, and zero everywhere but Android and iOS.
+    pub fn keyboard_height(&self) -> f32 {
+        self.canvas.keyboard_height()
+    }
+
     /// Sets the cursor position in window coordinates.
     ///
     /// # Arguments

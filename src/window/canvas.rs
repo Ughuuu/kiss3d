@@ -219,6 +219,11 @@ impl Canvas {
         self.canvas.safe_area()
     }
 
+    /// Pixels of the window the on-screen keyboard covers, from the bottom.
+    pub fn keyboard_height(&self) -> f32 {
+        self.canvas.keyboard_height()
+    }
+
     /// Set the cursor position.
     pub fn set_cursor_position(&self, x: f64, y: f64) {
         self.canvas.set_cursor_position(x, y);

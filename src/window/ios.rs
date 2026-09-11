@@ -17,11 +17,15 @@ use std::task::{Context as TaskContext, Poll, Waker};
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, MainThreadMarker, MainThreadOnly};
+use objc2_core_foundation::CGRect;
 use objc2_foundation::{
-    NSDictionary, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSString, NSURL,
+    NSDictionary, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSString,
+    NSValue, NSURL,
 };
 use objc2_ui_kit::{
-    UIApplicationDidFinishLaunchingNotification, UIKeyInput, UITextInputTraits, UIView,
+    NSValueUIGeometryExtensions, UIApplicationDidFinishLaunchingNotification, UIKeyInput,
+    UIKeyboardFrameEndUserInfoKey, UIKeyboardWillChangeFrameNotification, UITextInputTraits,
+    UIView,
 };
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -140,6 +144,7 @@ pub fn run_ios(fut: impl Future<Output = ()> + 'static) {
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     if let Some(mtm) = MainThreadMarker::new() {
         observe_launch_url(mtm);
+        observe_keyboard(mtm);
     }
     let mut app = IosApp {
         fut: Some(Box::pin(fut)),
@@ -225,6 +230,12 @@ thread_local! {
     /// dangling pointer the next notification would follow.
     static LAUNCH_OBSERVER: std::cell::RefCell<Option<Retained<LaunchObserver>>> =
         const { std::cell::RefCell::new(None) };
+    /// Where the keyboard will end up, in screen coordinates, as UIKit last
+    /// announced it; `None` before it has ever moved.
+    static KEYBOARD_FRAME: Cell<Option<CGRect>> = const { Cell::new(None) };
+    /// Kept alive for the reason `LAUNCH_OBSERVER` is.
+    static KEYBOARD_OBSERVER: std::cell::RefCell<Option<Retained<KeyboardObserver>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 // UIKit hands the launch URL to the application delegate, and winit owns the
@@ -261,6 +272,76 @@ define_class!(
         }
     }
 );
+
+// Every keyboard move posts `UIKeyboardWillChangeFrameNotification` with the
+// frame it is heading for, hides included: a hidden keyboard's frame sits
+// below the screen, so one handler covers show, hide, rotate and resize.
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "Kiss3dKeyboardObserver"]
+    struct KeyboardObserver;
+
+    unsafe impl NSObjectProtocol for KeyboardObserver {}
+
+    impl KeyboardObserver {
+        #[unsafe(method(keyboardWillChangeFrame:))]
+        fn will_change_frame(&self, notification: &NSNotification) {
+            let Some(info): Option<Retained<NSDictionary>> = notification.userInfo() else {
+                return;
+            };
+            let key: &NSString = unsafe { UIKeyboardFrameEndUserInfoKey };
+            let Some(object) = info.objectForKey(key) else {
+                return;
+            };
+            // Documented as an NSValue wrapping a CGRect.
+            let value: &NSValue = unsafe { &*ptr::from_ref(&*object).cast::<NSValue>() };
+            let frame = unsafe { value.CGRectValue() };
+            KEYBOARD_FRAME.with(|cell| cell.set(Some(frame)));
+        }
+    }
+);
+
+fn observe_keyboard(mtm: MainThreadMarker) {
+    let observer: Retained<KeyboardObserver> =
+        unsafe { msg_send![KeyboardObserver::alloc(mtm), init] };
+    unsafe {
+        NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+            &observer,
+            objc2::sel!(keyboardWillChangeFrame:),
+            Some(UIKeyboardWillChangeFrameNotification),
+            None,
+        );
+    }
+    KEYBOARD_OBSERVER.with(|cell| *cell.borrow_mut() = Some(observer));
+}
+
+/// How far up `window` the keyboard reaches, in points; zero while it is down.
+///
+/// The frame is converted into the view's own coordinates, as Apple asks: a
+/// screen-space frame is wrong under rotation and in a window smaller than
+/// the screen.
+pub(crate) fn keyboard_height(window: &Window) -> f64 {
+    use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+
+    if MainThreadMarker::new().is_none() {
+        return 0.0;
+    }
+    let Some(frame) = KEYBOARD_FRAME.with(Cell::get) else {
+        return 0.0;
+    };
+    let Ok(handle) = window.window_handle() else {
+        return 0.0;
+    };
+    let RawWindowHandle::UiKit(ui_kit) = handle.as_raw() else {
+        return 0.0;
+    };
+    // Valid while `window` is alive, which the borrow guarantees.
+    let view: &UIView = unsafe { ui_kit.ui_view.cast().as_ref() };
+    let local = view.convertRect_fromView(frame, None);
+    let bottom = view.bounds().size.height;
+    (bottom - local.origin.y).clamp(0.0, local.size.height.max(0.0))
+}
 
 /// Start listening for the launch URL. Called before `UIApplicationMain`
 /// takes the thread, which is the only moment early enough to hear the

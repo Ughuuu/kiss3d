@@ -1,5 +1,7 @@
 //! Unified wgpu-based canvas for both native and web platforms.
 
+#[cfg(target_os = "android")]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -120,6 +122,34 @@ thread_local! {
 enum LifecycleEvent {
     Resumed,
     Suspended,
+}
+
+#[cfg(target_os = "android")]
+thread_local! {
+    // The least of the window NativeActivity's content rect has ever left
+    // uncovered at this window height: the navigation bar, where the system
+    // draws one over the window. Reset when the height changes, since a
+    // rotation moves the bar.
+    static ANDROID_RESTING: Cell<(i32, i32)> = const { Cell::new((0, i32::MAX)) };
+}
+
+/// The keyboard's share of what the content rect leaves uncovered.
+///
+/// NativeActivity reports one rect for everything the system covers, keyboard
+/// and navigation bar alike. The bar's share is the smallest cover seen at
+/// this height, so what is left above it is the keyboard.
+#[cfg(target_os = "android")]
+fn android_keyboard(height: i32, covered: i32) -> f32 {
+    ANDROID_RESTING.with(|resting| {
+        let (at, least) = resting.get();
+        let least = if at == height {
+            least.min(covered)
+        } else {
+            covered
+        };
+        resting.set((height, least));
+        (covered - least).max(0) as f32
+    })
 }
 
 /// Stores the `AndroidApp` handle that `android_main` received, so opening a
@@ -1927,6 +1957,35 @@ impl WgpuCanvas {
     pub fn set_ime_allowed(&self, allowed: bool) {
         if let Some(window) = &self.window {
             window.set_ime_allowed(allowed);
+        }
+    }
+
+    /// How many pixels of the window the on-screen keyboard covers, from the
+    /// bottom; zero with it down, and zero everywhere but Android and iOS.
+    pub fn keyboard_height(&self) -> f32 {
+        #[cfg(target_os = "android")]
+        {
+            let Some(window) = &self.window else {
+                return 0.0;
+            };
+            let height = window.inner_size().height as i32;
+            let Some(content) =
+                ANDROID_APP.with(|app| app.borrow().as_ref().map(|a| a.content_rect()))
+            else {
+                return 0.0;
+            };
+            android_keyboard(height, height - content.bottom)
+        }
+        #[cfg(target_os = "ios")]
+        {
+            let Some(window) = &self.window else {
+                return 0.0;
+            };
+            (super::ios::keyboard_height(window) * window.scale_factor()) as f32
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            0.0
         }
     }
 

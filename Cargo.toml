@@ -83,8 +83,9 @@ android-activity = "0.6.1"
 # summons UIKit's keyboard itself through a hidden UIKeyInput view (window/ios.rs).
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = "0.3"
-objc2-ui-kit = { version = "0.3", features = ["UIApplication", "UIGeometry", "UIResponder", "UIView", "UITextInput"] }
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+objc2-foundation = { version = "0.3", features = ["NSValue"] }
+objc2-ui-kit = { version = "0.3", features = ["UIApplication", "UIGeometry", "UIResponder", "UIView", "UITextInput", "UIWindow", "objc2-core-foundation"] }
 
 [target.wasm32-unknown-unknown.dependencies]
 oneshot = { version = "0.2.0", features = ["async"] }
