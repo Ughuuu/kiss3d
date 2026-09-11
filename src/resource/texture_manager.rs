@@ -349,7 +349,7 @@ impl Texture {
     /// leave the fringe it is here to remove.
     fn premultiply_rgba(data: &[u8], srgb: bool) -> Vec<u8> {
         let mut out = data.to_vec();
-        for texel in out.chunks_exact_mut(4) {
+        for texel in out.as_chunks_mut::<4>().0 {
             let alpha = texel[3] as f32 / 255.0;
             for channel in &mut texel[..3] {
                 *channel = if srgb {
