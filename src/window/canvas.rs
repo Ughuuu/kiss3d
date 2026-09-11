@@ -189,6 +189,16 @@ impl Canvas {
         self.canvas.set_fullscreen(fullscreen);
     }
 
+    /// Enter or leave exclusive fullscreen on the current monitor.
+    pub fn set_exclusive_fullscreen(&self, exclusive: bool) {
+        self.canvas.set_exclusive_fullscreen(exclusive);
+    }
+
+    /// Maximize the window, or restore it.
+    pub fn set_maximized(&self, maximized: bool) {
+        self.canvas.set_maximized(maximized);
+    }
+
     /// Show or hide the platform's on-screen keyboard (mobile; no-op elsewhere).
     pub fn set_keyboard_visible(&self, visible: bool) {
         self.canvas.set_keyboard_visible(visible);

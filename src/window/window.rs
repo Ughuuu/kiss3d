@@ -353,6 +353,21 @@ impl Window {
         self.canvas.set_fullscreen(fullscreen);
     }
 
+    /// Enters or leaves exclusive fullscreen: the current monitor's largest
+    /// video mode, at its highest refresh rate.
+    ///
+    /// # Platform-specific
+    /// Where the platform offers no video modes, as on the web, this is
+    /// borderless fullscreen.
+    pub fn set_exclusive_fullscreen(&self, exclusive: bool) {
+        self.canvas.set_exclusive_fullscreen(exclusive);
+    }
+
+    /// Maximizes the window, or restores it.
+    pub fn set_maximized(&self, maximized: bool) {
+        self.canvas.set_maximized(maximized);
+    }
+
     /// Shows or hides the platform's on-screen keyboard.
     ///
     /// # Platform-specific

@@ -1897,6 +1897,39 @@ impl WgpuCanvas {
         }
     }
 
+    /// Enter exclusive fullscreen on the current monitor, in its largest
+    /// video mode at the highest refresh rate, or leave it. Falls back to
+    /// borderless where the platform offers no video modes, as the web does.
+    pub fn set_exclusive_fullscreen(&self, exclusive: bool) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        if !exclusive {
+            window.set_fullscreen(None);
+            return;
+        }
+        let mode = window.current_monitor().and_then(|monitor| {
+            monitor.video_modes().max_by_key(|mode| {
+                let size = mode.size();
+                (
+                    u64::from(size.width) * u64::from(size.height),
+                    mode.refresh_rate_millihertz(),
+                )
+            })
+        });
+        window.set_fullscreen(Some(match mode {
+            Some(mode) => winit::window::Fullscreen::Exclusive(mode),
+            None => winit::window::Fullscreen::Borderless(None),
+        }));
+    }
+
+    /// Maximize the window, or restore it.
+    pub fn set_maximized(&self, maximized: bool) {
+        if let Some(window) = &self.window {
+            window.set_maximized(maximized);
+        }
+    }
+
     /// Whether the window is currently fullscreen.
     pub fn is_fullscreen(&self) -> bool {
         self.window
