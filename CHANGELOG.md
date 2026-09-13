@@ -67,10 +67,6 @@
   pressed for good: macOS sends no keyup of its own for it.
 - A render target reused at another colour format is remade rather than only resized.
 - Auto-exposure meters what the film-stage chain wrote, not the film it started from.
-- An egui shortcut now fires from either Ctrl or ⌘, on every platform, rather than from whichever
-  one the build's platform calls the command key. This deliberately departs from egui's own rule
-  (⌘ on macOS, Ctrl everywhere else), so that a Mac keyboard drives the same chords wherever it is
-  plugged in; `mac_cmd` still follows the platform, so egui's mac-only paths are unaffected.
 
 ## Performance
 

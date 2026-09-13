@@ -63,16 +63,18 @@ fn command_is_super() -> bool {
 /// tapped within one frame has already released its modifier by then.
 fn egui_modifiers(modifiers: Modifiers) -> egui::Modifiers {
     let ctrl = modifiers.contains(Modifiers::Control);
-    let super_key = modifiers.contains(Modifiers::Super);
+    // Only where the platform's command key is ⌘: egui's mac-only paths read
+    // this, and a browser on an Apple platform counts.
+    let mac_cmd = command_is_super() && modifiers.contains(Modifiers::Super);
     egui::Modifiers {
         alt: modifiers.contains(Modifiers::Alt),
         ctrl,
         shift: modifiers.contains(Modifiers::Shift),
-        // Only where the platform has a ⌘: egui's mac-only paths read this.
-        mac_cmd: command_is_super() && super_key,
-        // Either key drives a `COMMAND` chord, so ⌃S saves on a Mac and ⌘S
-        // saves on a Mac keyboard plugged into anything else.
-        command: ctrl || super_key,
+        mac_cmd,
+        // egui's own rule: a `COMMAND` chord is ⌘ where the platform has one
+        // and Ctrl everywhere else, so a shortcut reads the way the rest of
+        // the platform's apps read it.
+        command: if command_is_super() { mac_cmd } else { ctrl },
     }
 }
 
@@ -638,20 +640,31 @@ mod tests {
         assert_eq!(translate_key_to_egui(Key::Unknown), None);
     }
 
-    /// Both keys drive a `COMMAND` chord, whichever platform is running, so a
-    /// ⌃ chord works on a Mac and a ⌘ one on the keyboards that have it.
+    /// A `COMMAND` chord is the key the platform calls command, as egui has it:
+    /// ⌘ where there is one, Ctrl everywhere else. The other key is not it.
     #[test]
-    fn control_and_super_both_read_as_command() {
-        for held in [Modifiers::Control, Modifiers::Super] {
-            let mods = egui_modifiers(held | Modifiers::Shift);
-            assert!(mods.command, "{:?} did not read as command", held);
-            assert!(mods.shift);
-            assert!(
-                mods.matches_logically(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT),
-                "{:?} did not match ⇧⌘",
-                held
-            );
-        }
+    fn command_is_the_key_the_platform_calls_command() {
+        let (command, other) = if command_is_super() {
+            (Modifiers::Super, Modifiers::Control)
+        } else {
+            (Modifiers::Control, Modifiers::Super)
+        };
+
+        let held = egui_modifiers(command | Modifiers::Shift);
+        assert!(held.command, "{:?} did not read as command", command);
+        assert!(held.shift);
+        assert!(
+            held.matches_logically(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT),
+            "{:?} did not match ⇧⌘",
+            command
+        );
+
+        assert!(
+            !egui_modifiers(other).command,
+            "{:?} read as command on a platform that calls {:?} that",
+            other,
+            command
+        );
     }
 
     /// ⌘ is a Mac's alone: egui's mac-only paths read `mac_cmd`, and a chord
