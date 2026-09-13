@@ -47,6 +47,10 @@ jobs:
         run: cargo build --verbose --examples --features egui;
       - name: Run tests
         run: cargo test
+      # The egui integration (key translation, the command modifier) is behind
+      # the feature, so its tests only exist in a build that enables it.
+      - name: Run tests (+ egui)
+        run: cargo test --features egui
   build-wasm:
     runs-on: ubuntu-latest
     env:
