@@ -26,6 +26,11 @@ pub(crate) struct EguiContext {
     /// The shape the pointer was last set to. Setting one is a hop to the
     /// main thread, so only a change is worth making.
     pub(crate) cursor: egui::CursorIcon,
+    /// The UI zoom the host asked for, in points per design pixel. Held here
+    /// rather than read back from the context because `set_zoom_factor` only
+    /// lands at the next `begin_pass`, so the context answers with the old
+    /// one until then and every size computed from it would be a frame late.
+    pub(crate) zoom: f32,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) start_time: std::time::Instant,
 }
@@ -39,6 +44,7 @@ impl EguiContext {
             pointer_touch_id: None,
             rerun_input: RawInput::default(),
             cursor: egui::CursorIcon::Default,
+            zoom: 1.0,
             #[cfg(not(target_arch = "wasm32"))]
             start_time: std::time::Instant::now(),
         }
@@ -215,7 +221,20 @@ impl Window {
     /// learn what a point became; it must not set `pixels_per_point` itself,
     /// since egui derives that from the zoom and the native scale below.
     pub fn egui_pixels_per_point(&self) -> f32 {
-        self.egui_context.renderer.context().zoom_factor() * self.scale_factor() as f32
+        self.egui_context.zoom * self.scale_factor() as f32
+    }
+
+    /// Draw the UI this many points per design pixel, on top of whatever the
+    /// display's own scale is. Applied to egui's zoom factor at the start of
+    /// the next pass, which is what makes every widget and every font grow
+    /// together, egui's own controls included.
+    pub fn set_ui_zoom(&mut self, zoom: f32) {
+        self.egui_context.zoom = zoom.max(f32::EPSILON);
+    }
+
+    /// What [`Window::set_ui_zoom`] was last given.
+    pub fn ui_zoom(&self) -> f32 {
+        self.egui_context.zoom
     }
 
     /// Registers a native wgpu texture view with this window's egui renderer,
@@ -532,6 +551,12 @@ impl Window {
 
         let native = self.canvas.scale_factor() as f32;
         let ppp = self.egui_pixels_per_point();
+        // Before the pass opens: egui holds a new zoom until its next
+        // `begin_pass`, so setting it here is what makes this pass use it.
+        self.egui_context
+            .renderer
+            .context()
+            .set_zoom_factor(self.egui_context.zoom);
 
         // Build raw input with accumulated events
         let mut raw_input = std::mem::take(&mut self.egui_context.raw_input);
