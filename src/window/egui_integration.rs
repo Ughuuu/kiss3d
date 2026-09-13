@@ -63,14 +63,118 @@ fn command_is_super() -> bool {
 /// tapped within one frame has already released its modifier by then.
 fn egui_modifiers(modifiers: Modifiers) -> egui::Modifiers {
     let ctrl = modifiers.contains(Modifiers::Control);
-    let mac_cmd = command_is_super() && modifiers.contains(Modifiers::Super);
+    let super_key = modifiers.contains(Modifiers::Super);
     egui::Modifiers {
         alt: modifiers.contains(Modifiers::Alt),
         ctrl,
         shift: modifiers.contains(Modifiers::Shift),
-        mac_cmd,
-        command: if command_is_super() { mac_cmd } else { ctrl },
+        // Only where the platform has a ⌘: egui's mac-only paths read this.
+        mac_cmd: command_is_super() && super_key,
+        // Either key drives a `COMMAND` chord, so ⌃S saves on a Mac and ⌘S
+        // saves on a Mac keyboard plugged into anything else.
+        command: ctrl || super_key,
     }
+}
+
+/// egui's key for one of ours. Keys arrive as physical codes on both
+/// backends, so a shifted `\` is still `Backslash` and one arm covers every
+/// layout. Anything egui has no key for is dropped.
+fn translate_key_to_egui(key: Key) -> Option<egui::Key> {
+    Some(match key {
+        Key::A => egui::Key::A,
+        Key::B => egui::Key::B,
+        Key::C => egui::Key::C,
+        Key::D => egui::Key::D,
+        Key::E => egui::Key::E,
+        Key::F => egui::Key::F,
+        Key::G => egui::Key::G,
+        Key::H => egui::Key::H,
+        Key::I => egui::Key::I,
+        Key::J => egui::Key::J,
+        Key::K => egui::Key::K,
+        Key::L => egui::Key::L,
+        Key::M => egui::Key::M,
+        Key::N => egui::Key::N,
+        Key::O => egui::Key::O,
+        Key::P => egui::Key::P,
+        Key::Q => egui::Key::Q,
+        Key::R => egui::Key::R,
+        Key::S => egui::Key::S,
+        Key::T => egui::Key::T,
+        Key::U => egui::Key::U,
+        Key::V => egui::Key::V,
+        Key::W => egui::Key::W,
+        Key::X => egui::Key::X,
+        Key::Y => egui::Key::Y,
+        Key::Z => egui::Key::Z,
+        Key::Key0 | Key::Numpad0 => egui::Key::Num0,
+        Key::Key1 | Key::Numpad1 => egui::Key::Num1,
+        Key::Key2 | Key::Numpad2 => egui::Key::Num2,
+        Key::Key3 | Key::Numpad3 => egui::Key::Num3,
+        Key::Key4 | Key::Numpad4 => egui::Key::Num4,
+        Key::Key5 | Key::Numpad5 => egui::Key::Num5,
+        Key::Key6 | Key::Numpad6 => egui::Key::Num6,
+        Key::Key7 | Key::Numpad7 => egui::Key::Num7,
+        Key::Key8 | Key::Numpad8 => egui::Key::Num8,
+        Key::Key9 | Key::Numpad9 => egui::Key::Num9,
+        Key::F1 => egui::Key::F1,
+        Key::F2 => egui::Key::F2,
+        Key::F3 => egui::Key::F3,
+        Key::F4 => egui::Key::F4,
+        Key::F5 => egui::Key::F5,
+        Key::F6 => egui::Key::F6,
+        Key::F7 => egui::Key::F7,
+        Key::F8 => egui::Key::F8,
+        Key::F9 => egui::Key::F9,
+        Key::F10 => egui::Key::F10,
+        Key::F11 => egui::Key::F11,
+        Key::F12 => egui::Key::F12,
+        Key::F13 => egui::Key::F13,
+        Key::F14 => egui::Key::F14,
+        Key::F15 => egui::Key::F15,
+        Key::F16 => egui::Key::F16,
+        Key::F17 => egui::Key::F17,
+        Key::F18 => egui::Key::F18,
+        Key::F19 => egui::Key::F19,
+        Key::F20 => egui::Key::F20,
+        Key::F21 => egui::Key::F21,
+        Key::F22 => egui::Key::F22,
+        Key::F23 => egui::Key::F23,
+        Key::F24 => egui::Key::F24,
+        Key::Backslash => egui::Key::Backslash,
+        Key::Slash | Key::Divide => egui::Key::Slash,
+        Key::Comma | Key::NumpadComma => egui::Key::Comma,
+        Key::Period | Key::Decimal => egui::Key::Period,
+        Key::Minus | Key::Subtract => egui::Key::Minus,
+        Key::Add => egui::Key::Plus,
+        Key::Equals | Key::NumpadEquals => egui::Key::Equals,
+        Key::Semicolon => egui::Key::Semicolon,
+        Key::Colon => egui::Key::Colon,
+        Key::Apostrophe => egui::Key::Quote,
+        Key::Grave => egui::Key::Backtick,
+        Key::LBracket => egui::Key::OpenBracket,
+        Key::RBracket => egui::Key::CloseBracket,
+        Key::Escape => egui::Key::Escape,
+        Key::Tab => egui::Key::Tab,
+        Key::Back => egui::Key::Backspace,
+        Key::Return | Key::NumpadEnter => egui::Key::Enter,
+        Key::Space => egui::Key::Space,
+        Key::Insert => egui::Key::Insert,
+        Key::Delete => egui::Key::Delete,
+        Key::Home => egui::Key::Home,
+        Key::End => egui::Key::End,
+        Key::PageUp => egui::Key::PageUp,
+        Key::PageDown => egui::Key::PageDown,
+        Key::Left => egui::Key::ArrowLeft,
+        Key::Up => egui::Key::ArrowUp,
+        Key::Right => egui::Key::ArrowRight,
+        Key::Down => egui::Key::ArrowDown,
+        Key::Copy => egui::Key::Copy,
+        Key::Cut => egui::Key::Cut,
+        Key::Paste => egui::Key::Paste,
+        Key::NavigateBackward => egui::Key::BrowserBack,
+        _ => return None,
+    })
 }
 
 impl Window {
@@ -280,7 +384,7 @@ impl Window {
                     .push(egui::Event::Text(ch.to_string()));
             }
             WindowEvent::Key(key, action, modifiers) => {
-                if let Some(egui_key) = self.translate_key_to_egui(key) {
+                if let Some(egui_key) = translate_key_to_egui(key) {
                     self.egui_context.raw_input.events.push(egui::Event::Key {
                         key: egui_key,
                         physical_key: None,
@@ -292,53 +396,6 @@ impl Window {
             }
             _ => {}
         }
-    }
-
-    pub(crate) fn translate_key_to_egui(&self, key: Key) -> Option<egui::Key> {
-        Some(match key {
-            Key::A => egui::Key::A,
-            Key::B => egui::Key::B,
-            Key::C => egui::Key::C,
-            Key::D => egui::Key::D,
-            Key::E => egui::Key::E,
-            Key::F => egui::Key::F,
-            Key::G => egui::Key::G,
-            Key::H => egui::Key::H,
-            Key::I => egui::Key::I,
-            Key::J => egui::Key::J,
-            Key::K => egui::Key::K,
-            Key::L => egui::Key::L,
-            Key::M => egui::Key::M,
-            Key::N => egui::Key::N,
-            Key::O => egui::Key::O,
-            Key::P => egui::Key::P,
-            Key::Q => egui::Key::Q,
-            Key::R => egui::Key::R,
-            Key::S => egui::Key::S,
-            Key::T => egui::Key::T,
-            Key::U => egui::Key::U,
-            Key::V => egui::Key::V,
-            Key::W => egui::Key::W,
-            Key::X => egui::Key::X,
-            Key::Y => egui::Key::Y,
-            Key::Z => egui::Key::Z,
-            Key::Escape => egui::Key::Escape,
-            Key::Tab => egui::Key::Tab,
-            Key::Back => egui::Key::Backspace,
-            Key::Return => egui::Key::Enter,
-            Key::Space => egui::Key::Space,
-            Key::Insert => egui::Key::Insert,
-            Key::Delete => egui::Key::Delete,
-            Key::Home => egui::Key::Home,
-            Key::End => egui::Key::End,
-            Key::PageUp => egui::Key::PageUp,
-            Key::PageDown => egui::Key::PageDown,
-            Key::Left => egui::Key::ArrowLeft,
-            Key::Up => egui::Key::ArrowUp,
-            Key::Right => egui::Key::ArrowRight,
-            Key::Down => egui::Key::ArrowDown,
-            _ => return None,
-        })
     }
 
     /// Draws an immediate mode UI using egui.
@@ -528,5 +585,59 @@ fn winit_cursor(icon: egui::CursorIcon) -> winit::window::CursorIcon {
         E::ResizeRow => W::RowResize,
         E::ZoomIn => W::ZoomIn,
         E::ZoomOut => W::ZoomOut,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The chords the editor binds are punctuation, digits and function keys,
+    /// none of which egui ever saw while the map held letters only.
+    #[test]
+    fn punctuation_digits_and_function_keys_reach_egui() {
+        for (key, want) in [
+            (Key::Backslash, egui::Key::Backslash),
+            (Key::Slash, egui::Key::Slash),
+            (Key::Comma, egui::Key::Comma),
+            (Key::Equals, egui::Key::Equals),
+            (Key::Minus, egui::Key::Minus),
+            (Key::Key1, egui::Key::Num1),
+            (Key::Numpad1, egui::Key::Num1),
+            (Key::F5, egui::Key::F5),
+            (Key::F11, egui::Key::F11),
+            (Key::A, egui::Key::A),
+        ] {
+            assert_eq!(translate_key_to_egui(key), Some(want), "{:?}", key);
+        }
+        assert_eq!(translate_key_to_egui(Key::Unknown), None);
+    }
+
+    /// Both keys drive a `COMMAND` chord, whichever platform is running, so a
+    /// ⌃ chord works on a Mac and a ⌘ one on the keyboards that have it.
+    #[test]
+    fn control_and_super_both_read_as_command() {
+        for held in [Modifiers::Control, Modifiers::Super] {
+            let mods = egui_modifiers(held | Modifiers::Shift);
+            assert!(mods.command, "{:?} did not read as command", held);
+            assert!(mods.shift);
+            assert!(
+                mods.matches_logically(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT),
+                "{:?} did not match ⇧⌘",
+                held
+            );
+        }
+    }
+
+    /// ⌘ is a Mac's alone: egui's mac-only paths read `mac_cmd`, and a chord
+    /// asking for no modifier still has to see none.
+    #[test]
+    fn mac_cmd_follows_the_platform_and_a_bare_key_stays_bare() {
+        let sup = egui_modifiers(Modifiers::Super);
+        assert_eq!(sup.mac_cmd, cfg!(target_os = "macos"));
+        let none = egui_modifiers(Modifiers::empty());
+        assert!(!none.command && !none.ctrl);
+        assert!(none.matches_logically(egui::Modifiers::NONE));
+        assert!(!egui_modifiers(Modifiers::Control).matches_logically(egui::Modifiers::NONE));
     }
 }

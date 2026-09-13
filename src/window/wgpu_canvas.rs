@@ -2333,7 +2333,7 @@ trait WebModifiers {
 /// Builds a mask from a `getModifierState`-style query.
 ///
 /// See <https://developer.mozilla.org/en-US/docs/Web/API/KeyboardEvent/getModifierState>.
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 fn web_modifiers(state: impl Fn(&str) -> bool) -> Modifiers {
     let mut res = Modifiers::empty();
     if state("Shift") {
@@ -2420,7 +2420,7 @@ fn is_modifier_key(key: Key) -> bool {
     )
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 fn translate_web_key(code: &str) -> Key {
     match code {
         "Digit1" => Key::Key1,
@@ -2539,6 +2539,33 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The editor's chords are punctuation and function keys, and both
+    /// backends read the physical code, so a shifted `\` is still `Backslash`.
+    #[test]
+    fn a_chord_key_arrives_as_its_physical_code() {
+        for (code, web, want) in [
+            (KeyCode::Backslash, "Backslash", Key::Backslash),
+            (KeyCode::Comma, "Comma", Key::Comma),
+            (KeyCode::Equal, "Equal", Key::Equals),
+            (KeyCode::Slash, "Slash", Key::Slash),
+            (KeyCode::F5, "F5", Key::F5),
+        ] {
+            assert_eq!(translate_key(PhysicalKey::Code(code)), want);
+            assert_eq!(translate_web_key(web), want);
+        }
+    }
+
+    /// Both keys reach the event as themselves. Folding them into one command
+    /// modifier is the egui layer's job, in `egui_modifiers`.
+    #[test]
+    fn control_and_super_both_reach_the_event() {
+        let held = translate_modifiers(ModifiersState::SUPER | ModifiersState::SHIFT);
+        assert!(held.contains(Modifiers::Super) && held.contains(Modifiers::Shift));
+        assert!(translate_modifiers(ModifiersState::CONTROL).contains(Modifiers::Control));
+        let web = web_modifiers(|key| key == "Meta" || key == "Shift");
+        assert!(web.contains(Modifiers::Super) && web.contains(Modifiers::Shift));
     }
 
     // Regression test for https://github.com/dimforge/kiss3d/issues/380:
