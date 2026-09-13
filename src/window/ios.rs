@@ -23,9 +23,9 @@ use objc2_foundation::{
     NSValue, NSURL,
 };
 use objc2_ui_kit::{
-    NSValueUIGeometryExtensions, UIApplicationDidFinishLaunchingNotification, UIFont, UIKeyInput,
-    UIKeyboardFrameEndUserInfoKey, UIKeyboardWillChangeFrameNotification, UIFontTextStyleBody,
-    UITextInputTraits, UIView,
+    NSValueUIGeometryExtensions, UIApplicationDidFinishLaunchingNotification, UIFont,
+    UIFontTextStyleBody, UIKeyInput, UIKeyboardFrameEndUserInfoKey,
+    UIKeyboardWillChangeFrameNotification, UITextInputTraits, UIView,
 };
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -396,11 +396,11 @@ pub(crate) fn safe_area(window: &Window) -> [f64; 4] {
 pub(crate) fn text_scale() -> f32 {
     /// The body style's size at the default Dynamic Type setting.
     const STANDARD_BODY: f64 = 17.0;
-    let Some(mtm) = MainThreadMarker::new() else {
+    if MainThreadMarker::new().is_none() {
         return 1.0;
-    };
-    let font = unsafe { UIFont::preferredFontForTextStyle(UIFontTextStyleBody, mtm) };
-    let size = font.pointSize();
+    }
+    let font = unsafe { UIFont::preferredFontForTextStyle(UIFontTextStyleBody) };
+    let size = unsafe { font.pointSize() };
     if size > 0.0 {
         (size / STANDARD_BODY) as f32
     } else {
