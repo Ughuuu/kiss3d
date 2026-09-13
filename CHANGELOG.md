@@ -42,6 +42,17 @@
 - egui's pointer shape is applied to the window, and a pass egui asks to discard (a new `Area`, a
   `Grid`, a `Resize`) is re-run before the frame is shown rather than showing the gap.
 - `Canvas::set_cursor_icon` and `HdrPipeline::scene_texture`.
+- `Window::keyboard_height` reports how many pixels of the window the on-screen keyboard covers,
+  from the bottom. Non-zero on Android and iOS, so a mobile app can lift what the keyboard would
+  bury.
+- `Window::set_exclusive_fullscreen` takes the current monitor's largest video mode at its highest
+  refresh rate, and `set_maximized` / `is_maximized` join the existing `set_fullscreen` /
+  `is_fullscreen`.
+- `kiss3d::wgpu` re-exports the wgpu the crate itself was built against. The material traits are
+  written in wgpu types, so an implementor naming them through this cannot drift to another
+  version.
+- egui now hears punctuation, digits, the numpad, the function keys and the clipboard keys, not
+  only the letters and the navigation keys, so an app can bind a chord to any of them.
 
 ## Bug Fixes
 
@@ -56,6 +67,10 @@
   pressed for good: macOS sends no keyup of its own for it.
 - A render target reused at another colour format is remade rather than only resized.
 - Auto-exposure meters what the film-stage chain wrote, not the film it started from.
+- An egui shortcut now fires from either Ctrl or ⌘, on every platform, rather than from whichever
+  one the build's platform calls the command key. This deliberately departs from egui's own rule
+  (⌘ on macOS, Ctrl everywhere else), so that a Mac keyboard drives the same chords wherever it is
+  plugged in; `mac_cmd` still follows the platform, so egui's mac-only paths are unaffected.
 
 ## Performance
 
