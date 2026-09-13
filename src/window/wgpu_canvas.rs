@@ -1,6 +1,6 @@
 //! Unified wgpu-based canvas for both native and web platforms.
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::sync::mpsc::Sender;
@@ -124,7 +124,7 @@ enum LifecycleEvent {
     Suspended,
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 thread_local! {
     // The least of the window NativeActivity's content rect has ever left
     // uncovered at this window height: the navigation bar, where the system
@@ -138,7 +138,7 @@ thread_local! {
 /// NativeActivity reports one rect for everything the system covers, keyboard
 /// and navigation bar alike. The bar's share is the smallest cover seen at
 /// this height, so what is left above it is the keyboard.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 fn android_keyboard(height: i32, covered: i32) -> f32 {
     ANDROID_RESTING.with(|resting| {
         let (at, least) = resting.get();
@@ -1908,8 +1908,9 @@ impl WgpuCanvas {
     }
 
     /// Enter exclusive fullscreen on the current monitor, in its largest
-    /// video mode at the highest refresh rate, or leave it. Falls back to
-    /// borderless where the platform offers no video modes, as the web does.
+    /// video mode at the highest refresh rate, or leave fullscreen entirely.
+    /// Falls back to borderless where the platform offers no video modes, as
+    /// the web does.
     pub fn set_exclusive_fullscreen(&self, exclusive: bool) {
         let Some(window) = &self.window else {
             return;
@@ -1938,6 +1939,13 @@ impl WgpuCanvas {
         if let Some(window) = &self.window {
             window.set_maximized(maximized);
         }
+    }
+
+    /// Whether the window is currently maximized.
+    pub fn is_maximized(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.is_maximized())
     }
 
     /// Whether the window is currently fullscreen.
@@ -2556,6 +2564,22 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The navigation bar covers the window whether or not the keyboard is up,
+    /// so the first cover seen at a height is taken as the bar alone and only
+    /// what a later one adds is the keyboard. A rotation changes the height,
+    /// which starts the measurement again.
+    #[test]
+    fn the_android_keyboard_is_what_covers_more_than_the_navigation_bar() {
+        // 1080-tall window whose navigation bar takes the bottom 60.
+        assert_eq!(android_keyboard(1080, 60), 0.0, "the bar alone is not it");
+        assert_eq!(android_keyboard(1080, 660), 600.0, "the keyboard is up");
+        assert_eq!(android_keyboard(1080, 60), 0.0, "and down again");
+        // A rotation: the new height is measured from scratch, so its first
+        // cover is the bar again rather than 600 pixels of phantom keyboard.
+        assert_eq!(android_keyboard(1920, 40), 0.0);
+        assert_eq!(android_keyboard(1920, 440), 400.0);
     }
 
     /// The editor's chords are punctuation and function keys, and both

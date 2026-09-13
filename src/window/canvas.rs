@@ -199,6 +199,11 @@ impl Canvas {
         self.canvas.set_maximized(maximized);
     }
 
+    /// Whether the window is currently maximized.
+    pub fn is_maximized(&self) -> bool {
+        self.canvas.is_maximized()
+    }
+
     /// Show or hide the platform's on-screen keyboard (mobile; no-op elsewhere).
     pub fn set_keyboard_visible(&self, visible: bool) {
         self.canvas.set_keyboard_visible(visible);

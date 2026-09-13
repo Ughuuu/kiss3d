@@ -321,23 +321,30 @@ fn observe_keyboard(mtm: MainThreadMarker) {
 /// The frame is converted into the view's own coordinates, as Apple asks: a
 /// screen-space frame is wrong under rotation and in a window smaller than
 /// the screen.
-pub(crate) fn keyboard_height(window: &Window) -> f64 {
+/// The `UIView` winit put this window's content in, with the marker proving
+/// the thread UIKit may be touched from.
+///
+/// `None` off the main thread, which winit callbacks (and so the app future)
+/// never leave, or on a window that is not a UIKit one.
+fn ui_view(window: &Window) -> Option<(MainThreadMarker, &UIView)> {
     use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
 
-    if MainThreadMarker::new().is_none() {
-        return 0.0;
-    }
+    let mtm = MainThreadMarker::new()?;
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::UiKit(ui_kit) = handle.as_raw() else {
+        return None;
+    };
+    // Valid while `window` is alive, which the borrow guarantees.
+    Some((mtm, unsafe { ui_kit.ui_view.cast().as_ref() }))
+}
+
+pub(crate) fn keyboard_height(window: &Window) -> f64 {
     let Some(frame) = KEYBOARD_FRAME.with(Cell::get) else {
         return 0.0;
     };
-    let Ok(handle) = window.window_handle() else {
+    let Some((_, view)) = ui_view(window) else {
         return 0.0;
     };
-    let RawWindowHandle::UiKit(ui_kit) = handle.as_raw() else {
-        return 0.0;
-    };
-    // Valid while `window` is alive, which the borrow guarantees.
-    let view: &UIView = unsafe { ui_kit.ui_view.cast().as_ref() };
     let local = view.convertRect_fromView(frame, None);
     let bottom = view.bounds().size.height;
     (bottom - local.origin.y).clamp(0.0, local.size.height.max(0.0))
@@ -375,41 +382,18 @@ pub fn take_launch_url() -> Option<String> {
 
 /// `[left, top, right, bottom]` in points; zeros before the view is laid out.
 pub(crate) fn safe_area(window: &Window) -> [f64; 4] {
-    use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
-
-    if MainThreadMarker::new().is_none() {
-        return [0.0; 4];
-    }
-    let Ok(handle) = window.window_handle() else {
+    let Some((_, view)) = ui_view(window) else {
         return [0.0; 4];
     };
-    let RawWindowHandle::UiKit(ui_kit) = handle.as_raw() else {
-        return [0.0; 4];
-    };
-    // Valid while `window` is alive, which the borrow guarantees.
-    let view: &UIView = unsafe { ui_kit.ui_view.cast().as_ref() };
     let insets = view.safeAreaInsets();
     [insets.left, insets.top, insets.right, insets.bottom]
 }
 
 /// Show or hide the system keyboard for `window`.
 pub(crate) fn set_keyboard_visible(window: &Window, visible: bool) {
-    use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
-
-    // Everything here is UIKit: reachable only from the main thread, which
-    // is the only thread winit callbacks (and therefore the app future) run
-    // on. The guard is belt and braces, not a code path.
-    let Some(mtm) = MainThreadMarker::new() else {
+    let Some((mtm, parent)) = ui_view(window) else {
         return;
     };
-    let Ok(handle) = window.window_handle() else {
-        return;
-    };
-    let RawWindowHandle::UiKit(ui_kit) = handle.as_raw() else {
-        return;
-    };
-    // Valid while `window` is alive, which the borrow guarantees.
-    let parent: &UIView = unsafe { ui_kit.ui_view.cast().as_ref() };
 
     KEY_VIEW.with(|cell| {
         let mut cell = cell.borrow_mut();

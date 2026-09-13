@@ -353,8 +353,9 @@ impl Window {
         self.canvas.set_fullscreen(fullscreen);
     }
 
-    /// Enters or leaves exclusive fullscreen: the current monitor's largest
-    /// video mode, at its highest refresh rate.
+    /// Enters exclusive fullscreen, the current monitor's largest video mode
+    /// at its highest refresh rate, or leaves fullscreen entirely: passing
+    /// `false` also leaves the borderless fullscreen of [`Self::set_fullscreen`].
     ///
     /// # Platform-specific
     /// Where the platform offers no video modes, as on the web, this is
@@ -366,6 +367,11 @@ impl Window {
     /// Maximizes the window, or restores it.
     pub fn set_maximized(&self, maximized: bool) {
         self.canvas.set_maximized(maximized);
+    }
+
+    /// Whether the window is currently maximized.
+    pub fn is_maximized(&self) -> bool {
+        self.canvas.is_maximized()
     }
 
     /// Shows or hides the platform's on-screen keyboard.
