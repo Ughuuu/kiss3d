@@ -206,6 +206,18 @@ impl Window {
         self.egui_context.renderer.context()
     }
 
+    /// Physical pixels per egui point: the display's own scale factor times
+    /// the UI zoom held by [`egui::Context::set_zoom_factor`]. Every position
+    /// egui is fed and the screen it is told about are divided by this, which
+    /// is what `egui-winit` does.
+    ///
+    /// A host that wants the UI larger sets the zoom factor and reads this to
+    /// learn what a point became; it must not set `pixels_per_point` itself,
+    /// since egui derives that from the zoom and the native scale below.
+    pub fn egui_pixels_per_point(&self) -> f32 {
+        self.egui_context.renderer.context().zoom_factor() * self.scale_factor() as f32
+    }
+
     /// Registers a native wgpu texture view with this window's egui renderer,
     /// returning a [`egui::TextureId`] that can be drawn with
     /// `ui.image((id, size))` inside [`Window::draw_ui`] — entirely on the
@@ -265,7 +277,7 @@ impl Window {
 
     /// Feed a window event to egui for processing.
     pub(crate) fn feed_egui_event(&mut self, event: &WindowEvent) {
-        let scale_factor = self.scale_factor() as f32;
+        let scale_factor = self.egui_pixels_per_point();
 
         match *event {
             WindowEvent::CursorPos(x, y, _) => {
@@ -518,22 +530,23 @@ impl Window {
             Some(start.elapsed().as_secs_f64())
         };
 
-        let scale_factor = self.canvas.scale_factor() as f32;
-
-        // Set pixels_per_point on the context to match our DPI scale
-        self.egui_context
-            .renderer
-            .context()
-            .set_pixels_per_point(scale_factor);
+        let native = self.canvas.scale_factor() as f32;
+        let ppp = self.egui_pixels_per_point();
 
         // Build raw input with accumulated events
         let mut raw_input = std::mem::take(&mut self.egui_context.raw_input);
+        // The display's own scale, which egui multiplies by the zoom factor to
+        // reach `pixels_per_point`. Setting that directly instead would pin the
+        // zoom at 1, since `set_pixels_per_point` is a zoom setter in disguise.
+        let viewport = raw_input.viewport_id;
+        raw_input
+            .viewports
+            .entry(viewport)
+            .or_default()
+            .native_pixels_per_point = Some(native);
         raw_input.screen_rect = Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(
-                self.width() as f32 / scale_factor,
-                self.height() as f32 / scale_factor,
-            ),
+            egui::vec2(self.width() as f32 / ppp, self.height() as f32 / ppp),
         ));
         raw_input.time = time;
         raw_input.predicted_dt = 1.0 / 60.0;

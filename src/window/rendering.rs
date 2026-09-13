@@ -1491,13 +1491,12 @@ impl Window {
             // Close the pass opened by any draw_ui/draw_inspector calls this
             // frame so all their shapes are tessellated together.
             self.finish_egui_pass();
-            self.egui_context.renderer.render(
-                &frame_view,
-                &depth_view,
-                w,
-                h,
-                self.canvas.scale_factor() as f32,
-            );
+            // What the pass laid out in, zoom included, not the display's own
+            // scale: tessellation and the screen descriptor both want points.
+            let ppp = self.egui_pixels_per_point();
+            self.egui_context
+                .renderer
+                .render(&frame_view, &depth_view, w, h, ppp);
         }
 
         // Copy the rendered image into the readback texture so `snap`,
@@ -1739,13 +1738,10 @@ impl Window {
             // Close the pass opened by any draw_ui/draw_inspector calls this
             // frame so all their shapes are tessellated together.
             self.finish_egui_pass();
-            self.egui_context.renderer.render(
-                &frame_view,
-                &frame_view,
-                w,
-                h,
-                self.canvas.scale_factor() as f32,
-            );
+            let ppp = self.egui_pixels_per_point();
+            self.egui_context
+                .renderer
+                .render(&frame_view, &frame_view, w, h, ppp);
         }
 
         match &frame {
