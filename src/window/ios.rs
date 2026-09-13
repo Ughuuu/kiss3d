@@ -23,9 +23,9 @@ use objc2_foundation::{
     NSValue, NSURL,
 };
 use objc2_ui_kit::{
-    NSValueUIGeometryExtensions, UIApplicationDidFinishLaunchingNotification, UIKeyInput,
-    UIKeyboardFrameEndUserInfoKey, UIKeyboardWillChangeFrameNotification, UITextInputTraits,
-    UIView,
+    NSValueUIGeometryExtensions, UIApplicationDidFinishLaunchingNotification, UIFont, UIKeyInput,
+    UIKeyboardFrameEndUserInfoKey, UIKeyboardWillChangeFrameNotification, UIFontTextStyleBody,
+    UITextInputTraits, UIView,
 };
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -387,6 +387,25 @@ pub(crate) fn safe_area(window: &Window) -> [f64; 4] {
     };
     let insets = view.safeAreaInsets();
     [insets.left, insets.top, insets.right, insets.bottom]
+}
+
+/// How much larger than standard the reader asked their text to be.
+///
+/// Dynamic Type, as the ratio of the body style's point size to the 17 points
+/// it is at the default setting. 1.0 where UIKit cannot be asked.
+pub(crate) fn text_scale() -> f32 {
+    /// The body style's size at the default Dynamic Type setting.
+    const STANDARD_BODY: f64 = 17.0;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return 1.0;
+    };
+    let font = unsafe { UIFont::preferredFontForTextStyle(UIFontTextStyleBody, mtm) };
+    let size = font.pointSize();
+    if size > 0.0 {
+        (size / STANDARD_BODY) as f32
+    } else {
+        1.0
+    }
 }
 
 /// Show or hide the system keyboard for `window`.

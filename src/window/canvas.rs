@@ -234,6 +234,11 @@ impl Canvas {
         self.canvas.safe_area()
     }
 
+    /// The reader's own preferred text size, as a multiplier of standard.
+    pub fn text_scale(&self) -> f32 {
+        self.canvas.text_scale()
+    }
+
     /// Pixels of the window the on-screen keyboard covers, from the bottom.
     pub fn keyboard_height(&self) -> f32 {
         self.canvas.keyboard_height()

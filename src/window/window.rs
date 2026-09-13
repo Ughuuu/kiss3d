@@ -419,6 +419,12 @@ impl Window {
         self.canvas.keyboard_height()
     }
 
+    /// How much larger than standard the reader asked their text to be: iOS
+    /// Dynamic Type today, and 1.0 where the platform has not been asked.
+    pub fn text_scale(&self) -> f32 {
+        self.canvas.text_scale()
+    }
+
     /// Sets the cursor position in window coordinates.
     ///
     /// # Arguments

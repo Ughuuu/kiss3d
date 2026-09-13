@@ -2056,6 +2056,19 @@ impl WgpuCanvas {
         }
     }
 
+    /// How much larger than standard the reader asked their text to be: iOS
+    /// Dynamic Type today, and 1.0 on every platform not yet asked.
+    pub fn text_scale(&self) -> f32 {
+        #[cfg(target_os = "ios")]
+        {
+            super::ios::text_scale()
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            1.0
+        }
+    }
+
     /// Set the cursor grabbing behaviour.
     pub fn set_cursor_grab(&self, grab: bool) {
         use winit::window::CursorGrabMode;
