@@ -1359,6 +1359,22 @@ impl HdrPipeline {
     /// Runs the bloom prefilter + downsample + upsample chain. The final blurred
     /// result lands in `bloom_mips[0]` (half resolution), which the tonemap pass
     /// samples.
+    /// Compile whatever the current settings will draw with, so the frame that
+    /// first draws it is not the frame that waits for a shader compiler.
+    ///
+    /// Called when the settings change rather than when a pass runs: a project
+    /// that ships with bloom on pays at start-up, as it did when these were
+    /// built unconditionally, and one that turns it on mid-game pays on the
+    /// frame it asked rather than inside a render pass.
+    pub fn prepare(&self) {
+        if self.settings.bloom_enabled {
+            let _ = self.bloom();
+        }
+        if self.settings.auto_exposure {
+            let _ = self.exposure();
+        }
+    }
+
     /// The bloom chain, compiled on the first frame that draws it.
     fn bloom(&self) -> &BloomPipelines {
         self.bloom.get_or_init(|| build_bloom(&self.bloom_layout))

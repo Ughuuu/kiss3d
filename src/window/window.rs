@@ -906,6 +906,15 @@ impl Window {
         self.hdr.settings_mut().bloom_enabled = enabled;
     }
 
+    /// Compile the finishing passes the current settings will draw with.
+    ///
+    /// Bloom and auto-exposure are built on demand, so call this after writing
+    /// the settings: a frame that waits for a shader compiler is a frame
+    /// somebody sees, and this puts that wait where the settings changed.
+    pub fn prepare_post(&self) {
+        self.hdr.prepare();
+    }
+
     /// Sets the bloom brightness threshold and additive intensity.
     pub fn set_bloom(&mut self, threshold: f32, intensity: f32) {
         let s = self.hdr.settings_mut();
