@@ -1024,15 +1024,26 @@ impl WgpuCanvas {
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
 
-            let adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::default(),
-                    compatible_surface: None,
-                    force_fallback_adapter: false,
-                    apply_limit_buckets: false,
-                })
-                .await
-                .expect("Failed to find an appropriate adapter");
+            let ask = async |fallback: bool| {
+                instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::default(),
+                        compatible_surface: None,
+                        force_fallback_adapter: fallback,
+                        apply_limit_buckets: false,
+                    })
+                    .await
+                    .ok()
+            };
+            // A machine with no GPU driver still has a software one: WARP on
+            // Windows, lavapipe where Mesa is installed. Slow, and the only
+            // way a surface-less render runs on a CI box at all.
+            let adapter = match ask(false).await {
+                Some(adapter) => adapter,
+                None => ask(true)
+                    .await
+                    .expect("Failed to find an appropriate adapter, software one included"),
+            };
 
             let required_features = device_features(&adapter, canvas_setup.required_features);
             let (device, queue) = adapter
