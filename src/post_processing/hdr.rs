@@ -221,6 +221,180 @@ struct HdrTargets {
     oit_reveal_msaa_view: Option<wgpu::TextureView>,
 }
 
+/// Compile the bloom chain. Called the first time a frame draws bloom.
+fn build_bloom(bloom_layout: &wgpu::BindGroupLayout) -> BloomPipelines {
+    let ctxt = Context::get();
+    let vertex_layout = Some(wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<QuadVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[wgpu::VertexAttribute {
+            offset: 0,
+            shader_location: 0,
+            format: wgpu::VertexFormat::Float32x2,
+        }],
+    });
+
+    let bloom_shader = ctxt.create_shader_module(
+        Some("hdr_bloom_shader"),
+        &crate::builtin::compile_shader_with_common(
+            "package::hdr_bloom",
+            include_str!("../builtin/hdr_bloom.wgsl"),
+        ),
+    );
+
+    let bloom_pipeline_layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("hdr_bloom_pipeline_layout"),
+        bind_group_layouts: &[Some(&bloom_layout)],
+        immediate_size: 0,
+    });
+
+    let make_bloom_pipeline = |label: &str, fs_entry: &str, blend: Option<wgpu::BlendState>| {
+        ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&bloom_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &bloom_shader,
+                entry_point: Some("vs_main"),
+                buffers: std::slice::from_ref(&vertex_layout),
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &bloom_shader,
+                entry_point: Some(fs_entry),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+
+    let prefilter = make_bloom_pipeline("hdr_bloom_prefilter", "fs_prefilter", None);
+    let downsample = make_bloom_pipeline("hdr_bloom_downsample", "fs_downsample", None);
+    // The upsample pass additively blends into the larger mip.
+    let upsample = make_bloom_pipeline(
+        "hdr_bloom_upsample",
+        "fs_upsample",
+        Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::REPLACE,
+        }),
+    );
+
+    BloomPipelines {
+        prefilter,
+        downsample,
+        upsample,
+    }
+}
+
+/// The bloom chain's pipelines, built together the first time bloom draws.
+struct BloomPipelines {
+    prefilter: wgpu::RenderPipeline,
+    downsample: wgpu::RenderPipeline,
+    upsample: wgpu::RenderPipeline,
+}
+
+/// Auto-exposure's two 1x1 pipelines, built the first time it runs.
+struct ExposurePipelines {
+    meter: wgpu::RenderPipeline,
+    adapt: wgpu::RenderPipeline,
+}
+
+/// Compile auto-exposure's two passes. Called the first time one runs.
+fn build_exposure(
+    meter_layout: &wgpu::BindGroupLayout,
+    adapt_layout: &wgpu::BindGroupLayout,
+) -> ExposurePipelines {
+    let ctxt = Context::get();
+    let meter_shader = ctxt.create_shader_module(
+        Some("hdr_autoexposure_meter"),
+        &crate::builtin::compile_shader_with_common(
+            "package::auto_exposure_meter",
+            include_str!("../builtin/auto_exposure_meter.wgsl"),
+        ),
+    );
+    let make_1x1_pipeline =
+        |label: &str, layout: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule| {
+            let pl = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+            ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::R16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+    let meter = make_1x1_pipeline("hdr_autoexposure_meter", meter_layout, &meter_shader);
+
+    let adapt_shader = ctxt.create_shader_module(
+        Some("hdr_autoexposure_adapt"),
+        &crate::builtin::compile_shader_with_common(
+            "package::auto_exposure_adapt",
+            include_str!("../builtin/auto_exposure_adapt.wgsl"),
+        ),
+    );
+    let adapt = make_1x1_pipeline("hdr_autoexposure_adapt", adapt_layout, &adapt_shader);
+    ExposurePipelines { meter, adapt }
+}
+
 /// Owns the HDR scene target, bloom chain and resolve pipelines for the
 /// rasterizer. One instance lives on each [`Window`](crate::window::Window).
 pub struct HdrPipeline {
@@ -265,9 +439,10 @@ pub struct HdrPipeline {
 
     // Bloom pipelines (prefilter / downsample / upsample) and tonemap pipeline.
     bloom_layout: wgpu::BindGroupLayout,
-    prefilter_pipeline: wgpu::RenderPipeline,
-    downsample_pipeline: wgpu::RenderPipeline,
-    upsample_pipeline: wgpu::RenderPipeline,
+    // Built the first frame bloom is drawn. Bloom is off by default, so three
+    // pipelines and a shader module were compiled at start-up for a pass most
+    // projects never run.
+    bloom: std::sync::OnceLock<BloomPipelines>,
     tonemap_layout: wgpu::BindGroupLayout,
     tonemap_pipeline: wgpu::RenderPipeline,
 
@@ -290,9 +465,9 @@ pub struct HdrPipeline {
     // Index of the texture written this frame (the other holds the previous value).
     exposure_index: usize,
     meter_layout: wgpu::BindGroupLayout,
-    meter_pipeline: wgpu::RenderPipeline,
     adapt_layout: wgpu::BindGroupLayout,
-    adapt_pipeline: wgpu::RenderPipeline,
+    // Built the first frame auto-exposure runs, for the same reason as `bloom`.
+    exposure: std::sync::OnceLock<ExposurePipelines>,
     adapt_uniform: wgpu::Buffer,
     // Wall-clock of the previous adaptation, for the dt-based smoothing.
     last_adapt_time: Option<web_time::Instant>,
@@ -353,14 +528,6 @@ impl HdrPipeline {
             ],
         });
 
-        let bloom_shader = ctxt.create_shader_module(
-            Some("hdr_bloom_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::hdr_bloom",
-                include_str!("../builtin/hdr_bloom.wgsl"),
-            ),
-        );
-
         let vertex_layout = Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<QuadVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -370,69 +537,6 @@ impl HdrPipeline {
                 format: wgpu::VertexFormat::Float32x2,
             }],
         });
-
-        let bloom_pipeline_layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("hdr_bloom_pipeline_layout"),
-            bind_group_layouts: &[Some(&bloom_layout)],
-            immediate_size: 0,
-        });
-
-        let make_bloom_pipeline = |label: &str, fs_entry: &str, blend: Option<wgpu::BlendState>| {
-            ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&bloom_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &bloom_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: std::slice::from_ref(&vertex_layout),
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &bloom_shader,
-                    entry_point: Some(fs_entry),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: HDR_FORMAT,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleStrip,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-
-        let prefilter_pipeline = make_bloom_pipeline("hdr_bloom_prefilter", "fs_prefilter", None);
-        let downsample_pipeline =
-            make_bloom_pipeline("hdr_bloom_downsample", "fs_downsample", None);
-        // The upsample pass additively blends into the larger mip.
-        let upsample_pipeline = make_bloom_pipeline(
-            "hdr_bloom_upsample",
-            "fs_upsample",
-            Some(wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::One,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent::REPLACE,
-            }),
-        );
 
         // Tonemap bind group: scene texture + sampler, bloom texture + sampler, uniforms.
         let tonemap_layout = ctxt.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -699,61 +803,6 @@ impl HdrPipeline {
                 },
             ],
         });
-        let meter_shader = ctxt.create_shader_module(
-            Some("hdr_autoexposure_meter"),
-            &crate::builtin::compile_shader_with_common(
-                "package::auto_exposure_meter",
-                include_str!("../builtin/auto_exposure_meter.wgsl"),
-            ),
-        );
-        let make_1x1_pipeline =
-            |label: &str, layout: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule| {
-                let pl = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some(label),
-                    bind_group_layouts: &[Some(layout)],
-                    immediate_size: 0,
-                });
-                ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&pl),
-                    vertex: wgpu::VertexState {
-                        module: shader,
-                        entry_point: Some("vs_main"),
-                        buffers: &[],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: shader,
-                        entry_point: Some("fs_main"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: wgpu::TextureFormat::R16Float,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None,
-                        polygon_mode: wgpu::PolygonMode::Fill,
-                        unclipped_depth: false,
-                        conservative: false,
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState {
-                        count: 1,
-                        mask: !0,
-                        alpha_to_coverage_enabled: false,
-                    },
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
-        let meter_pipeline =
-            make_1x1_pipeline("hdr_autoexposure_meter", &meter_layout, &meter_shader);
-
         // Adaptation pipeline: meter + prev exposure + sampler + uniforms -> new exposure.
         let adapt_layout = ctxt.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("hdr_autoexposure_adapt_layout"),
@@ -796,15 +845,6 @@ impl HdrPipeline {
                 },
             ],
         });
-        let adapt_shader = ctxt.create_shader_module(
-            Some("hdr_autoexposure_adapt"),
-            &crate::builtin::compile_shader_with_common(
-                "package::auto_exposure_adapt",
-                include_str!("../builtin/auto_exposure_adapt.wgsl"),
-            ),
-        );
-        let adapt_pipeline =
-            make_1x1_pipeline("hdr_autoexposure_adapt", &adapt_layout, &adapt_shader);
         let adapt_uniform = ctxt.create_buffer_simple(
             Some("hdr_autoexposure_adapt_uniform"),
             std::mem::size_of::<AdaptUniforms>() as u64,
@@ -835,9 +875,7 @@ impl HdrPipeline {
             oit_composite_pipeline,
             sampler,
             bloom_layout,
-            prefilter_pipeline,
-            downsample_pipeline,
-            upsample_pipeline,
+            bloom: std::sync::OnceLock::new(),
             tonemap_layout,
             tonemap_pipeline,
             _tony_lut_texture: tony_lut,
@@ -852,9 +890,8 @@ impl HdrPipeline {
             exposure_views: [exposure_view0, exposure_view1],
             exposure_index: 0,
             meter_layout,
-            meter_pipeline,
             adapt_layout,
-            adapt_pipeline,
+            exposure: std::sync::OnceLock::new(),
             adapt_uniform,
             last_adapt_time: None,
         }
@@ -1322,6 +1359,17 @@ impl HdrPipeline {
     /// Runs the bloom prefilter + downsample + upsample chain. The final blurred
     /// result lands in `bloom_mips[0]` (half resolution), which the tonemap pass
     /// samples.
+    /// The bloom chain, compiled on the first frame that draws it.
+    fn bloom(&self) -> &BloomPipelines {
+        self.bloom.get_or_init(|| build_bloom(&self.bloom_layout))
+    }
+
+    /// Auto-exposure's passes, compiled on the first frame that runs them.
+    fn exposure(&self) -> &ExposurePipelines {
+        self.exposure
+            .get_or_init(|| build_exposure(&self.meter_layout, &self.adapt_layout))
+    }
+
     fn run_bloom(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1350,7 +1398,7 @@ impl HdrPipeline {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.prefilter_pipeline);
+            pass.set_pipeline(&self.bloom().prefilter);
             pass.set_bind_group(0, &bg, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.draw(0..4, 0..1);
@@ -1378,7 +1426,7 @@ impl HdrPipeline {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.downsample_pipeline);
+            pass.set_pipeline(&self.bloom().downsample);
             pass.set_bind_group(0, &bg, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.draw(0..4, 0..1);
@@ -1407,7 +1455,7 @@ impl HdrPipeline {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.upsample_pipeline);
+            pass.set_pipeline(&self.bloom().upsample);
             pass.set_bind_group(0, &bg, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.draw(0..4, 0..1);
@@ -1489,7 +1537,7 @@ impl HdrPipeline {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.meter_pipeline);
+            pass.set_pipeline(&self.exposure().meter);
             pass.set_bind_group(0, &meter_bg, &[]);
             pass.draw(0..3, 0..1);
         }
@@ -1535,7 +1583,7 @@ impl HdrPipeline {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.adapt_pipeline);
+            pass.set_pipeline(&self.exposure().adapt);
             pass.set_bind_group(0, &adapt_bg, &[]);
             pass.draw(0..3, 0..1);
         }
