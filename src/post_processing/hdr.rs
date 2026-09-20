@@ -442,7 +442,7 @@ pub struct HdrPipeline {
     // Built the first frame bloom is drawn. Bloom is off by default, so three
     // pipelines and a shader module were compiled at start-up for a pass most
     // projects never run.
-    bloom: std::sync::OnceLock<BloomPipelines>,
+    bloom: std::cell::OnceCell<BloomPipelines>,
     tonemap_layout: wgpu::BindGroupLayout,
     tonemap_pipeline: wgpu::RenderPipeline,
 
@@ -467,7 +467,7 @@ pub struct HdrPipeline {
     meter_layout: wgpu::BindGroupLayout,
     adapt_layout: wgpu::BindGroupLayout,
     // Built the first frame auto-exposure runs, for the same reason as `bloom`.
-    exposure: std::sync::OnceLock<ExposurePipelines>,
+    exposure: std::cell::OnceCell<ExposurePipelines>,
     adapt_uniform: wgpu::Buffer,
     // Wall-clock of the previous adaptation, for the dt-based smoothing.
     last_adapt_time: Option<web_time::Instant>,
@@ -875,7 +875,7 @@ impl HdrPipeline {
             oit_composite_pipeline,
             sampler,
             bloom_layout,
-            bloom: std::sync::OnceLock::new(),
+            bloom: std::cell::OnceCell::new(),
             tonemap_layout,
             tonemap_pipeline,
             _tony_lut_texture: tony_lut,
@@ -891,7 +891,7 @@ impl HdrPipeline {
             exposure_index: 0,
             meter_layout,
             adapt_layout,
-            exposure: std::sync::OnceLock::new(),
+            exposure: std::cell::OnceCell::new(),
             adapt_uniform,
             last_adapt_time: None,
         }
