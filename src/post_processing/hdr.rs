@@ -244,7 +244,7 @@ fn build_bloom(bloom_layout: &wgpu::BindGroupLayout) -> BloomPipelines {
 
     let bloom_pipeline_layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("hdr_bloom_pipeline_layout"),
-        bind_group_layouts: &[Some(&bloom_layout)],
+        bind_group_layouts: &[Some(bloom_layout)],
         immediate_size: 0,
     });
 
