@@ -207,6 +207,7 @@ impl ObjectData2d {
 ///     lines_width: Some(2.0),  // 2px wireframe
 ///     points_color: Some([1.0, 1.0, 0.0, 1.0]),  // Yellow points
 ///     points_size: Some(5.0),  // 5px points
+///     uv: [0.0, 0.0, 1.0, 1.0],  // the whole image
 /// };
 /// ```
 pub struct InstanceData2d {
