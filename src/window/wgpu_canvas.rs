@@ -273,6 +273,14 @@ pub(crate) fn collect_window_event(window_id: winit::window::WindowId, event: Wi
         WinitWindowEvent::ModifiersChanged(new_modifiers) => {
             vec![PendingEvent::Modifiers(new_modifiers.state())]
         }
+        WinitWindowEvent::Focused(focused) => {
+            vec![PendingEvent::WindowEvent(WindowEvent::Focus(focused))]
+        }
+        // Minimised, covered or on another space: out of sight, as a
+        // backgrounded app is.
+        WinitWindowEvent::Occluded(hidden) => {
+            vec![PendingEvent::WindowEvent(WindowEvent::Iconify(hidden))]
+        }
         WinitWindowEvent::DroppedFile(path) => {
             DROPPED_FILES.with(|dropped| dropped.borrow_mut().push((window_id, path)));
             vec![]
@@ -1442,6 +1450,10 @@ impl WgpuCanvas {
                 let lifecycle: Vec<LifecycleEvent> =
                     LIFECYCLE_EVENTS.with(|events| events.borrow_mut().drain(..).collect());
                 for event in lifecycle {
+                    // Told to the app too: an activity in the background is
+                    // an iconified window.
+                    let backgrounded = matches!(event, LifecycleEvent::Suspended);
+                    let _ = self.out_events.send(WindowEvent::Iconify(backgrounded));
                     match event {
                         LifecycleEvent::Suspended => {
                             self.surface = None;
