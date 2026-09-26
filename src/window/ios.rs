@@ -9,6 +9,7 @@
 //! `while window.render().await` loop yield back to UIKit between frames —
 //! the iOS analogue of the wasm path awaiting `requestAnimationFrame`.
 
+use super::wgpu_canvas::{push_lifecycle, LifecycleEvent};
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
@@ -115,8 +116,19 @@ impl IosApp {
 impl ApplicationHandler for IosApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Poll);
+        if self.started {
+            push_lifecycle(LifecycleEvent::Resumed);
+        }
         self.started = true;
         self.poll(event_loop);
+    }
+
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        push_lifecycle(LifecycleEvent::Suspended);
+    }
+
+    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+        push_lifecycle(LifecycleEvent::LowMemory);
     }
 
     fn window_event(

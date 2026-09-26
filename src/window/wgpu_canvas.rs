@@ -129,14 +129,28 @@ thread_local! {
 thread_local! {
     static ANDROID_APP: RefCell<Option<winit::platform::android::activity::AndroidApp>> =
         const { RefCell::new(None) };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
     static LIFECYCLE_EVENTS: RefCell<Vec<LifecycleEvent>> = const { RefCell::new(Vec::new()) };
 }
 
-#[cfg(target_os = "android")]
+/// What the application, rather than a window, was told, kept until
+/// `poll_events` hands it on.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
-enum LifecycleEvent {
+pub(crate) enum LifecycleEvent {
     Resumed,
     Suspended,
+    LowMemory,
+}
+
+/// Queue an application event for the next `poll_events`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn push_lifecycle(event: LifecycleEvent) {
+    LIFECYCLE_EVENTS.with(|events| events.borrow_mut().push(event));
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -1418,6 +1432,10 @@ impl WgpuCanvas {
                         });
                     }
 
+                    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+                        push_lifecycle(LifecycleEvent::LowMemory);
+                    }
+
                     fn window_event(
                         &mut self,
                         _event_loop: &ActiveEventLoop,
@@ -1442,19 +1460,23 @@ impl WgpuCanvas {
                 });
             }
 
-            // Android: the native window lives only between Resumed and
-            // Suspended, so the surface must die and be reborn with it. While
-            // it is gone `get_current_texture` returns None and frames skip.
-            #[cfg(target_os = "android")]
+            // Told to the app as window events: an app in the background is
+            // an iconified window. Android: the native window lives only
+            // between Resumed and Suspended, so the surface must die and be
+            // reborn with it; while it is gone frames skip.
+            #[cfg(not(target_arch = "wasm32"))]
             {
                 let lifecycle: Vec<LifecycleEvent> =
                     LIFECYCLE_EVENTS.with(|events| events.borrow_mut().drain(..).collect());
                 for event in lifecycle {
-                    // Told to the app too: an activity in the background is
-                    // an iconified window.
-                    let backgrounded = matches!(event, LifecycleEvent::Suspended);
-                    let _ = self.out_events.send(WindowEvent::Iconify(backgrounded));
+                    let _ = self.out_events.send(match event {
+                        LifecycleEvent::LowMemory => WindowEvent::LowMemory,
+                        LifecycleEvent::Suspended => WindowEvent::Iconify(true),
+                        LifecycleEvent::Resumed => WindowEvent::Iconify(false),
+                    });
+                    #[cfg(target_os = "android")]
                     match event {
+                        LifecycleEvent::LowMemory => {}
                         LifecycleEvent::Suspended => {
                             self.surface = None;
                         }
