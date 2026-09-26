@@ -29,6 +29,6 @@ pub use offscreen::OffscreenSurface;
 pub use recording::RecordingConfig;
 #[cfg(target_os = "android")]
 pub use wgpu_canvas::init_android;
-pub use wgpu_canvas::WgpuCanvas;
+pub use wgpu_canvas::{Waker, WgpuCanvas};
 pub use window::Window;
 pub(crate) use window_cache::WINDOW_CACHE;

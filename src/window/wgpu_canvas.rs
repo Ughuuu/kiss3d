@@ -89,6 +89,21 @@ thread_local! {
     static EVENT_LOOP: RefCell<Option<EventLoop<()>>> = const { RefCell::new(None) };
 }
 
+/// Ends a [`WgpuCanvas::wait_events`] from any thread.
+#[derive(Clone, Debug)]
+pub struct Waker(
+    #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
+    winit::event_loop::EventLoopProxy<()>,
+);
+
+impl Waker {
+    /// Wake the waiting loop; harmless once it has gone.
+    pub fn wake(&self) {
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
+        let _ = self.0.send_event(());
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
     // Shared event storage for multi-window support. Events are stored per window_id
@@ -1330,10 +1345,38 @@ impl WgpuCanvas {
 
     /// Polls events from the window system.
     pub fn poll_events(&mut self) {
+        self.pump_events(Some(std::time::Duration::ZERO));
+    }
+
+    /// Blocks until the window system has an event, a [`Waker`] wakes it, or
+    /// `timeout` passes, then polls as [`Self::poll_events`] does; `None`
+    /// waits for as long as it takes. Answers whether anything arrived. The
+    /// web and iOS own their loops and cannot block here, so there it polls.
+    pub fn wait_events(&mut self, timeout: Option<std::time::Duration>) -> bool {
+        self.pump_events(timeout)
+    }
+
+    /// Something that ends a [`Self::wait_events`] from another thread.
+    /// `None` where the loop is not kiss3d's to pump.
+    pub fn waker(&self) -> Option<Waker> {
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
+        {
+            EVENT_LOOP.with(|cell| cell.borrow().as_ref().map(|el| Waker(el.create_proxy())))
+        }
+        #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
+        {
+            None
+        }
+    }
+
+    fn pump_events(&mut self, timeout: Option<std::time::Duration>) -> bool {
         // A headless canvas has no window and no event loop; nothing to poll.
         if self.window.is_none() {
-            return;
+            return false;
         }
+        let mut arrived = false;
+        #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
+        let _ = timeout;
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1345,7 +1388,9 @@ impl WgpuCanvas {
             {
                 use winit::platform::pump_events::EventLoopExtPumpEvents;
 
-                struct EventCollector;
+                struct EventCollector {
+                    arrived: bool,
+                }
 
                 impl ApplicationHandler for EventCollector {
                     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1371,15 +1416,20 @@ impl WgpuCanvas {
                         window_id: winit::window::WindowId,
                         event: WinitWindowEvent,
                     ) {
+                        self.arrived = true;
                         collect_window_event(window_id, event);
+                    }
+
+                    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+                        self.arrived = true;
                     }
                 }
 
-                let timeout = Some(std::time::Duration::ZERO);
                 EVENT_LOOP.with(|event_loop_cell| {
                     if let Some(ref mut event_loop) = *event_loop_cell.borrow_mut() {
-                        let mut collector = EventCollector;
+                        let mut collector = EventCollector { arrived: false };
                         let _ = event_loop.pump_app_events(timeout, &mut collector);
+                        arrived = collector.arrived;
                     }
                 });
             }
@@ -1447,6 +1497,7 @@ impl WgpuCanvas {
                     .remove(&self.window_id.unwrap())
                     .unwrap_or_default()
             });
+            arrived |= !events.is_empty();
 
             for event in events {
                 match event {
@@ -1563,6 +1614,7 @@ impl WgpuCanvas {
 
             // Process pending events from web callbacks
             let events: Vec<WindowEvent> = self.pending_events.borrow_mut().drain(..).collect();
+            arrived |= !events.is_empty();
             for event in events {
                 match &event {
                     WindowEvent::CursorPos(x, y, _) => {
@@ -1579,6 +1631,7 @@ impl WgpuCanvas {
                 let _ = self.out_events.send(event);
             }
         }
+        arrived
     }
 
     /// Gets the current surface texture for rendering.

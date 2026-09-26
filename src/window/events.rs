@@ -42,6 +42,22 @@ impl Window {
         EventManager::new(self.events.clone(), self.unhandled_events.clone())
     }
 
+    /// Sleeps until the window system has an event, a [`Waker`] from
+    /// [`Self::waker`] fires, or `timeout` passes, and queues what arrived for
+    /// [`Self::events`] without drawing. `None` waits for as long as it takes.
+    /// Answers whether anything arrived. The web and iOS cannot block here.
+    ///
+    /// [`Waker`]: crate::window::Waker
+    pub fn wait_events(&mut self, timeout: Option<std::time::Duration>) -> bool {
+        self.canvas.wait_events(timeout)
+    }
+
+    /// What ends a [`Self::wait_events`] from another thread; `None` where
+    /// the platform owns the loop.
+    pub fn waker(&self) -> Option<crate::window::Waker> {
+        self.canvas.waker()
+    }
+
     /// Gets the current state of a keyboard key.
     ///
     /// # Arguments

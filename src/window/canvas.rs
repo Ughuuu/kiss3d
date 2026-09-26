@@ -100,6 +100,17 @@ impl Canvas {
         self.canvas.poll_events()
     }
 
+    /// Wait for an event, a [`super::Waker`] or `timeout`, then poll; see
+    /// [`WgpuCanvas::wait_events`].
+    pub fn wait_events(&mut self, timeout: Option<std::time::Duration>) -> bool {
+        self.canvas.wait_events(timeout)
+    }
+
+    /// What ends a [`Self::wait_events`] from another thread.
+    pub fn waker(&self) -> Option<super::Waker> {
+        self.canvas.waker()
+    }
+
     /// Resizes the canvas render targets.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.canvas.resize(width, height)
