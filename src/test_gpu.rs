@@ -52,3 +52,8 @@ pub(crate) fn mean_luma(surface: &OffscreenSurface) -> f32 {
     let sum: f32 = image.pixels().map(|p| luma(p.0)).sum();
     sum / (image.width() * image.height()) as f32
 }
+
+/// Luma of one pixel of the last frame, `(0, 0)` at the top left.
+pub(crate) fn luma_at(surface: &OffscreenSurface, x: u32, y: u32) -> f32 {
+    luma(surface.snap_image().get_pixel(x, y).0)
+}

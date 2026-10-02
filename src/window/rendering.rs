@@ -710,9 +710,27 @@ impl Window {
             );
         }
 
+        let has_transparent = scene
+            .as_deref()
+            .is_some_and(|s| s.has_transparent_surfaces());
+
         // Render the 3D scene using two-phase rendering
         for pass in 0usize..camera.num_passes() {
+            if pass > 0 {
+                // The frame and object uniforms are shared, and `write_buffer` lands
+                // at the next submission: the previous pass must be submitted first.
+                let done = std::mem::replace(
+                    &mut encoder,
+                    ctxt.create_command_encoder(Some("kiss3d_frame_encoder")),
+                );
+                ctxt.submit(std::iter::once(done.finish()));
+                MaterialManager3d::get_global_manager(|mm| mm.begin_frame());
+                lights = LightCollection::with_ambient(self.ambient_intensity);
+                lights.ambient_color = self.ambient_color;
+                lights.fog = self.fog;
+            }
             camera.start_pass(pass, &self.canvas);
+            let [vx, vy, vw, vh] = camera.pass_viewport(pass, w, h);
 
             // Phase 1: Prepare - collect uniforms in CPU memory and gather lights from scene
             if let Some(scene) = scene.as_deref_mut() {
@@ -729,7 +747,7 @@ impl Window {
             // light into the shadow atlas before the color pass. World transforms are
             // already propagated and lights collected by `prepare`. Only meaningful
             // for the first pass; stereo passes reuse the same shadow maps.
-            if let Some(scene) = scene.as_deref_mut() {
+            if let Some(scene) = scene.as_deref_mut().filter(|_| pass == 0) {
                 self.shadow_mapper.render(
                     scene,
                     &*camera,
@@ -806,6 +824,7 @@ impl Window {
                             occlusion_query_set: None,
                             multiview_mask: None,
                         });
+                        pp.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
                         scene
                             .data_mut()
                             .render(0, camera, &lights, &mut pp, &prepass_ctx);
@@ -887,6 +906,7 @@ impl Window {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
+                wgpu_render_pass.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
 
                 if let Some(scene) = scene.as_deref_mut() {
                     self.render_scene(
@@ -930,87 +950,97 @@ impl Window {
                             occlusion_query_set: None,
                             multiview_mask: None,
                         });
+                    custom_render_pass.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
                     renderer.render(pass, camera, &mut custom_render_pass, &render_context);
                 }
             }
-        }
 
-        // === Order-independent transparency ===
-        // Transparent object surfaces are drawn in a separate weighted-blended pass
-        // (McGuire & Bavoil) into the HDR pipeline's accum + revealage targets, then
-        // composited over the opaque HDR scene — so transparency needs no sorting and
-        // is robust to interpenetration. Points/polylines are opaque overlays already
-        // drawn above. Done once (not per stereo pass).
-        //
-        // Skipped entirely when nothing in the scene is transparent (the common
-        // case): the geometry pass clears + MSAA-resolves the accum/revealage targets
-        // and the composite blends them back, all for zero draws otherwise. The
-        // `has_transparent_surfaces` check uses the same per-object classification the
-        // material applies, so a real transparent surface is never dropped.
-        if let Some(scene) = scene
-            .as_deref_mut()
-            .filter(|s| s.has_transparent_surfaces())
-        {
-            let oit_context = RenderContext {
-                surface_format: Context::render_format(),
-                // The OIT geometry pass shares the (MSAA) opaque depth buffer, so its
-                // targets and pipelines must use the same sample count.
-                sample_count,
-                viewport_width: w,
-                viewport_height: h,
-                render_layers: camera.render_layers(),
-                force_no_cull: false,
-                shadow: Some(self.shadow_mapper.resources()),
-                phase: RenderPhase::Transparent,
-            };
-            {
-                // Under MSAA the geometry pass renders into the multisampled accum/
-                // revealage attachments and resolves into their single-sample copies,
-                // which `composite_oit` then samples.
-                let oit_accum_resolve = self.hdr.oit_accum_resolve_view();
-                let oit_reveal_resolve = self.hdr.oit_reveal_resolve_view();
-                let oit_ts = self.gpu_timer.render_scope("transparent");
-                let mut oit_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("oit_geometry_pass"),
-                    color_attachments: &[
-                        // accum: cleared to 0 (additive).
-                        Some(wgpu::RenderPassColorAttachment {
-                            view: self.hdr.oit_accum_view(),
-                            resolve_target: oit_accum_resolve,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            // === Order-independent transparency ===
+            // Transparent object surfaces are drawn in a separate weighted-blended pass
+            // (McGuire & Bavoil) into the HDR pipeline's accum + revealage targets, then
+            // composited over the opaque HDR scene once every pass has drawn — so
+            // transparency needs no sorting and is robust to interpenetration.
+            // Points/polylines are opaque overlays already drawn above.
+            //
+            // Skipped entirely when nothing in the scene is transparent (the common
+            // case): the geometry pass clears + MSAA-resolves the accum/revealage targets
+            // and the composite blends them back, all for zero draws otherwise. The
+            // `has_transparent_surfaces` check uses the same per-object classification the
+            // material applies, so a real transparent surface is never dropped.
+            if let Some(scene) = scene.as_deref_mut().filter(|_| has_transparent) {
+                let oit_context = RenderContext {
+                    surface_format: Context::render_format(),
+                    // The OIT geometry pass shares the (MSAA) opaque depth buffer, so its
+                    // targets and pipelines must use the same sample count.
+                    sample_count,
+                    viewport_width: w,
+                    viewport_height: h,
+                    render_layers: camera.render_layers(),
+                    force_no_cull: false,
+                    shadow: Some(self.shadow_mapper.resources()),
+                    phase: RenderPhase::Transparent,
+                };
+                {
+                    // Later passes keep what earlier passes accumulated beside them.
+                    let (accum_load, reveal_load) = if pass == 0 {
+                        (
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        )
+                    } else {
+                        (wgpu::LoadOp::Load, wgpu::LoadOp::Load)
+                    };
+                    // Under MSAA the geometry pass renders into the multisampled accum/
+                    // revealage attachments and resolves into their single-sample copies,
+                    // which `composite_oit` then samples.
+                    let oit_accum_resolve = self.hdr.oit_accum_resolve_view();
+                    let oit_reveal_resolve = self.hdr.oit_reveal_resolve_view();
+                    let oit_ts = self.gpu_timer.render_scope("transparent");
+                    let mut oit_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("oit_geometry_pass"),
+                        color_attachments: &[
+                            // accum: cleared to 0 (additive).
+                            Some(wgpu::RenderPassColorAttachment {
+                                view: self.hdr.oit_accum_view(),
+                                resolve_target: oit_accum_resolve,
+                                ops: wgpu::Operations {
+                                    load: accum_load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            }),
+                            // revealage: cleared to 1 (nothing occluded yet).
+                            Some(wgpu::RenderPassColorAttachment {
+                                view: self.hdr.oit_reveal_view(),
+                                resolve_target: oit_reveal_resolve,
+                                ops: wgpu::Operations {
+                                    load: reveal_load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            }),
+                        ],
+                        // Test against the opaque depth (the OIT pipeline does not write it).
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
                                 store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
+                            }),
+                            stencil_ops: None,
                         }),
-                        // revealage: cleared to 1 (nothing occluded yet).
-                        Some(wgpu::RenderPassColorAttachment {
-                            view: self.hdr.oit_reveal_view(),
-                            resolve_target: oit_reveal_resolve,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        }),
-                    ],
-                    // Test against the opaque depth (the OIT pipeline does not write it).
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &depth_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: oit_ts,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                scene
-                    .data_mut()
-                    .render(0, camera, &lights, &mut oit_pass, &oit_context);
+                        timestamp_writes: oit_ts,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    oit_pass.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
+                    scene
+                        .data_mut()
+                        .render(pass, camera, &lights, &mut oit_pass, &oit_context);
+                }
             }
+        }
+        if has_transparent {
             self.hdr.composite_oit(&mut encoder, &mut self.gpu_timer);
         }
 
