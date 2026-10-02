@@ -167,6 +167,12 @@ fn with_globals<R>(f: impl FnOnce(&DeformGlobals) -> R) -> R {
     })
 }
 
+/// Drops the shared layout and buffers, which belong to the device that made
+/// them; the next use builds them on the device then current.
+pub(crate) fn reset() {
+    GLOBALS.with(|cell| *cell.borrow_mut() = None);
+}
+
 /// The shared deform bind-group layout, used as group 4 of the color/prepass
 /// pipelines and group 2 of the shadow pipelines. All these pipelines reference the
 /// *same* layout object, so one per-object bind group works in every pass.

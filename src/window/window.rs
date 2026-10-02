@@ -1411,6 +1411,7 @@ impl Drop for Window {
             // Clear 2D resource managers
             MeshManager2d::reset_global_manager();
             MaterialManager2d::reset_global_manager();
+            crate::builtin::deform::reset();
 
             // Finally, clear the wgpu context itself
             Context::reset();

@@ -429,7 +429,7 @@ mod tests {
     use crate::camera::{CoordinateSystem2d, FixedView2d, OrbitCamera3d};
     use crate::color::Color;
     use crate::scene::{SceneNode2d, SceneNode3d};
-    use crate::test_gpu::{on_gpu, on_gpu_with};
+    use crate::test_gpu::{luma_at, on_gpu, on_gpu_with};
     use crate::window::{CanvasSetup, NumSamples};
     use glamx::Vec3;
 
@@ -459,31 +459,48 @@ mod tests {
         surface.render_2d(&mut flat, &mut camera_2d).await;
     }
 
-    /// Edge pixels of the tilted shapes at `samples`, on a thread of its own: a
-    /// thread keeps one surface's GPU context to itself.
+    /// Edge pixels of the tilted shapes at `samples`.
     fn edge_pixels_at(samples: NumSamples) -> usize {
-        std::thread::spawn(move || {
-            let mut count = 0;
-            on_gpu_with(
-                CanvasSetup {
-                    samples,
-                    ..CanvasSetup::default()
-                },
-                async |surface| {
-                    assert_eq!(surface.window().canvas.sample_count(), samples as u32);
-                    render_tilted_shapes(surface).await;
-                    count = edge_pixels(surface);
-                },
-            );
-            count
-        })
-        .join()
-        .unwrap()
+        let mut count = 0;
+        on_gpu_with(
+            CanvasSetup {
+                samples,
+                ..CanvasSetup::default()
+            },
+            async |surface| {
+                assert_eq!(surface.window().canvas.sample_count(), samples as u32);
+                render_tilted_shapes(surface).await;
+                count = edge_pixels(surface);
+            },
+        );
+        count
     }
 
     #[test]
     fn a_surface_that_never_drew_2d_drops_cleanly() {
         on_gpu(8, 8, async |_| {});
+    }
+
+    #[test]
+    fn a_second_surface_on_the_same_thread_draws_like_the_first() {
+        for _ in 0..2 {
+            on_gpu(32, 32, async |surface| {
+                let mut scene = SceneNode3d::empty();
+                scene
+                    .add_cube(2.0, 2.0, 2.0)
+                    .set_emissive(Color::new(4.0, 4.0, 4.0, 1.0));
+                let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+                surface.render_3d(&mut scene, &mut camera).await;
+                assert!(luma_at(surface, 16, 16) > 0.5);
+
+                let mut flat = SceneNode2d::empty();
+                flat.add_rectangle(10.0, 10.0);
+                let mut camera_2d = FixedView2d::new(CoordinateSystem2d::default(), false);
+                surface.render_2d(&mut flat, &mut camera_2d).await;
+                assert!(luma_at(surface, 16, 16) > 0.5);
+                assert!(luma_at(surface, 2, 2) < 0.1);
+            });
+        }
     }
 
     #[test]
