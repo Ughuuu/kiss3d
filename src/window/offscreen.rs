@@ -6,7 +6,7 @@ use crate::color::Color;
 use crate::post_processing::{PostProcessingEffect, Tonemap};
 use crate::renderer::{RayTracer, Renderer3d};
 use crate::scene::{SceneNode2d, SceneNode3d};
-use crate::window::{CanvasSetup, Window};
+use crate::window::{CanvasSetup, NumSamples, Window};
 use glamx::UVec2;
 #[cfg(not(target_arch = "wasm32"))]
 use image::{ImageBuffer, Luma, Rgb};
@@ -44,14 +44,20 @@ pub struct OffscreenSurface {
 }
 
 impl OffscreenSurface {
-    /// Creates a new off-screen surface of the given size, in pixels.
+    /// Creates a new single-sampled off-screen surface of the given size, in
+    /// pixels. [`with_setup`](Self::with_setup) takes a sample count.
     pub async fn new(width: u32, height: u32) -> OffscreenSurface {
+        let setup = CanvasSetup {
+            samples: NumSamples::One,
+            ..CanvasSetup::default()
+        };
         OffscreenSurface {
-            window: Window::do_new_headless(width, height, None).await,
+            window: Window::do_new_headless(width, height, Some(setup)).await,
         }
     }
 
-    /// Creates a new off-screen surface with custom setup options (e.g. MSAA).
+    /// Creates a new off-screen surface with custom setup options, its scene
+    /// multisampled at `setup.samples`.
     pub async fn with_setup(width: u32, height: u32, setup: CanvasSetup) -> OffscreenSurface {
         OffscreenSurface {
             window: Window::do_new_headless(width, height, Some(setup)).await,
@@ -414,5 +420,71 @@ impl OffscreenSurface {
     #[cfg(feature = "egui")]
     pub fn clear_ui(&mut self) {
         self.window.clear_ui();
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::OffscreenSurface;
+    use crate::camera::{CoordinateSystem2d, FixedView2d, OrbitCamera3d};
+    use crate::color::Color;
+    use crate::scene::{SceneNode2d, SceneNode3d};
+    use crate::test_gpu::on_gpu_with;
+    use crate::window::{CanvasSetup, NumSamples};
+    use glamx::Vec3;
+
+    /// Pixels part-way between the black background and the white shapes: the
+    /// blended edge samples MSAA leaves.
+    fn edge_pixels(surface: &OffscreenSurface) -> usize {
+        surface
+            .snap_image()
+            .pixels()
+            .filter(|p| (40..215).contains(&p.0[1]))
+            .count()
+    }
+
+    async fn render_tilted_shapes(surface: &mut OffscreenSurface) {
+        let mut scene = SceneNode3d::empty();
+        scene
+            .add_cube(1.5, 1.5, 1.5)
+            .set_emissive(Color::new(4.0, 4.0, 4.0, 1.0))
+            .set_rotation(glamx::Quat::from_rotation_z(0.4));
+        let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+        surface.render_3d(&mut scene, &mut camera).await;
+        let mut flat = SceneNode2d::empty();
+        flat.add_rectangle(20.0, 20.0)
+            .set_position(glamx::Vec2::new(-20.0, 20.0))
+            .set_rotation(0.4);
+        let mut camera_2d = FixedView2d::new(CoordinateSystem2d::default(), false);
+        surface.render_2d(&mut flat, &mut camera_2d).await;
+    }
+
+    /// Edge pixels of the tilted shapes at `samples`, on a thread of its own: a
+    /// thread keeps one surface's GPU context to itself.
+    fn edge_pixels_at(samples: NumSamples) -> usize {
+        std::thread::spawn(move || {
+            let mut count = 0;
+            on_gpu_with(
+                CanvasSetup {
+                    samples,
+                    ..CanvasSetup::default()
+                },
+                async |surface| {
+                    assert_eq!(surface.window().canvas.sample_count(), samples as u32);
+                    render_tilted_shapes(surface).await;
+                    count = edge_pixels(surface);
+                },
+            );
+            count
+        })
+        .join()
+        .unwrap()
+    }
+
+    #[test]
+    fn an_offscreen_surface_draws_at_the_sample_count_it_asks() {
+        let single = edge_pixels_at(NumSamples::One);
+        let four = edge_pixels_at(NumSamples::Four);
+        assert!(four > single + 10, "{} {}", single, four);
     }
 }

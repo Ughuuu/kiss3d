@@ -351,13 +351,9 @@ impl Window {
         // No need to update the light position here - it's computed per-frame
         // in the material's prepare() based on the camera position
 
-        // `OffscreenBuffers` are never multisampled, so offscreen rendering
-        // always uses a single sample (a hidden window is not antialiased).
-        let sample_count = if offscreen {
-            1
-        } else {
-            self.canvas.sample_count()
-        };
+        // A hidden window draws at the canvas's sample count too: the HDR film is
+        // multisampled and resolved before the single-sample offscreen output.
+        let sample_count = self.canvas.sample_count();
 
         let ctxt = Context::get();
         let mut encoder = ctxt.create_command_encoder(Some("kiss3d_frame_encoder"));
@@ -412,9 +408,9 @@ impl Window {
         let resolve_view = self.hdr.scene_resolve_view().cloned();
 
         // The depth attachment must match the scene target's sample count. The
-        // canvas depth texture is built MSAA-aware; offscreen rendering is always
-        // single-sampled and uses the offscreen target's depth.
-        let depth_view = if offscreen {
+        // canvas depth texture is built at the canvas's sample count; a
+        // single-sampled offscreen frame uses the offscreen target's depth.
+        let depth_view = if offscreen && sample_count == 1 {
             self.offscreen_output_target
                 .as_ref()
                 .expect("offscreen render target was just created")
@@ -1657,11 +1653,7 @@ impl Window {
         camera.handle_event(&self.canvas, &WindowEvent::FramebufferSize(w, h));
         camera.update(&self.canvas);
 
-        let sample_count = if offscreen {
-            1
-        } else {
-            self.canvas.sample_count()
-        };
+        let sample_count = self.canvas.sample_count();
 
         let ctxt = Context::get();
         let mut encoder = ctxt.create_command_encoder(Some("kiss3d_raytrace_encoder"));

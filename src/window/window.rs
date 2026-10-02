@@ -1321,7 +1321,6 @@ impl Window {
         let (event_send, event_receive) = mpsc::channel();
         let canvas = Canvas::open_headless(width, height, setup, event_send).await;
         let (width, height) = canvas.size();
-        // A headless surface is never multisampled.
         let canvas_surface_format = canvas.surface_format();
 
         Context::increment_window_count();

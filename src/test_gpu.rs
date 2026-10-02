@@ -3,7 +3,7 @@
 
 use crate::context::Context;
 use crate::resource::MaterialManager2d;
-use crate::window::OffscreenSurface;
+use crate::window::{CanvasSetup, NumSamples, OffscreenSurface};
 
 async fn adapter_available() -> bool {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -21,15 +21,33 @@ async fn adapter_available() -> bool {
         .is_ok()
 }
 
-/// Runs `test` on a fresh `width × height` surface and fails on any wgpu
-/// validation error it raised.
+/// Runs `test` on a fresh single-sampled `width × height` surface and fails on
+/// any wgpu validation error it raised.
 pub(crate) fn on_gpu(width: u32, height: u32, test: impl AsyncFnOnce(&mut OffscreenSurface)) {
+    let setup = CanvasSetup {
+        samples: NumSamples::One,
+        ..CanvasSetup::default()
+    };
+    run_on_gpu(width, height, setup, test);
+}
+
+/// [`on_gpu`] on a 64 × 64 surface built from `setup`.
+pub(crate) fn on_gpu_with(setup: CanvasSetup, test: impl AsyncFnOnce(&mut OffscreenSurface)) {
+    run_on_gpu(64, 64, setup, test);
+}
+
+fn run_on_gpu(
+    width: u32,
+    height: u32,
+    setup: CanvasSetup,
+    test: impl AsyncFnOnce(&mut OffscreenSurface),
+) {
     crate::pollster::block_on(async {
         if !adapter_available().await {
             eprintln!("no GPU adapter found, skipping");
             return;
         }
-        let mut surface = OffscreenSurface::new(width, height).await;
+        let mut surface = OffscreenSurface::with_setup(width, height, setup).await;
         // Dropping the last window resets this manager, and a reset that first
         // creates it needs the texture manager the drop already cleared.
         MaterialManager2d::get_global_manager(|_| ());
