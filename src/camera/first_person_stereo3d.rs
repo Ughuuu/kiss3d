@@ -25,6 +25,9 @@ pub struct FirstPersonCamera3dStereo {
 
     /// Inter Pupilary Distance
     ipd: f32,
+    /// How far ahead the two eyes converge: the distance to the point
+    /// `look_at` was given.
+    focus: f32,
 
     /// Yaw of the camera (rotation along the y axis).
     yaw: f32,
@@ -81,6 +84,7 @@ impl FirstPersonCamera3dStereo {
             eye_left: Vec3::ZERO,
             eye_right: Vec3::ZERO,
             ipd,
+            focus: 1.0,
             yaw: 0.0,
             pitch: 0.0,
             yaw_step: 0.005,
@@ -114,6 +118,9 @@ impl FirstPersonCamera3dStereo {
         self.eye = eye;
         self.yaw = yaw;
         self.pitch = pitch;
+        if dist > 0.0 {
+            self.focus = dist;
+        }
         self.update_eyes_location();
         self.update_projviews();
     }
@@ -205,12 +212,17 @@ impl FirstPersonCamera3dStereo {
 
     /// The left eye camera view transformation
     fn view_transform_left(&self) -> Pose3 {
-        Pose3::look_at_rh(self.eye_left, self.at(), Vec3::Y)
+        Pose3::look_at_rh(self.eye_left, self.focus_point(), Vec3::Y)
+    }
+
+    /// Where the two eyes converge.
+    fn focus_point(&self) -> Vec3 {
+        self.eye + (self.at() - self.eye) * self.focus
     }
 
     /// The right eye camera view transformation
     fn view_transform_right(&self) -> Pose3 {
-        Pose3::look_at_rh(self.eye_right, self.at(), Vec3::Y)
+        Pose3::look_at_rh(self.eye_right, self.focus_point(), Vec3::Y)
     }
 
     /// return Inter Pupilary Distance
@@ -370,6 +382,26 @@ mod tests {
                 assert!(left > 0.3 && right > 0.3, "{} {} {}", left, middle, right);
                 assert!(middle < 0.1, "{} {} {}", left, middle, right);
             }
+        });
+    }
+
+    #[test]
+    fn both_eyes_converge_on_the_point_looked_at() {
+        on_gpu(128, 64, async |surface| {
+            let mut scene = glowing_ball(1.0);
+            let mut camera =
+                FirstPersonCamera3dStereo::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO, 2.0);
+            surface.render_3d(&mut scene, &mut camera).await;
+            assert!(
+                luma_at(surface, 32, 32) > 0.3,
+                "{}",
+                luma_at(surface, 32, 32)
+            );
+            assert!(
+                luma_at(surface, 96, 32) > 0.3,
+                "{}",
+                luma_at(surface, 96, 32)
+            );
         });
     }
 
