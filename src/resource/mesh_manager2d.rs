@@ -50,7 +50,8 @@ impl MeshManager2d {
             Vec2::new(1.0, 1.0),
         ];
 
-        let rect_ids = vec![[0, 1, 2], [1, 0, 3]];
+        // Counter-clockwise, the front a culled 2D surface keeps.
+        let rect_ids = vec![[0, 2, 1], [1, 3, 0]];
         let rect = GpuMesh2d::new(rect_vtx, rect_ids, Some(rect_uvs), false);
         res.add(Rc::new(RefCell::new(rect)), "rectangle");
 

@@ -130,6 +130,8 @@ impl GpuData for LitMaterial2dGpuData {
 /// [module docs](crate::builtin)).
 pub struct LitMaterial2d {
     pipeline: PipelineCache,
+    /// The pipeline of an object with backface culling on.
+    pipeline_cull: PipelineCache,
     object_bind_group_layout: wgpu::BindGroupLayout,
     texture_bind_group_layout: wgpu::BindGroupLayout,
     frame_uniform_buffer: wgpu::Buffer,
@@ -223,7 +225,7 @@ impl LitMaterial2d {
             ),
         );
 
-        let pipeline = PipelineCache::new(move |sample_count| {
+        let build = std::rc::Rc::new(move |sample_count: u32, cull: bool| {
             let ctxt = Context::get();
             let vertex_buffer_layouts = [
                 Some(wgpu::VertexBufferLayout {
@@ -303,7 +305,7 @@ impl LitMaterial2d {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     strip_index_format: None,
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
+                    cull_mode: cull.then_some(wgpu::Face::Back),
                     polygon_mode: wgpu::PolygonMode::Fill,
                     unclipped_depth: false,
                     conservative: false,
@@ -314,6 +316,12 @@ impl LitMaterial2d {
                 cache: None,
             })
         });
+
+        let pipeline = {
+            let build = build.clone();
+            PipelineCache::new(move |sample_count| build(sample_count, false))
+        };
+        let pipeline_cull = PipelineCache::new(move |sample_count| build(sample_count, true));
 
         let frame_uniform_buffer = ctxt.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lit2d_frame_uniform_buffer"),
@@ -332,6 +340,7 @@ impl LitMaterial2d {
 
         LitMaterial2d {
             pipeline,
+            pipeline_cull,
             object_bind_group_layout,
             texture_bind_group_layout,
             frame_uniform_buffer,
@@ -522,7 +531,7 @@ impl Material2d for LitMaterial2d {
         _transform: Pose2,
         _scale: Vec2,
         _camera: &mut dyn Camera2d,
-        _data: &ObjectData2d,
+        data: &ObjectData2d,
         mesh: &mut GpuMesh2d,
         instances: &mut InstancesBuffer2d,
         gpu_data: &mut dyn GpuData,
@@ -578,7 +587,12 @@ impl Material2d for LitMaterial2d {
             None => return,
         };
 
-        let pipeline = self.pipeline.get(context.sample_count);
+        let pipeline = if data.backface_culling_enabled() {
+            &self.pipeline_cull
+        } else {
+            &self.pipeline
+        }
+        .get(context.sample_count);
         render_pass.set_pipeline(&pipeline);
         render_pass.set_bind_group(0, &self.frame_bind_group, &[]);
         render_pass.set_bind_group(1, object_bind_group, &[]);

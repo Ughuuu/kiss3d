@@ -113,7 +113,7 @@ pub fn nine_slice_mesh(size: Vec2, world: Border, uv: Border) -> GpuMesh2d {
         }
     }
 
-    // Two triangles per cell. Backface culling is off for 2D, so winding is free.
+    // Two triangles per cell, counter-clockwise so a culled sprite keeps them.
     let mut faces = Vec::with_capacity(18);
     for j in 0..3u32 {
         for i in 0..3u32 {

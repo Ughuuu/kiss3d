@@ -355,8 +355,9 @@ pub struct ObjectMaterial2d {
     surface_pipeline_layout: wgpu::PipelineLayout,
     /// Specialized surface shader modules, compiled lazily and cached per feature mask.
     surface_shaders: RefCell<HashMap<ShaderFeatures2d, Rc<wgpu::ShaderModule>>>,
-    /// Specialized surface pipelines, keyed by `(blend mode, features, sample count)`.
-    surface_pipelines: RefCell<HashMap<(Blend2d, ShaderFeatures2d, u32), Rc<wgpu::RenderPipeline>>>,
+    /// Specialized surface pipelines, keyed by `(blend mode, features, sample count, cull)`.
+    surface_pipelines:
+        RefCell<HashMap<(Blend2d, ShaderFeatures2d, u32, bool), Rc<wgpu::RenderPipeline>>>,
     /// The global default (white) texture; an object still using it gets the
     /// untextured shader variant.
     default_texture: Arc<Texture>,
@@ -870,15 +871,16 @@ impl ObjectMaterial2d {
         module
     }
 
-    /// Returns the surface pipeline for `(blend, features, sample_count)`, building and
-    /// caching it on first use. All variants share `surface_pipeline_layout`.
+    /// Returns the surface pipeline for `(blend, features, sample_count, cull)`, building
+    /// and caching it on first use. All variants share `surface_pipeline_layout`.
     fn surface_pipeline(
         &self,
         blend: Blend2d,
         features: ShaderFeatures2d,
         sample_count: u32,
+        cull: bool,
     ) -> Rc<wgpu::RenderPipeline> {
-        let key = (blend, features, sample_count);
+        let key = (blend, features, sample_count, cull);
         if let Some(p) = self.surface_pipelines.borrow().get(&key) {
             return p.clone();
         }
@@ -984,7 +986,7 @@ impl ObjectMaterial2d {
                         topology: wgpu::PrimitiveTopology::TriangleList,
                         strip_index_format: None,
                         front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None, // 2D objects typically don't need culling
+                        cull_mode: cull.then_some(wgpu::Face::Back),
                         polygon_mode: wgpu::PolygonMode::Fill,
                         unclipped_depth: false,
                         conservative: false,
@@ -1549,7 +1551,12 @@ impl Material2d for ObjectMaterial2d {
             // get the untextured variant (no texture sample), the rest the textured one.
             let textured = !Arc::ptr_eq(data.texture(), &self.default_texture);
             let features = ShaderFeatures2d::default().with(ShaderFeatures2d::TEXTURED, textured);
-            let pipeline = self.surface_pipeline(data.blend(), features, context.sample_count);
+            let pipeline = self.surface_pipeline(
+                data.blend(),
+                features,
+                context.sample_count,
+                data.backface_culling_enabled(),
+            );
             render_pass.set_pipeline(&pipeline);
             render_pass.set_bind_group(0, &self.frame_bind_group, &[]);
             // Use dynamic offset for object uniforms!
