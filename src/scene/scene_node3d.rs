@@ -2751,7 +2751,7 @@ impl SceneNode3d {
         let mut any = false;
         self.apply_to_objects_recursive(&mut |obj| {
             let d = obj.data();
-            if d.surface_rendering_active() && d.alpha_mode().is_transparent(d.color().a) {
+            if d.surface_rendering_active() && d.draws_translucent() {
                 any = true;
             }
         });

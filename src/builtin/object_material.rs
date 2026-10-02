@@ -3171,7 +3171,7 @@ impl Material3d for ObjectMaterial {
         // is translucent draw in the OIT transparent phase. Transparency is keyed
         // off the object color's alpha (per-instance alpha uses this classification
         // too).
-        let transparent = data.alpha_mode().is_transparent(data.color().a);
+        let transparent = data.draws_translucent();
         // Refractive glass draws in its own post-resolve pass (so it can sample the
         // scene behind it), not the opaque/prepass passes — otherwise it would be
         // drawn opaque and double-rendered.

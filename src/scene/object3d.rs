@@ -263,6 +263,9 @@ pub struct ObjectData3d {
     /// Whether this object's surface, wireframe and points test and write depth.
     /// Defaults to `true`; `false` draws them over everything.
     depth_test: bool,
+    /// The lowest alpha among the instances `set_instances` last wrote, so a
+    /// fading instance sends the object to the transparent pass.
+    instance_alpha: f32,
     // PBR material properties
     metallic: f32,
     roughness: f32,
@@ -359,6 +362,14 @@ impl ObjectData3d {
     #[inline]
     pub fn color(&self) -> Color {
         self.color
+    }
+
+    /// Whether the surface draws in the transparent pass: its alpha mode
+    /// blends and its colour, or any instance's, is translucent.
+    #[inline]
+    pub fn draws_translucent(&self) -> bool {
+        self.alpha_mode
+            .is_transparent(self.color.a.min(self.instance_alpha))
     }
 
     /// Returns the line width used for wireframe rendering.
@@ -1064,6 +1075,7 @@ impl Object3d {
             casts_shadows: true,    // contributes to the shadow depth pass
             receives_shadows: true,
             depth_test: true,
+            instance_alpha: 1.0,
 
             // PBR defaults (backward compatible with Blinn-Phong appearance)
             metallic: 0.0,
@@ -1397,6 +1409,7 @@ impl Object3d {
         points_col_data.clear();
         points_size_data.clear();
 
+        self.data.instance_alpha = instances.iter().map(|i| i.color.a).fold(1.0, f32::min);
         pos_data.extend(instances.iter().map(|i| i.position));
         col_data.extend(instances.iter().map(|i| color_to_array(i.color)));
         def_data.extend(instances.iter().flat_map(|i| {
@@ -2132,6 +2145,32 @@ mod tests {
             surface.render_3d(&mut scene, &mut camera).await;
             let unshadowed = mean_luma(surface);
             assert!(unshadowed > shadowed + 0.01, "{} {}", shadowed, unshadowed);
+        });
+    }
+
+    #[test]
+    fn a_translucent_instance_blends_over_what_is_behind_it() {
+        on_gpu(64, 64, async |surface| {
+            let mut scene = SceneNode3d::empty();
+            let mut wall = scene.add_cube(3.0, 3.0, 0.2);
+            wall.set_emissive(Color::new(4.0, 4.0, 4.0, 1.0));
+            wall.set_position(Vec3::new(0.0, 0.0, -2.0));
+            let mut veil = scene.add_cube(1.0, 1.0, 0.1);
+            veil.set_color(Color::new(0.0, 0.0, 0.0, 1.0));
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+            let instance = |alpha: f32| super::InstanceData3d {
+                color: Color::new(1.0, 1.0, 1.0, alpha),
+                ..Default::default()
+            };
+
+            veil.set_instances(&[instance(1.0)]);
+            surface.render_3d(&mut scene, &mut camera).await;
+            let solid = luma_at(surface, 32, 32);
+            veil.set_instances(&[instance(0.3)]);
+            assert!(veil.data().get_object().data().draws_translucent());
+            surface.render_3d(&mut scene, &mut camera).await;
+            let veiled = luma_at(surface, 32, 32);
+            assert!(solid < 0.1 && veiled > solid + 0.2, "{} {}", solid, veiled);
         });
     }
 }
