@@ -76,4 +76,13 @@ pub trait PostProcessingEffect {
     /// * `target` - The render target containing the rendered scene (color and depth textures)
     /// * `context` - The post-processing context with encoder and output view
     fn draw(&mut self, target: &RenderTarget, context: &mut PostProcessingContext);
+
+    /// Whether [`draw`](Self::draw) reads the scene's depth through the target's
+    /// [`depth_view`](RenderTarget::depth_view). When an effect in a chain says
+    /// so, every target of that chain carries the depth the scene was drawn
+    /// with, single-sampled, wherever the effect sits in the chain. Default
+    /// `false`, which leaves the targets' depth unwritten.
+    fn reads_depth(&self) -> bool {
+        false
+    }
 }

@@ -127,6 +127,9 @@ pub struct Window {
     /// LDR image after them. Made the first frame such a chain is passed, so a run
     /// that never passes one allocates neither.
     pub(super) film_render_targets: Option<(RenderTarget, RenderTarget)>,
+    /// The multisampled scene depth resolved for a chain whose effect reads it.
+    /// Made the first frame one asks.
+    pub(super) scene_depth: Option<crate::post_processing::SceneDepth>,
     /// Offscreen render target used when the window is hidden, so `snap` and
     /// recording work without a presentable surface. Created on first use.
     pub(super) offscreen_output_target: Option<RenderTarget>,
@@ -1283,6 +1286,7 @@ impl Window {
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
             film_render_targets: None,
+            scene_depth: None,
             offscreen_output_target: None,
             aov_renderer: None,
             hidden: hide,
@@ -1375,6 +1379,7 @@ impl Window {
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
             film_render_targets: None,
+            scene_depth: None,
             offscreen_output_target: None,
             aov_renderer: None,
             // A headless window has no surface; always render off-screen.

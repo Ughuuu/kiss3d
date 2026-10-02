@@ -17,7 +17,7 @@ pub use crate::post_processing::oculus_stereo::OculusStereo;
 pub use crate::post_processing::post_processing_effect::{
     FormatPipelines, PostProcessingContext, PostProcessingEffect,
 };
-#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use crate::post_processing::scene_depth::SceneDepth;
 pub use crate::post_processing::sobel_edge_highlight::SobelEdgeHighlight;
 pub use crate::post_processing::waves::Waves;
 
@@ -30,6 +30,6 @@ mod hdr;
 mod loupe;
 mod oculus_stereo;
 pub mod post_processing_effect;
-#[cfg(not(target_arch = "wasm32"))]
+mod scene_depth;
 mod sobel_edge_highlight;
 mod waves;

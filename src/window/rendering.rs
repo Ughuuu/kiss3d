@@ -1408,6 +1408,24 @@ impl Window {
         // scene alpha for snapshots and host-app embedding.
         let force_opaque = !offscreen;
 
+        let reads_depth = film_processing.iter().any(|pp| pp.reads_depth())
+            || post_processing.iter().any(|pp| pp.reads_depth());
+        if reads_depth {
+            let depth = if depth_view.texture().sample_count() == 1 {
+                depth_view.clone()
+            } else {
+                self.scene_depth
+                    .get_or_insert_with(crate::post_processing::SceneDepth::new)
+                    .resolve(&mut encoder, &depth_view)
+            };
+            self.post_process_render_target.share_depth(&depth);
+            self.post_process_render_target_b.share_depth(&depth);
+            if let Some((a, b)) = self.film_render_targets.as_mut() {
+                a.share_depth(&depth);
+                b.share_depth(&depth);
+            }
+        }
+
         // The film-stage chain, before bloom and the tonemap: a pass listed there
         // works in linear light, and what it writes is what blooms. The film is
         // copied into A because an effect reads a `RenderTarget` and the film is

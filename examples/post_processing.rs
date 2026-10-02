@@ -1,6 +1,4 @@
-#[cfg(not(target_arch = "wasm32"))]
-use kiss3d::post_processing::SobelEdgeHighlight;
-use kiss3d::post_processing::{Grayscales, Waves};
+use kiss3d::post_processing::{Grayscales, SobelEdgeHighlight, Waves};
 use kiss3d::prelude::*;
 use rand::random;
 
@@ -33,7 +31,6 @@ async fn main() {
         .add_capsule(0.5, 1.0)
         .set_color(Color::new(random(), random(), random(), 1.0));
 
-    #[cfg(not(target_arch = "wasm32"))]
     let mut sobel = SobelEdgeHighlight::new(4.0);
     let mut waves = Waves::new();
     let mut grays = Grayscales::new();
@@ -81,7 +78,6 @@ async fn main() {
                     )
                     .await
             }
-            #[cfg(not(target_arch = "wasm32"))]
             3 => {
                 window
                     .render(

@@ -72,6 +72,15 @@ impl RenderTarget {
         }
     }
 
+    /// Points this target's depth at `depth`, a single-sampled view it does not
+    /// own, so an effect reading the target reads that depth.
+    pub(crate) fn share_depth(&mut self, depth: &wgpu::TextureView) {
+        if let RenderTarget::Offscreen(o) = self {
+            o.depth_texture = depth.texture().clone();
+            o.depth_view = depth.clone();
+        }
+    }
+
     /// Resizes this render target.
     pub fn resize(&mut self, width: u32, height: u32, surface_format: wgpu::TextureFormat) {
         match self {
