@@ -1499,16 +1499,18 @@ impl SceneNode3d {
     }
 
     /// Sets the morph-target weights on this node's object and every descendant
-    /// object whose target count matches `weights.len()`.
+    /// object whose mesh carries `weights.len()` targets.
     ///
     /// glTF attaches each mesh primitive as a child object node and shares one weight
     /// vector across them, so an animation channel targeting the mesh node fans the
-    /// weights out to all its primitives here.
+    /// weights out to all its primitives here. The count is the mesh's, so a mesh
+    /// built outside the loader takes weights on the first call too.
     pub fn set_morph_weights(&self, weights: &[f32]) {
         let children = {
             let mut data = self.data.borrow_mut();
             if let Some(obj) = data.object.as_mut() {
-                if obj.data().morph_target_count() == weights.len() && !weights.is_empty() {
+                let targets = obj.mesh().borrow().morph_target_count();
+                if targets == weights.len() && !weights.is_empty() {
                     obj.data_mut().set_morph_weights(weights);
                 }
             }
