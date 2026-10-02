@@ -386,6 +386,45 @@ mod tests {
             .count()
     }
 
+    /// The same, with `chain` run on the film before the tonemap.
+    async fn dark_film_pixels(
+        surface: &mut OffscreenSurface,
+        chain: &mut [&mut dyn PostProcessingEffect],
+    ) -> usize {
+        let mut scene = SceneNode3d::empty();
+        scene
+            .add_cube(2.0, 2.0, 2.0)
+            .set_emissive(Color::new(4.0, 4.0, 4.0, 1.0))
+            .set_rotation(Quat::from_rotation_z(0.4));
+        let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+        surface.set_background_color(WHITE);
+        surface
+            .render_chains(
+                Some(&mut scene),
+                None,
+                Some(&mut camera),
+                None,
+                None,
+                chain,
+                &mut [],
+            )
+            .await;
+        surface
+            .snap_image()
+            .pixels()
+            .filter(|p| p.0[1] < 64)
+            .count()
+    }
+
+    #[test]
+    fn sobel_outlines_a_cube_in_the_film_chain() {
+        on_gpu(64, 64, async |surface| {
+            let mut sobel = SobelEdgeHighlight::new(4.0);
+            let edges = dark_film_pixels(surface, &mut [&mut sobel]).await;
+            assert!(edges > 40, "edge pass on the film: {}", edges);
+        });
+    }
+
     async fn sobel_outlines_the_cube_wherever_it_sits(surface: &mut OffscreenSurface) {
         let mut gray = Grayscales::new();
         let mut sobel = SobelEdgeHighlight::new(4.0);
