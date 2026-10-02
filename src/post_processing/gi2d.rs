@@ -44,9 +44,6 @@ pub const MAX_EMITTERS: usize = 32;
 pub const MAX_OCCLUDERS: usize = 64;
 /// Maximum number of occluder segments (matches `MAX_SEGMENTS` in `gi2d_field.wgsl`).
 pub const MAX_SEGMENT_OCCLUDERS: usize = 128;
-/// The thinnest a segment occluder blocks, in world units: the march steps at
-/// least half a unit, so a thinner segment would let light slip through.
-pub const MIN_SEGMENT_RADIUS: f32 = 0.25;
 
 const SEED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 const SDF_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
@@ -100,7 +97,8 @@ pub struct GiSegmentOccluder2d {
     pub a: Vec2,
     /// World-space end point.
     pub b: Vec2,
-    /// Half thickness; raised to [`MIN_SEGMENT_RADIUS`] when below it.
+    /// Half thickness; raised to half a field pixel, the thinnest the march
+    /// cannot step over.
     pub radius: f32,
 }
 
@@ -879,9 +877,10 @@ impl Gi2d {
             slot.pos_radius = [o.position.x, o.position.y, o.radius, 0.0];
         }
         let mut segments = [GpuSegment::zeroed(); MAX_SEGMENT_OCCLUDERS];
+        let thinnest = 0.5 * self.world_per_field_pixel();
         for (slot, s) in segments.iter_mut().zip(self.segments.iter()) {
             slot.ab = [s.a.x, s.a.y, s.b.x, s.b.y];
-            slot.radius = [s.radius.max(MIN_SEGMENT_RADIUS), 0.0, 0.0, 0.0];
+            slot.radius = [s.radius.max(thinnest), 0.0, 0.0, 0.0];
         }
         FieldUniforms {
             inv_vp: mat3_to_padded(&self.inv_vp),
