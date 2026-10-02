@@ -429,7 +429,7 @@ mod tests {
     use crate::camera::{CoordinateSystem2d, FixedView2d, OrbitCamera3d};
     use crate::color::Color;
     use crate::scene::{SceneNode2d, SceneNode3d};
-    use crate::test_gpu::on_gpu_with;
+    use crate::test_gpu::{on_gpu, on_gpu_with};
     use crate::window::{CanvasSetup, NumSamples};
     use glamx::Vec3;
 
@@ -479,6 +479,11 @@ mod tests {
         })
         .join()
         .unwrap()
+    }
+
+    #[test]
+    fn a_surface_that_never_drew_2d_drops_cleanly() {
+        on_gpu(8, 8, async |_| {});
     }
 
     #[test]

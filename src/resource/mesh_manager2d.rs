@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-thread_local!(static KEY_MESH_MANAGER: RefCell<MeshManager2d> = RefCell::new(MeshManager2d::new()));
+thread_local!(static KEY_MESH_MANAGER: RefCell<Option<MeshManager2d>> = const { RefCell::new(None) });
 
 /// The mesh manager.
 ///
@@ -81,7 +81,8 @@ impl MeshManager2d {
 
     /// Mutably applies a function to the mesh manager.
     pub fn get_global_manager<T, F: FnMut(&mut MeshManager2d) -> T>(mut f: F) -> T {
-        KEY_MESH_MANAGER.with(|manager| f(&mut manager.borrow_mut()))
+        KEY_MESH_MANAGER
+            .with(|manager| f(manager.borrow_mut().get_or_insert_with(MeshManager2d::new)))
     }
 
     /// Get a mesh with the specified name. Returns `None` if the mesh is not registered.
@@ -99,13 +100,12 @@ impl MeshManager2d {
         let _ = self.meshes.remove(name);
     }
 
-    /// Resets the global mesh manager, releasing all GPU resources.
+    /// Resets the global mesh manager, releasing all GPU resources. The next
+    /// use builds a fresh one, built-in shapes included.
     ///
     /// This should be called before thread-local storage destruction begins
     /// to avoid TLS access order issues with wgpu internals.
     pub fn reset_global_manager() {
-        KEY_MESH_MANAGER.with(|manager| {
-            manager.borrow_mut().meshes.clear();
-        });
+        KEY_MESH_MANAGER.with(|manager| *manager.borrow_mut() = None);
     }
 }

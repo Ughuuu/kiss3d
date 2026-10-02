@@ -2,7 +2,6 @@
 //! A machine without an adapter skips them, as the shader-validity test does.
 
 use crate::context::Context;
-use crate::resource::MaterialManager2d;
 use crate::window::{CanvasSetup, NumSamples, OffscreenSurface};
 
 async fn adapter_available() -> bool {
@@ -48,9 +47,6 @@ fn run_on_gpu(
             return;
         }
         let mut surface = OffscreenSurface::with_setup(width, height, setup).await;
-        // Dropping the last window resets this manager, and a reset that first
-        // creates it needs the texture manager the drop already cleared.
-        MaterialManager2d::get_global_manager(|_| ());
         let scope = Context::get()
             .device
             .push_error_scope(wgpu::ErrorFilter::Validation);
