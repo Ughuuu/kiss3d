@@ -90,8 +90,10 @@ impl Border {
 
 /// Builds the 16-vertex / 9-quad mesh of a 9-slice sprite of total size `size`
 /// (centered on the origin), whose corner cells keep `world` size while the center
-/// and edge cells stretch, sampling the texture split by the `uv` border.
-pub(crate) fn nine_slice_mesh(size: Vec2, world: Border, uv: Border) -> GpuMesh2d {
+/// and edge cells stretch, sampling the texture split by the `uv` border (in
+/// normalized texture coordinates, `0.0..=1.0`). This is the mesh behind
+/// [`SceneNode2d::nine_slice`](crate::scene::SceneNode2d::nine_slice).
+pub fn nine_slice_mesh(size: Vec2, world: Border, uv: Border) -> GpuMesh2d {
     let hx = size.x * 0.5;
     let hy = size.y * 0.5;
 

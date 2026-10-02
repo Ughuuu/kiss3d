@@ -45,7 +45,7 @@ pub enum Blend2d {
 impl Blend2d {
     /// The wgpu blend state realizing this mode for a straight-(non-premultiplied)
     /// color target, or `None` for [`Blend2d::Opaque`] (blending disabled).
-    pub(crate) fn blend_state(self) -> Option<wgpu::BlendState> {
+    pub fn blend_state(self) -> Option<wgpu::BlendState> {
         use wgpu::{BlendComponent, BlendFactor, BlendOperation, BlendState};
         let alpha_over = BlendComponent {
             src_factor: BlendFactor::One,

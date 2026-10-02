@@ -1355,10 +1355,10 @@ impl SceneNode3d {
         model
     }
 
-    /// Returns a weak handle to this node's shared data. Used by the glTF loader
-    /// to let a [`crate::scene::Skin3d`] reference its skeleton's joint nodes
-    /// without keeping them (or the scene graph) alive.
-    pub(crate) fn downgrade(&self) -> Weak<RefCell<SceneNodeData3d>> {
+    /// Returns a weak handle to this node's shared data. A [`crate::scene::Skin3d`]
+    /// holds its skeleton's joint nodes this way, without keeping them (or the
+    /// scene graph) alive.
+    pub fn downgrade(&self) -> Weak<RefCell<SceneNodeData3d>> {
         Rc::downgrade(&self.data)
     }
 

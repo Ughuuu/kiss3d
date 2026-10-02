@@ -56,10 +56,11 @@ pub struct Skin3d {
 impl Skin3d {
     /// Creates a skin from its joint node handles and inverse bind matrices
     /// (which must have equal length). The palette starts at identity.
-    pub(crate) fn new(
-        joints: Vec<Weak<RefCell<SceneNodeData3d>>>,
-        inverse_bind: Vec<Mat4>,
-    ) -> Self {
+    ///
+    /// Take each joint's handle with [`SceneNode3d::downgrade`](crate::scene::SceneNode3d::downgrade),
+    /// then attach the skin with [`Object3d::set_skin`]; the mesh also needs
+    /// per-vertex joints and weights ([`GpuMesh3d::set_skin_vertices`](crate::resource::GpuMesh3d::set_skin_vertices)).
+    pub fn new(joints: Vec<Weak<RefCell<SceneNodeData3d>>>, inverse_bind: Vec<Mat4>) -> Self {
         let n = joints.len();
         Skin3d {
             joints,
@@ -173,7 +174,7 @@ pub enum AlphaMode {
 impl AlphaMode {
     /// Whether a surface with this mode and `color_alpha` renders in the
     /// transparent (OIT) pass rather than the opaque pass.
-    pub(crate) fn is_transparent(self, color_alpha: f32) -> bool {
+    pub fn is_transparent(self, color_alpha: f32) -> bool {
         matches!(self, AlphaMode::Blend | AlphaMode::Premultiplied) && color_alpha < 1.0
     }
 
@@ -1287,9 +1288,10 @@ impl Object3d {
         self.data.has_skin()
     }
 
-    /// Attaches a skeletal skinning binding (used by the glTF loader).
+    /// Attaches a skeletal skinning binding, replacing any previous one. The glTF
+    /// loader calls this for every skinned mesh; an object starts with no skin.
     #[inline]
-    pub(crate) fn set_skin(&mut self, skin: Skin3d) {
+    pub fn set_skin(&mut self, skin: Skin3d) {
         self.data.set_skin(skin);
     }
 
