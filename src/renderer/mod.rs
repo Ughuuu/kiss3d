@@ -10,7 +10,7 @@ pub use self::polyline_renderer2d::{Polyline2d, PolylineRenderer2d};
 pub use self::polyline_renderer3d::{Polyline3d, PolylineRenderer3d};
 pub use self::raytracer::{RayBackend, RayTracer, RayTracerPreset};
 pub use self::reflection_probe::{
-    CubeFaceCamera, ProbeCapture, ReflectionProbe, ReflectionProbes, MAX_PROBES,
+    CubeFaceCamera, ProbeCapture, ReflectionProbe, ReflectionProbes, DEFAULT_PROBE_SIZE, MAX_PROBES,
 };
 pub(crate) use self::reflector::ReflectorOit;
 pub use self::reflector::{MirrorCamera, Reflector};

@@ -111,11 +111,11 @@ pub(crate) const MAX_PROBES: usize = crate::renderer::reflection_probe::MAX_PROB
 struct GpuProbe {
     // xyz: world center; w: 1.0 if this slot is active, else 0.0.
     center_active: [f32; 4],
-    // xyz: parallax-box min (world); w: array layer index.
-    box_min_layer: [f32; 4],
-    // xyz: parallax-box max (world); w: intensity.
-    box_max_intensity: [f32; 4],
-    // x: rotation (radians); y: falloff (world units); z: max LOD; w: unused.
+    // xyz: parallax-box half extents; w: array layer index.
+    half_layer: [f32; 4],
+    // Parallax-box orientation, a unit quaternion (x, y, z, w).
+    orientation: [f32; 4],
+    // x: rotation (radians); y: falloff (world units); z: max LOD; w: intensity.
     params: [f32; 4],
 }
 
@@ -3003,11 +3003,17 @@ impl Material3d for ObjectMaterial {
                 for (slot, probe) in p.probes.iter().take(MAX_PROBES).enumerate() {
                     let c = probe.center;
                     let h = probe.half_extents;
+                    let q = probe.orientation.normalize();
                     records[slot] = GpuProbe {
                         center_active: [c.x, c.y, c.z, 1.0],
-                        box_min_layer: [c.x - h.x, c.y - h.y, c.z - h.z, probe.layer as f32],
-                        box_max_intensity: [c.x + h.x, c.y + h.y, c.z + h.z, probe.intensity],
-                        params: [probe.rotation, probe.falloff.max(1e-4), p.max_lod, 0.0],
+                        half_layer: [h.x, h.y, h.z, probe.layer as f32],
+                        orientation: [q.x, q.y, q.z, q.w],
+                        params: [
+                            probe.rotation,
+                            probe.falloff.max(1e-4),
+                            p.max_lod,
+                            probe.intensity,
+                        ],
                     };
                 }
                 self.probe_records.set(records);

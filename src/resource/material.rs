@@ -104,8 +104,10 @@ pub struct EnvLight<'a> {
 pub struct ProbeData {
     /// World-space center (capture viewpoint).
     pub center: Vec3,
-    /// Half-extents of the parallax/influence box (world AABB), centered on `center`.
+    /// Half-extents of the parallax/influence box, centered on `center`.
     pub half_extents: Vec3,
+    /// Orientation of the parallax/influence box (identity: axis-aligned).
+    pub orientation: glamx::Quat,
     /// Soft-edge width (world units) over which the probe fades to the global env.
     pub falloff: f32,
     /// Luminance multiplier.

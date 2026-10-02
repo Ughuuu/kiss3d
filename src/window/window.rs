@@ -98,10 +98,8 @@ pub struct Window {
     pub(super) probe_capture: Option<crate::renderer::ProbeCapture>,
     /// Probe indices queued for a runtime scene capture next frame.
     pub(super) pending_probe_captures: Vec<usize>,
-    /// Render-layer mask used when capturing reflection probes. Defaults to all
-    /// layers; set it to exclude dynamic objects (which SSR reflects more
-    /// accurately) so a single-point probe doesn't distort nearby geometry.
-    pub(super) reflection_capture_layers: u32,
+    /// Cube-face size of a probe capture and width of every probe map.
+    pub(super) reflection_probe_size: u32,
     /// Screen-space reflections (created on first enable when the backend supports
     /// it; stays `None` / inactive on WebGL2).
     pub(super) ssr: Option<crate::renderer::Ssr>,
@@ -687,9 +685,27 @@ impl Window {
         &mut self,
         probe: crate::renderer::ReflectionProbe,
     ) -> Option<usize> {
+        let size = self.reflection_probe_size;
         self.reflection_probes
-            .get_or_insert_with(crate::renderer::ReflectionProbes::new)
+            .get_or_insert_with(|| crate::renderer::ReflectionProbes::with_size(size))
             .add(probe)
+    }
+
+    /// Sets the reflection-probe resolution, shared by every probe: a runtime
+    /// capture renders cube faces `size` pixels square, and each probe map is `size`
+    /// wide and half as tall. Clamped to `2..=4096`. A change reallocates the probe
+    /// maps black: set the baked images again and re-capture the live probes. The
+    /// default is 256.
+    pub fn set_reflection_probe_size(&mut self, size: u32) {
+        self.reflection_probe_size = size.clamp(2, 4096);
+        if let Some(probes) = self.reflection_probes.as_mut() {
+            probes.set_size(self.reflection_probe_size);
+        }
+    }
+
+    /// Returns the reflection-probe resolution. The default is 256.
+    pub fn reflection_probe_size(&self) -> u32 {
+        self.reflection_probe_size
     }
 
     /// Fills reflection probe `idx` from a baked equirectangular HDR image.
@@ -708,16 +724,6 @@ impl Window {
         self.reflection_probes
             .as_mut()
             .and_then(|p| p.probe_mut(idx))
-    }
-
-    /// Sets the render-layer mask used when capturing reflection probes (default:
-    /// all layers). A reflection probe captures from a single point, so nearby
-    /// dynamic objects come out distorted/magnified; put such objects on a layer
-    /// excluded here (and let SSR reflect them instead) so the probe captures only
-    /// the static surroundings. An object is captured when its own render-layer
-    /// mask shares a bit with `mask`.
-    pub fn set_reflection_capture_layers(&mut self, mask: u32) {
-        self.reflection_capture_layers = mask;
     }
 
     /// Queues a runtime scene capture of reflection probe `idx`: next frame the
@@ -1238,7 +1244,7 @@ impl Window {
             reflection_probes: None,
             probe_capture: None,
             pending_probe_captures: Vec::new(),
-            reflection_capture_layers: u32::MAX,
+            reflection_probe_size: crate::renderer::DEFAULT_PROBE_SIZE,
             ssr: None,
             ssr_enabled: false,
             dof: None,
@@ -1331,7 +1337,7 @@ impl Window {
             reflection_probes: None,
             probe_capture: None,
             pending_probe_captures: Vec::new(),
-            reflection_capture_layers: u32::MAX,
+            reflection_probe_size: crate::renderer::DEFAULT_PROBE_SIZE,
             ssr: None,
             ssr_enabled: false,
             dof: None,

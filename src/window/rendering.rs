@@ -505,6 +505,7 @@ impl Window {
                         .map(|(layer, p)| crate::resource::ProbeData {
                             center: p.center,
                             half_extents: p.half_extents,
+                            orientation: p.orientation,
                             falloff: p.falloff,
                             intensity: p.intensity,
                             rotation: p.rotation,
@@ -565,9 +566,13 @@ impl Window {
         if !self.pending_probe_captures.is_empty() && scene.is_some() {
             let captures = std::mem::take(&mut self.pending_probe_captures);
             let (znear, zfar) = camera.clip_planes();
-            const FACE: u32 = 256;
-            if self.probe_capture.is_none() {
-                self.probe_capture = Some(crate::renderer::ProbeCapture::new(FACE));
+            let face_size = self.reflection_probe_size;
+            if self
+                .probe_capture
+                .as_ref()
+                .is_none_or(|c| c.size() != face_size)
+            {
+                self.probe_capture = Some(crate::renderer::ProbeCapture::new(face_size));
             }
             // Force the non-clustered shading path for the capture frame uniforms.
             MaterialManager3d::get_global_manager(|mm| {
@@ -585,21 +590,29 @@ impl Window {
             let ctxt = Context::get();
             let sky_set = self.skybox.is_set();
             for idx in captures {
-                let center = match self.reflection_probes.as_ref() {
-                    Some(p) if idx < p.len() => p.probes()[idx].center,
+                let (center, (near, far), layers) = match self.reflection_probes.as_ref() {
+                    Some(p) if idx < p.len() => {
+                        let probe = &p.probes()[idx];
+                        let planes = probe.clip_planes.unwrap_or((znear, zfar));
+                        (probe.center, planes, probe.capture_layers)
+                    }
                     _ => continue,
                 };
                 for face in 0..6usize {
-                    let mut cam = crate::renderer::CubeFaceCamera::new(center, face, znear, zfar);
+                    let mut cam = crate::renderer::CubeFaceCamera::new(center, face, near, far);
                     // Bump the frame counter so prepare writes this face's uniforms.
                     MaterialManager3d::get_global_manager(|mm| mm.begin_frame());
                     let mut cap_lights = LightCollection::with_ambient(self.ambient_intensity);
                     cap_lights.ambient_color = self.ambient_color;
                     cap_lights.fog = self.fog;
                     if let Some(scene) = scene.as_deref_mut() {
-                        scene
-                            .data_mut()
-                            .prepare(0, &mut cam, &mut cap_lights, FACE, FACE);
+                        scene.data_mut().prepare(
+                            0,
+                            &mut cam,
+                            &mut cap_lights,
+                            face_size,
+                            face_size,
+                        );
                         scene.update_deformations();
                     }
                     MaterialManager3d::get_global_manager(|mm| mm.flush());
@@ -618,9 +631,9 @@ impl Window {
                     let ctx = RenderContext {
                         surface_format: crate::post_processing::HDR_FORMAT,
                         sample_count: 1,
-                        viewport_width: FACE,
-                        viewport_height: FACE,
-                        render_layers: self.reflection_capture_layers,
+                        viewport_width: face_size,
+                        viewport_height: face_size,
+                        render_layers: layers,
                         force_no_cull: false,
                         shadow: Some(self.shadow_mapper.resources()),
                         phase: RenderPhase::Opaque,
