@@ -474,7 +474,7 @@ impl Window {
         // lighting (or clear it when no skybox is set).
         {
             let env = self.skybox.ibl_env();
-            let intensity = self.skybox.intensity();
+            let intensity = self.skybox.lighting_intensity();
             let rotation = self.skybox.rotation();
             MaterialManager3d::get_global_manager(|mm| {
                 mm.for_each(|mat| match env {
@@ -1357,7 +1357,7 @@ impl Window {
                     view: &e.view,
                     sampler: &e.sampler,
                     mip_count: e.mip_count,
-                    intensity: self.skybox.intensity(),
+                    intensity: self.skybox.lighting_intensity(),
                     rotation: self.skybox.rotation(),
                 });
                 let scene_resolved = self.hdr.scene_resolved_view();

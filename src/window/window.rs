@@ -639,6 +639,32 @@ impl Window {
         self.skybox.set_orientation(rotation_radians, intensity);
     }
 
+    /// Lights the rasterized scene with `image` (an equirectangular map) instead of
+    /// the drawn skybox, which stays the background; it turns with the skybox's
+    /// rotation and lights even with no skybox drawn. `None`, the default, lights
+    /// with the drawn skybox. The path tracer keeps the skybox for both.
+    pub fn set_sky_lighting_image(&mut self, image: Option<&image::DynamicImage>) {
+        self.skybox.set_lighting_image(image);
+    }
+
+    /// Whether a lighting image apart from the drawn skybox is set.
+    pub fn has_sky_lighting_image(&self) -> bool {
+        self.skybox.has_lighting_image()
+    }
+
+    /// Sets the image-based-lighting multiplier apart from the drawn skybox's
+    /// (clamped to `>= 0`). `None`, the default, follows the intensity given to
+    /// [`set_skybox_orientation`](Self::set_skybox_orientation).
+    pub fn set_sky_lighting_intensity(&mut self, intensity: Option<f32>) {
+        self.skybox.set_lighting_intensity(intensity);
+    }
+
+    /// Returns the image-based-lighting multiplier in use: the one set apart, else
+    /// the skybox's.
+    pub fn sky_lighting_intensity(&self) -> f32 {
+        self.skybox.lighting_intensity()
+    }
+
     /// Removes the skybox, so subsequent frames render the plain background color.
     pub fn clear_skybox(&mut self) {
         self.skybox.clear();

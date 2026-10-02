@@ -29,6 +29,10 @@ pub struct Skybox {
     /// Mip-chained copy of the environment used as the image-based-lighting
     /// source (built alongside the background environment).
     ibl_env: Option<EnvironmentMap>,
+    /// Lighting image apart from the drawn sky; `None` lights with the sky.
+    lighting_env: Option<EnvironmentMap>,
+    /// Lighting multiplier apart from the drawn sky's; `None` follows it.
+    lighting_intensity: Option<f32>,
     rotation: f32,
     intensity: f32,
     /// Bumped whenever the environment image is replaced or cleared, so the path
@@ -152,6 +156,8 @@ impl Skybox {
         Skybox {
             environment: Environment::fallback(),
             ibl_env: None,
+            lighting_env: None,
+            lighting_intensity: None,
             rotation: 0.0,
             intensity: 1.0,
             generation: 0,
@@ -204,9 +210,36 @@ impl Skybox {
         self.generation
     }
 
-    /// The mip-chained environment map used for image-based lighting, if set.
+    /// The mip-chained environment map used for image-based lighting, if set: the
+    /// lighting image when one is set, else the drawn sky's.
     pub fn ibl_env(&self) -> Option<&EnvironmentMap> {
-        self.ibl_env.as_ref()
+        self.lighting_env.as_ref().or(self.ibl_env.as_ref())
+    }
+
+    /// Lights the scene with `image` (an equirectangular map) instead of the drawn
+    /// sky, which stays the background; it turns with the sky's rotation. `None`,
+    /// the default, lights with the drawn sky. The path tracer keeps the drawn
+    /// sky for both.
+    pub fn set_lighting_image(&mut self, image: Option<&image::DynamicImage>) {
+        self.lighting_env = image.map(EnvironmentMap::from_image);
+    }
+
+    /// Whether a lighting image apart from the drawn sky is set.
+    pub fn has_lighting_image(&self) -> bool {
+        self.lighting_env.is_some()
+    }
+
+    /// The image-based-lighting multiplier: the one set with
+    /// [`set_lighting_intensity`](Self::set_lighting_intensity), else the drawn
+    /// sky's [`intensity`](Self::intensity).
+    pub fn lighting_intensity(&self) -> f32 {
+        self.lighting_intensity.unwrap_or(self.intensity)
+    }
+
+    /// Sets the image-based-lighting multiplier apart from the drawn sky's
+    /// (clamped to `>= 0`). `None`, the default, follows the sky's intensity.
+    pub fn set_lighting_intensity(&mut self, intensity: Option<f32>) {
+        self.lighting_intensity = intensity.map(|i| i.max(0.0));
     }
 
     /// The environment Y-rotation in radians.
@@ -296,5 +329,55 @@ impl Skybox {
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.draw(0..3, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::camera::OrbitCamera3d;
+    use crate::color::Color;
+    use crate::scene::SceneNode3d;
+    use crate::test_gpu::{luma_at, on_gpu};
+    use glamx::Vec3;
+
+    fn flat_sky(value: u8) -> image::DynamicImage {
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(16, 8, image::Rgb([value; 3])))
+    }
+
+    #[test]
+    fn sky_lighting_can_part_from_the_drawn_sky() {
+        on_gpu(64, 64, async |surface| {
+            surface.window_mut().set_ambient(0.0);
+            let mut scene = SceneNode3d::empty();
+            scene
+                .add_sphere(1.0)
+                .set_color(Color::new(1.0, 1.0, 1.0, 1.0))
+                .set_roughness(1.0);
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+            let window = surface.window_mut();
+            window.set_skybox_image(&flat_sky(0));
+            assert!(!window.has_sky_lighting_image());
+            assert_eq!(window.sky_lighting_intensity(), 1.0);
+
+            surface.render_3d(&mut scene, &mut camera).await;
+            let dark_ball = luma_at(surface, 32, 32);
+
+            surface
+                .window_mut()
+                .set_sky_lighting_image(Some(&flat_sky(200)));
+            surface.render_3d(&mut scene, &mut camera).await;
+            let lit_ball = luma_at(surface, 32, 32);
+            assert!(lit_ball > dark_ball + 0.1, "{} {}", dark_ball, lit_ball);
+            assert!(luma_at(surface, 2, 2) < 0.05, "the drawn sky stays black");
+
+            surface.window_mut().set_sky_lighting_intensity(Some(0.0));
+            surface.render_3d(&mut scene, &mut camera).await;
+            assert!(luma_at(surface, 32, 32) < lit_ball - 0.1);
+
+            surface.window_mut().set_sky_lighting_intensity(None);
+            surface.window_mut().set_sky_lighting_image(None);
+            surface.render_3d(&mut scene, &mut camera).await;
+            assert!((luma_at(surface, 32, 32) - dark_ball).abs() < 0.02);
+        });
     }
 }
