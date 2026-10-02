@@ -57,3 +57,21 @@ pub(crate) fn mean_luma(surface: &OffscreenSurface) -> f32 {
 pub(crate) fn luma_at(surface: &OffscreenSurface, x: u32, y: u32) -> f32 {
     luma(surface.snap_image().get_pixel(x, y).0)
 }
+
+/// Mean luma of the `width × height` block whose top-left pixel is `(x, y)`.
+pub(crate) fn block_luma(
+    surface: &OffscreenSurface,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> f32 {
+    let image = surface.snap_image();
+    let mut sum = 0.0;
+    for py in y..y + height {
+        for px in x..x + width {
+            sum += luma(image.get_pixel(px, py).0);
+        }
+    }
+    sum / (width * height) as f32
+}

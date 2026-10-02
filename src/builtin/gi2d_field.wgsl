@@ -10,6 +10,8 @@ import package::common::{unpack_mat3, fullscreen_uv_from_clip};
 
 const MAX_EMITTERS: u32 = 32u;
 const MAX_OCCLUDERS: u32 = 64u;
+// Must match `MAX_SEGMENT_OCCLUDERS` in gi2d.rs.
+const MAX_SEGMENTS: u32 = 128u;
 const TAU: f32 = 6.2831853;
 const GOLDEN: f32 = 2.39996323;
 
@@ -20,6 +22,21 @@ struct Emitter {
 
 struct Occluder {
     pos_radius: vec4<f32>,
+}
+
+struct Segment {
+    // a.xy, b.xy
+    ab: vec4<f32>,
+    // radius, _, _, _
+    radius: vec4<f32>,
+}
+
+// Distance from `q` to the segment occluder `s`'s surface (negative inside).
+fn segment_distance(q: vec2<f32>, s: Segment) -> f32 {
+    let a = s.ab.xy;
+    let ab = s.ab.zw - a;
+    let h = clamp(dot(q - a, ab) / max(dot(ab, ab), 1e-12), 0.0, 1.0);
+    return length(q - a - ab * h) - s.radius.x;
 }
 
 struct FieldUniforms {
@@ -34,12 +51,13 @@ struct FieldUniforms {
     cur_vp_2: vec4<f32>,
     // num_rays, frame_index, temporal_blend, history_valid
     params: vec4<f32>,
-    // use_sdf, _, _, _
+    // use_sdf, sdf_bias, num_segments, _
     flags: vec4<f32>,
     // num_emitters, num_occluders, max_dist, max_steps
     counts: vec4<f32>,
     emitters: array<Emitter, MAX_EMITTERS>,
     occluders: array<Occluder, MAX_OCCLUDERS>,
+    segments: array<Segment, MAX_SEGMENTS>,
 }
 
 @group(0) @binding(0)
@@ -104,6 +122,10 @@ fn occluder_distance(p: vec2<f32>) -> f32 {
     for (var i = 0u; i < num_occluders; i = i + 1u) {
         let o = u.occluders[i];
         d = min(d, length(p - o.pos_radius.xy) - o.pos_radius.z);
+    }
+    let num_segments = u32(u.flags.z);
+    for (var i = 0u; i < num_segments; i = i + 1u) {
+        d = min(d, segment_distance(p, u.segments[i]));
     }
     return d;
 }

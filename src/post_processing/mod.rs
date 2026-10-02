@@ -4,7 +4,8 @@ pub use crate::post_processing::cas::Cas;
 pub use crate::post_processing::crt::Crt;
 pub use crate::post_processing::fxaa::Fxaa;
 pub use crate::post_processing::gi2d::{
-    Gi2d, GiEmitter2d, GiOccluder2d, MAX_EMITTERS, MAX_OCCLUDERS,
+    Gi2d, GiEmitter2d, GiOccluder2d, GiSegmentOccluder2d, MAX_EMITTERS, MAX_OCCLUDERS,
+    MAX_SEGMENT_OCCLUDERS, MIN_SEGMENT_RADIUS,
 };
 pub use crate::post_processing::grayscales::Grayscales;
 pub use crate::post_processing::hdr::{
