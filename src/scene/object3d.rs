@@ -257,6 +257,12 @@ pub struct ObjectData3d {
     /// e.g. an emissive marker placed at a light's position, which would otherwise
     /// self-shadow the whole scene.
     casts_shadows: bool,
+    /// Whether the lighting shader darkens this object where the shadow maps say a
+    /// light is occluded. Defaults to `true`.
+    receives_shadows: bool,
+    /// Whether this object's surface, wireframe and points test and write depth.
+    /// Defaults to `true`; `false` draws them over everything.
+    depth_test: bool,
     // PBR material properties
     metallic: f32,
     roughness: f32,
@@ -647,6 +653,18 @@ impl ObjectData3d {
     #[inline]
     pub fn casts_shadows(&self) -> bool {
         self.casts_shadows
+    }
+
+    /// Whether shadows darken this object. See [`Object3d::set_receives_shadows`].
+    #[inline]
+    pub fn receives_shadows(&self) -> bool {
+        self.receives_shadows
+    }
+
+    /// Whether this object tests and writes depth. See [`Object3d::set_depth_test`].
+    #[inline]
+    pub fn depth_test(&self) -> bool {
+        self.depth_test
     }
 
     /// Returns the path-tracer BSDF model for this object.
@@ -1044,6 +1062,8 @@ impl Object3d {
             render_layers: 1,       // layer 0
             light_layers: u32::MAX, // affected by every light
             casts_shadows: true,    // contributes to the shadow depth pass
+            receives_shadows: true,
+            depth_test: true,
 
             // PBR defaults (backward compatible with Blinn-Phong appearance)
             metallic: 0.0,
@@ -1170,6 +1190,23 @@ impl Object3d {
     #[inline]
     pub fn set_casts_shadows(&mut self, casts_shadows: bool) {
         self.data.casts_shadows = casts_shadows;
+    }
+
+    /// Sets whether shadows darken this object in the rasterizer: `false` skips the
+    /// shadow-map lookup, so every light reaches it unoccluded. Defaults to `true`.
+    /// The path tracer ignores it.
+    #[inline]
+    pub fn set_receives_shadows(&mut self, receives_shadows: bool) {
+        self.data.receives_shadows = receives_shadows;
+    }
+
+    /// Sets whether this object's surface, wireframe and points test against and
+    /// write the depth buffer. `false` draws them over everything drawn before,
+    /// without hiding what is drawn after, and keeps the surface out of the
+    /// G-buffer that SSAO, SSR and refraction read. Defaults to `true`.
+    #[inline]
+    pub fn set_depth_test(&mut self, depth_test: bool) {
+        self.data.depth_test = depth_test;
     }
 
     /// Draws this object's surface geometry into the shadow depth pass.
@@ -2039,5 +2076,62 @@ impl Object3d {
     #[inline]
     pub fn set_parallax_method(&mut self, method: ParallaxMethod) {
         self.data.parallax_method = method;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::camera::OrbitCamera3d;
+    use crate::color::Color;
+    use crate::light::Light;
+    use crate::scene::SceneNode3d;
+    use crate::test_gpu::{luma_at, mean_luma, on_gpu};
+    use glamx::Vec3;
+
+    #[test]
+    fn an_object_without_depth_test_draws_over_what_hides_it() {
+        on_gpu(64, 64, async |surface| {
+            let mut scene = SceneNode3d::empty();
+            scene
+                .add_cube(3.0, 3.0, 0.5)
+                .set_color(Color::new(0.0, 0.0, 0.0, 1.0));
+            let mut ball = scene.add_sphere(0.5);
+            ball.set_emissive(Color::new(4.0, 4.0, 4.0, 1.0));
+            ball.set_position(Vec3::new(0.0, 0.0, -2.0));
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+
+            surface.render_3d(&mut scene, &mut camera).await;
+            assert!(luma_at(surface, 32, 32) < 0.1);
+
+            ball.set_depth_test(false);
+            assert!(!ball.data().get_object().data().depth_test());
+            surface.render_3d(&mut scene, &mut camera).await;
+            assert!(luma_at(surface, 32, 32) > 0.3);
+        });
+    }
+
+    #[test]
+    fn a_surface_that_receives_no_shadows_stays_lit() {
+        on_gpu(64, 64, async |surface| {
+            surface.set_shadow_resolution(256);
+            let mut scene = SceneNode3d::empty();
+            scene
+                .add_light(Light::point(40.0).with_intensity(2.0))
+                .set_position(Vec3::new(3.0, 3.0, 1.0));
+            let mut ground = scene.add_cube(12.0, 0.2, 12.0);
+            ground.set_color(Color::new(0.8, 0.8, 0.8, 1.0));
+            ground.set_position(Vec3::new(0.0, -1.1, 0.0));
+            scene.add_cube(2.0, 2.0, 2.0);
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 6.0, 8.0), Vec3::ZERO);
+
+            surface.render_3d(&mut scene, &mut camera).await;
+            let shadowed = mean_luma(surface);
+            assert!(ground.data().get_object().data().receives_shadows());
+
+            ground.set_receives_shadows(false);
+            surface.render_3d(&mut scene, &mut camera).await;
+            let unshadowed = mean_luma(surface);
+            assert!(unshadowed > shadowed + 0.01, "{} {}", shadowed, unshadowed);
+        });
     }
 }

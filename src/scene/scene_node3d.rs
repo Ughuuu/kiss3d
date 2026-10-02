@@ -2297,6 +2297,24 @@ impl SceneNode3d {
         self.clone()
     }
 
+    /// Sets whether shadows darken this node's object (see
+    /// [`Object3d::set_receives_shadows`](crate::scene::Object3d::set_receives_shadows)).
+    /// Defaults to `true`.
+    #[inline]
+    pub fn set_receives_shadows(&mut self, receives_shadows: bool) -> Self {
+        self.apply_to_object_mut(&mut |o| o.set_receives_shadows(receives_shadows));
+        self.clone()
+    }
+
+    /// Sets whether this node's object tests and writes depth (see
+    /// [`Object3d::set_depth_test`](crate::scene::Object3d::set_depth_test)).
+    /// Defaults to `true`; `false` draws it over everything.
+    #[inline]
+    pub fn set_depth_test(&mut self, depth_test: bool) -> Self {
+        self.apply_to_object_mut(&mut |o| o.set_depth_test(depth_test));
+        self.clone()
+    }
+
     // === PBR Texture Maps ===
 
     /// Sets the normal map for this node's object only.

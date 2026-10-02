@@ -483,9 +483,9 @@ pub struct ObjectMaterial {
     build_prepass: PrepassPipelineBuilder,
     /// WESL-compiled shader modules, keyed by feature mask (lazily compiled, cached).
     shader_modules: RefCell<HashMap<ShaderFeatures, Rc<wgpu::ShaderModule>>>,
-    /// Specialized surface/prepass pipelines, keyed by `(features, sample_count, kind)`.
+    /// Specialized surface/prepass pipelines, keyed by `(features, sample_count, kind, depth_test)`.
     surface_pipelines:
-        RefCell<HashMap<(ShaderFeatures, u32, PipelineKind), Rc<wgpu::RenderPipeline>>>,
+        RefCell<HashMap<(ShaderFeatures, u32, PipelineKind, bool), Rc<wgpu::RenderPipeline>>>,
     object_bind_group_layout: wgpu::BindGroupLayout,
     /// Combined material-texture bind group layout (albedo + PBR maps, group 2).
     texture_bind_group_layout: wgpu::BindGroupLayout,
@@ -499,9 +499,13 @@ pub struct ObjectMaterial {
     reflection_sampler: wgpu::Sampler,
     // Wireframe rendering resources
     wireframe_pipeline: PipelineCache,
+    /// The wireframe pipeline of an object that draws over everything.
+    wireframe_pipeline_no_depth: PipelineCache,
     wireframe_model_bind_group_layout: wgpu::BindGroupLayout,
     // Point rendering resources
     points_pipeline: PipelineCache,
+    /// The points pipeline of an object that draws over everything.
+    points_pipeline_no_depth: PipelineCache,
     points_model_bind_group_layout: wgpu::BindGroupLayout,
 
     // === Dynamic uniform buffer system ===
@@ -607,7 +611,7 @@ pub struct ObjectMaterial {
 }
 
 /// Builds an opaque-surface or OIT pipeline from a compiled module:
-/// `(pipeline_layout, shader_module, vertex_colors, cull_mode, label, sample_count)`.
+/// `(pipeline_layout, shader_module, vertex_colors, cull_mode, depth_test, label, sample_count)`.
 /// Captures nothing; the deform variant differs only in the module + layout passed,
 /// while `vertex_colors` adds the per-vertex colour buffer to the vertex layout.
 type SurfacePipelineBuilder = Rc<
@@ -616,10 +620,31 @@ type SurfacePipelineBuilder = Rc<
         &wgpu::ShaderModule,
         bool,
         Option<wgpu::Face>,
+        bool,
         &'static str,
         u32,
     ) -> wgpu::RenderPipeline,
 >;
+
+/// The depth state of an object pipeline: `compare` and `write` when the object
+/// tests depth, always passing and never writing when it draws over everything.
+fn object_depth_state(
+    depth_test: bool,
+    write: bool,
+    compare: wgpu::CompareFunction,
+) -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: Context::depth_format(),
+        depth_write_enabled: Some(write && depth_test),
+        depth_compare: Some(if depth_test {
+            compare
+        } else {
+            wgpu::CompareFunction::Always
+        }),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    }
+}
 
 /// Builds the depth + view-position prepass pipeline:
 /// `(pipeline_layout, shader_module, vertex_colors, sample_count)`.
@@ -1262,6 +1287,7 @@ impl ObjectMaterial {
              shader: &wgpu::ShaderModule,
              vertex_colors: bool,
              cull_mode: Option<wgpu::Face>,
+             depth_test: bool,
              label: &'static str,
              sample_count: u32| {
                 let ctxt = Context::get();
@@ -1299,13 +1325,11 @@ impl ObjectMaterial {
                         unclipped_depth: false,
                         conservative: false,
                     },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: Context::depth_format(),
-                        depth_write_enabled: Some(true),
-                        depth_compare: Some(wgpu::CompareFunction::Less),
-                        stencil: wgpu::StencilState::default(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
+                    depth_stencil: Some(object_depth_state(
+                        depth_test,
+                        true,
+                        wgpu::CompareFunction::Less,
+                    )),
                     multisample: multisample_state(sample_count),
                     multiview_mask: None,
                     cache: None,
@@ -1324,6 +1348,7 @@ impl ObjectMaterial {
              shader: &wgpu::ShaderModule,
              vertex_colors: bool,
              cull_mode: Option<wgpu::Face>,
+             depth_test: bool,
              label: &'static str,
              sample_count: u32| {
                 let ctxt = Context::get();
@@ -1388,15 +1413,13 @@ impl ObjectMaterial {
                         unclipped_depth: false,
                         conservative: false,
                     },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: Context::depth_format(),
-                        // Test against opaque depth, but do not write (transparent
-                        // fragments must not occlude each other).
-                        depth_write_enabled: Some(false),
-                        depth_compare: Some(wgpu::CompareFunction::Less),
-                        stencil: wgpu::StencilState::default(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
+                    // Test against opaque depth, but do not write (transparent
+                    // fragments must not occlude each other).
+                    depth_stencil: Some(object_depth_state(
+                        depth_test,
+                        false,
+                        wgpu::CompareFunction::Less,
+                    )),
                     multisample: multisample_state(sample_count),
                     multiview_mask: None,
                     cache: None,
@@ -1650,7 +1673,7 @@ impl ObjectMaterial {
 
         // Wireframe pipeline, built lazily per MSAA sample count (lines render into
         // the optionally-multisampled HDR film alongside surfaces).
-        let wireframe_pipeline = PipelineCache::new(move |sample_count| {
+        let build_wireframe = Rc::new(move |sample_count: u32, depth_test: bool| {
             let ctxt = Context::get();
             // Instance vertex buffer layouts for wireframe (matching InstancesBuffer)
             let wireframe_instance_buffer_layouts = [
@@ -1750,18 +1773,23 @@ impl ObjectMaterial {
                     unclipped_depth: false,
                     conservative: false,
                 },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: Context::depth_format(),
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
+                depth_stencil: Some(object_depth_state(
+                    depth_test,
+                    true,
+                    wgpu::CompareFunction::LessEqual,
+                )),
                 multisample: multisample_state(sample_count),
                 multiview_mask: None,
                 cache: None,
             })
         });
+
+        let wireframe_pipeline = {
+            let build = build_wireframe.clone();
+            PipelineCache::new(move |sample_count| build(sample_count, true))
+        };
+        let wireframe_pipeline_no_depth =
+            PipelineCache::new(move |sample_count| build_wireframe(sample_count, false));
 
         // Create points bind group layouts (same view layout as wireframe, different model layout)
         let points_view_bind_group_layout =
@@ -1825,7 +1853,7 @@ impl ObjectMaterial {
 
         // Points pipeline, built lazily per MSAA sample count (points render into
         // the optionally-multisampled HDR film alongside surfaces).
-        let points_pipeline = PipelineCache::new(move |sample_count| {
+        let build_points = Rc::new(move |sample_count: u32, depth_test: bool| {
             let ctxt = Context::get();
             // Instance vertex buffer layouts for points (similar to wireframe but with points_colors/sizes)
             let points_instance_buffer_layouts = [
@@ -1921,18 +1949,23 @@ impl ObjectMaterial {
                     unclipped_depth: false,
                     conservative: false,
                 },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: Context::depth_format(),
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
+                depth_stencil: Some(object_depth_state(
+                    depth_test,
+                    true,
+                    wgpu::CompareFunction::LessEqual,
+                )),
                 multisample: multisample_state(sample_count),
                 multiview_mask: None,
                 cache: None,
             })
         });
+
+        let points_pipeline = {
+            let build = build_points.clone();
+            PipelineCache::new(move |sample_count| build(sample_count, true))
+        };
+        let points_pipeline_no_depth =
+            PipelineCache::new(move |sample_count| build_points(sample_count, false));
 
         // === Create shared dynamic buffer resources ===
 
@@ -2101,8 +2134,10 @@ impl ObjectMaterial {
             default_height_map,
             reflection_sampler,
             wireframe_pipeline,
+            wireframe_pipeline_no_depth,
             wireframe_model_bind_group_layout,
             points_pipeline,
+            points_pipeline_no_depth,
             points_model_bind_group_layout,
             frame_uniform_buffer,
             frame_shadow_group: None,
@@ -2177,9 +2212,10 @@ impl ObjectMaterial {
         features: ShaderFeatures,
         sample_count: u32,
         kind: PipelineKind,
+        depth_test: bool,
     ) -> Rc<wgpu::RenderPipeline> {
         let sample_count = sample_count.max(1);
-        let key = (features, sample_count, kind);
+        let key = (features, sample_count, kind, depth_test);
         if let Some(p) = self.surface_pipelines.borrow().get(&key) {
             return p.clone();
         }
@@ -2200,6 +2236,7 @@ impl ObjectMaterial {
                 &module,
                 vertex_colors,
                 Some(wgpu::Face::Back),
+                depth_test,
                 "object_material_pipeline_cull",
                 sample_count,
             ),
@@ -2208,6 +2245,7 @@ impl ObjectMaterial {
                 &module,
                 vertex_colors,
                 None,
+                depth_test,
                 "object_material_pipeline_no_cull",
                 sample_count,
             ),
@@ -2216,6 +2254,7 @@ impl ObjectMaterial {
                 &module,
                 vertex_colors,
                 Some(wgpu::Face::Back),
+                depth_test,
                 "object_material_oit_pipeline_cull",
                 sample_count,
             ),
@@ -2224,6 +2263,7 @@ impl ObjectMaterial {
                 &module,
                 vertex_colors,
                 None,
+                depth_test,
                 "object_material_oit_pipeline_no_cull",
                 sample_count,
             ),
@@ -2260,7 +2300,7 @@ impl ObjectMaterial {
         {
             return false;
         }
-        let _ = self.surface_pipeline(f, sample_count, PipelineKind::OpaqueCull);
+        let _ = self.surface_pipeline(f, sample_count, PipelineKind::OpaqueCull, true);
         true
     }
 
@@ -3128,7 +3168,10 @@ impl Material3d for ObjectMaterial {
             && match context.phase {
                 // The prepass rasterizes opaque surfaces only (for SSAO geometry +
                 // the depth the glass pass tests against — glass stays out of it).
-                crate::resource::RenderPhase::Prepass => !transparent && !glass,
+                // A surface drawn over everything stays out of the G-buffer too.
+                crate::resource::RenderPhase::Prepass => {
+                    !transparent && !glass && data.depth_test()
+                }
                 crate::resource::RenderPhase::Opaque => !transparent && !glass,
                 crate::resource::RenderPhase::Transparent => transparent,
                 crate::resource::RenderPhase::Transmission => glass,
@@ -3299,14 +3342,16 @@ impl Material3d for ObjectMaterial {
                 (crate::resource::RenderPhase::Transmission, false)
                 | (crate::resource::RenderPhase::Opaque, false) => PipelineKind::OpaqueNoCull,
             };
+            let receives_shadows = shadows_active && data.receives_shadows();
             let mut features =
-                self.object_features(data, use_deform, shadows_active, colors_buf.is_some());
+                self.object_features(data, use_deform, receives_shadows, colors_buf.is_some());
             // The prepass ignores all shading features; collapse to the structural key
             // so it stays a single module per deform-ness.
             if kind == PipelineKind::Prepass {
                 features = features.prepass_key();
             }
-            let pipeline = self.surface_pipeline(features, context.sample_count, kind);
+            let pipeline =
+                self.surface_pipeline(features, context.sample_count, kind, data.depth_test());
 
             let texture_bind_group = gpu_data.texture_bind_group.as_ref().unwrap();
             let object_bind_group = self.object_bind_group.as_ref().unwrap();
@@ -3451,7 +3496,12 @@ impl Material3d for ObjectMaterial {
                 let wireframe_model_bind_group =
                     gpu_data.wireframe_model_bind_group.as_ref().unwrap();
 
-                let wireframe_pipeline = self.wireframe_pipeline.get(context.sample_count);
+                let wireframe_pipeline = if data.depth_test() {
+                    &self.wireframe_pipeline
+                } else {
+                    &self.wireframe_pipeline_no_depth
+                }
+                .get(context.sample_count);
                 render_pass.set_pipeline(&wireframe_pipeline);
                 // Use shared view bind group (written once per frame)
                 render_pass.set_bind_group(0, &self.wireframe_view_bind_group, &[]);
@@ -3562,7 +3612,12 @@ impl Material3d for ObjectMaterial {
 
                 let points_model_bind_group = gpu_data.points_model_bind_group.as_ref().unwrap();
 
-                let points_pipeline = self.points_pipeline.get(context.sample_count);
+                let points_pipeline = if data.depth_test() {
+                    &self.points_pipeline
+                } else {
+                    &self.points_pipeline_no_depth
+                }
+                .get(context.sample_count);
                 render_pass.set_pipeline(&points_pipeline);
                 // Use shared view bind group (written once per frame)
                 render_pass.set_bind_group(0, &self.points_view_bind_group, &[]);
