@@ -75,6 +75,28 @@ fn shadow_depth_bias((constant, slope_scale): (i32, f32)) -> wgpu::DepthBiasStat
     }
 }
 
+/// The fragment entry of a transmittance-shader pipeline: the tint for the
+/// transmittance pass, the cutout test for an alpha-tested depth pass.
+fn fragment_entry(alpha_depth: Option<(i32, f32)>) -> &'static str {
+    if alpha_depth.is_some() {
+        "fs_alpha_test"
+    } else {
+        "fs_main"
+    }
+}
+
+/// Depth state of a transmittance-shader pipeline: read-only for the tint, or
+/// written with the raster bias like the plain depth pass for a cutout caster.
+fn transmittance_depth_state(alpha_depth: Option<(i32, f32)>) -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth32Float,
+        depth_write_enabled: Some(alpha_depth.is_some()),
+        depth_compare: Some(wgpu::CompareFunction::Less),
+        stencil: wgpu::StencilState::default(),
+        bias: alpha_depth.map_or_else(wgpu::DepthBiasState::default, shadow_depth_bias),
+    }
+}
+
 /// Tight perspective near/far planes for a point or spot light, fit to the
 /// shadow-caster world AABB so the limited depth range isn't wasted on empty space
 /// between the light's tiny default near plane and a far plane at its full
@@ -207,8 +229,12 @@ struct ShadowModelUniforms {
     transform: [[f32; 4]; 4],
     scale: [[f32; 4]; 3], // mat3x3 padded to mat3x4 for alignment
     /// Base color (RGBA). Only read by the transmittance pass (to tint the
-    /// shadow by translucent occluders); the depth pass ignores it.
+    /// shadow by translucent occluders) and the cutout depth pass; the plain depth
+    /// pass ignores it.
     color: [f32; 4],
+    /// x: the alpha cutoff of a `Mask` caster (the cutout depth pass discards
+    /// texels below it); 0 otherwise.
+    params: [f32; 4],
 }
 
 /// Aligned stride of the dynamic per-view/per-object buffers (256 satisfies the
@@ -295,6 +321,9 @@ pub struct ShadowMapper {
     /// Deformed colored-transmittance pipeline (translucent deformable casters).
     /// `None` on web, where they fall back to the rest shape.
     deform_transmittance_pipeline: Option<wgpu::RenderPipeline>,
+    /// Depth pipelines of `Mask` casters, plain and deformed, which discard texels
+    /// below the cutoff. Built the first frame a cutout caster appears.
+    cutout_pipelines: Option<(wgpu::RenderPipeline, Option<wgpu::RenderPipeline>)>,
     /// Layout for the per-view bind group (group 0 of the depth pipeline).
     view_bind_group_layout: wgpu::BindGroupLayout,
     /// Dynamic per-view uniform buffer (one entry per scheduled view).
@@ -449,6 +478,7 @@ impl ShadowMapper {
             &view_bind_group_layout,
             &model_bind_group_layout,
             &transmittance_tex_bgl,
+            None,
         );
 
         // Deformed depth/transmittance pipelines: the deform data is bound as a 3rd
@@ -478,6 +508,7 @@ impl ShadowMapper {
                 &model_bind_group_layout,
                 &deform_layout,
                 &transmittance_tex_bgl,
+                None,
             );
             (Some(depth), Some(transmittance))
         } else {
@@ -556,6 +587,7 @@ impl ShadowMapper {
             depth_pipeline,
             deform_depth_pipeline,
             deform_transmittance_pipeline,
+            cutout_pipelines: None,
             view_bind_group_layout,
             view_uniform_buffer,
             view_capacity,
@@ -1045,6 +1077,7 @@ impl ShadowMapper {
         model_bind_group_layout: &wgpu::BindGroupLayout,
         deform_bind_group_layout: &wgpu::BindGroupLayout,
         tex_bind_group_layout: &wgpu::BindGroupLayout,
+        alpha_depth: Option<(i32, f32)>,
     ) -> wgpu::RenderPipeline {
         let shader = ctxt.create_shader_module(
             Some("shadow_transmittance_deform_shader"),
@@ -1128,6 +1161,14 @@ impl ShadowMapper {
             dst_factor: wgpu::BlendFactor::Zero,
             operation: wgpu::BlendOperation::Add,
         };
+        let transmittance_target = [Some(wgpu::ColorTargetState {
+            format: TRANSMITTANCE_FORMAT,
+            blend: Some(wgpu::BlendState {
+                color: mult_blend,
+                alpha: mult_blend,
+            }),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
 
         ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow_transmittance_skinned_pipeline"),
@@ -1140,15 +1181,12 @@ impl ShadowMapper {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: TRANSMITTANCE_FORMAT,
-                    blend: Some(wgpu::BlendState {
-                        color: mult_blend,
-                        alpha: mult_blend,
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                entry_point: Some(fragment_entry(alpha_depth)),
+                targets: if alpha_depth.is_some() {
+                    &[]
+                } else {
+                    &transmittance_target
+                },
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -1160,13 +1198,7 @@ impl ShadowMapper {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            depth_stencil: Some(transmittance_depth_state(alpha_depth)),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -1187,6 +1219,7 @@ impl ShadowMapper {
         view_bind_group_layout: &wgpu::BindGroupLayout,
         model_bind_group_layout: &wgpu::BindGroupLayout,
         tex_bind_group_layout: &wgpu::BindGroupLayout,
+        alpha_depth: Option<(i32, f32)>,
     ) -> wgpu::RenderPipeline {
         let shader = ctxt.create_shader_module(
             Some("shadow_transmittance_shader"),
@@ -1272,6 +1305,14 @@ impl ShadowMapper {
             dst_factor: wgpu::BlendFactor::Zero,
             operation: wgpu::BlendOperation::Add,
         };
+        let transmittance_target = [Some(wgpu::ColorTargetState {
+            format: TRANSMITTANCE_FORMAT,
+            blend: Some(wgpu::BlendState {
+                color: mult_blend,
+                alpha: mult_blend,
+            }),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
 
         ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow_transmittance_pipeline"),
@@ -1284,15 +1325,12 @@ impl ShadowMapper {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: TRANSMITTANCE_FORMAT,
-                    blend: Some(wgpu::BlendState {
-                        color: mult_blend,
-                        alpha: mult_blend,
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                entry_point: Some(fragment_entry(alpha_depth)),
+                targets: if alpha_depth.is_some() {
+                    &[]
+                } else {
+                    &transmittance_target
+                },
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -1308,13 +1346,7 @@ impl ShadowMapper {
             // fragment tints only where it is in front of the nearest opaque
             // surface. Depth writes are off so translucent occluders don't hide
             // one another (their transmittances multiply commutatively).
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            depth_stencil: Some(transmittance_depth_state(alpha_depth)),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -1452,6 +1484,34 @@ impl ShadowMapper {
                 bias,
             ));
         }
+        self.cutout_pipelines = None;
+    }
+
+    /// Builds the cutout depth pipelines if they are not built yet.
+    fn ensure_cutout_pipelines(&mut self) {
+        if self.cutout_pipelines.is_some() {
+            return;
+        }
+        let ctxt = Context::get();
+        let bias = Some(self.raster_bias);
+        let plain = Self::create_transmittance_pipeline(
+            &ctxt,
+            &self.view_bind_group_layout,
+            &self.model_bind_group_layout,
+            &self.transmittance_tex_bgl,
+            bias,
+        );
+        let deformed = self.deform_depth_pipeline.as_ref().map(|_| {
+            Self::create_transmittance_pipeline_deform(
+                &ctxt,
+                &self.view_bind_group_layout,
+                &self.model_bind_group_layout,
+                &crate::builtin::deform::deform_bind_group_layout(),
+                &self.transmittance_tex_bgl,
+                bias,
+            )
+        });
+        self.cutout_pipelines = Some((plain, deformed));
     }
 
     /// The shadow view budget: atlas layers shared by every shadow-casting light.
@@ -1655,10 +1715,12 @@ impl ShadowMapper {
         // buffer writes can't be interleaved with an active pass.
         let mut models: Vec<ShadowModelUniforms> = Vec::new();
         let mut has_transparent = false;
+        let mut has_cutout = false;
         scene
             .data()
-            .collect_shadow_models(&mut |transform, scale, color| {
-                has_transparent |= color.a < OPAQUE_ALPHA_THRESHOLD;
+            .collect_shadow_models(&mut |transform, scale, color, cutoff| {
+                has_transparent |= cutoff.is_none() && color.a < OPAQUE_ALPHA_THRESHOLD;
+                has_cutout |= cutoff.is_some();
                 let scale_mat = glamx::Mat3::from_diagonal(scale).to_cols_array_2d();
                 models.push(ShadowModelUniforms {
                     transform: transform.to_mat4().to_cols_array_2d(),
@@ -1668,8 +1730,12 @@ impl ShadowMapper {
                         [scale_mat[2][0], scale_mat[2][1], scale_mat[2][2], 0.0],
                     ],
                     color: [color.r, color.g, color.b, color.a],
+                    params: [cutoff.unwrap_or(0.0), 0.0, 0.0, 0.0],
                 });
             });
+        if has_cutout {
+            self.ensure_cutout_pipelines();
+        }
 
         if models.is_empty() {
             // No surface geometry to occlude: nothing to render, behave as off.
@@ -1744,6 +1810,9 @@ impl ShadowMapper {
                     &mut object_index,
                     false,
                     OPAQUE_ALPHA_THRESHOLD,
+                    self.cutout_pipelines.as_ref().map(|(plain, deformed)| {
+                        (plain, deformed.as_ref(), &self.transmittance_tex_bgl)
+                    }),
                 );
             }
 
@@ -1798,6 +1867,7 @@ impl ShadowMapper {
                     &mut object_index,
                     true,
                     OPAQUE_ALPHA_THRESHOLD,
+                    None,
                 );
             }
         }
@@ -2098,7 +2168,7 @@ mod tests {
     use crate::camera::OrbitCamera3d;
     use crate::color::Color;
     use crate::light::Light;
-    use crate::scene::SceneNode3d;
+    use crate::scene::{AlphaMode, SceneNode3d};
     use crate::test_gpu::{mean_luma, on_gpu};
     use glamx::Vec3;
 
@@ -2183,6 +2253,58 @@ mod tests {
                 shadowed,
                 raster_biased
             );
+        });
+    }
+
+    /// A slab above the ground, lit from straight above, its texture opaque on
+    /// the left half and clear on the right.
+    fn half_clear_slab(scene: &mut SceneNode3d) -> SceneNode3d {
+        let mut pixels = image::RgbaImage::new(8, 1);
+        for (x, _, p) in pixels.enumerate_pixels_mut() {
+            *p = image::Rgba([255, 255, 255, if x < 4 { 255 } else { 0 }]);
+        }
+        let texture = crate::resource::TextureManager::get_global_manager(|tm| {
+            tm.add_image(
+                image::DynamicImage::ImageRgba8(pixels.clone()),
+                "half_clear",
+            )
+        });
+        let mut slab = scene.add_cube(3.0, 0.05, 3.0);
+        slab.set_texture(texture);
+        slab.set_position(Vec3::new(0.0, 1.0, 0.0));
+        slab
+    }
+
+    #[test]
+    fn a_masked_caster_shadows_only_where_its_texture_is_opaque() {
+        on_gpu(64, 64, async |surface| {
+            surface.set_shadow_resolution(256);
+            let mut scene = SceneNode3d::empty();
+            scene
+                .add_light(Light::point(40.0).with_intensity(2.0))
+                .set_position(Vec3::new(0.0, 6.0, 0.0));
+            scene
+                .add_cube(12.0, 0.2, 12.0)
+                .set_color(Color::new(0.8, 0.8, 0.8, 1.0))
+                .set_position(Vec3::new(0.0, -1.1, 0.0));
+            let mut slab = half_clear_slab(&mut scene);
+            // Looking up from below the slab, so only the ground and its shadow show.
+            let mut camera =
+                OrbitCamera3d::new(Vec3::new(0.0, 0.4, 0.01), Vec3::new(0.0, -1.0, 0.0));
+
+            slab.set_alpha_mode(AlphaMode::Opaque);
+            surface.render_3d(&mut scene, &mut camera).await;
+            let solid = mean_luma(surface);
+
+            slab.set_alpha_mode(AlphaMode::Mask(0.5));
+            surface.render_3d(&mut scene, &mut camera).await;
+            let cut = mean_luma(surface);
+            assert!(cut > solid + 0.02, "{} {}", solid, cut);
+
+            slab.set_casts_shadows(false);
+            surface.render_3d(&mut scene, &mut camera).await;
+            let open = mean_luma(surface);
+            assert!(open > cut + 0.02, "{} {}", cut, open);
         });
     }
 

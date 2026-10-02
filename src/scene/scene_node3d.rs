@@ -285,12 +285,23 @@ impl SceneNodeData3d {
     /// uses, so each object maps to a stable per-object uniform slot.
     ///
     /// [`render_depth_only`]: Self::render_depth_only
+    ///
+    /// The last argument is the alpha cutoff of a `Mask` caster, `None` otherwise.
     #[doc(hidden)]
-    pub fn collect_shadow_models(&self, f: &mut dyn FnMut(Pose3, Vec3, Color)) {
+    pub fn collect_shadow_models(&self, f: &mut dyn FnMut(Pose3, Vec3, Color, Option<f32>)) {
         if self.visible {
             if let Some(ref o) = self.object {
                 if o.casts_shadows() {
-                    f(self.world_transform, self.world_scale, o.data().color());
+                    let cutoff = match o.data().alpha_mode() {
+                        crate::scene::AlphaMode::Mask(cutoff) => Some(cutoff),
+                        _ => None,
+                    };
+                    f(
+                        self.world_transform,
+                        self.world_scale,
+                        o.data().color(),
+                        cutoff,
+                    );
                 }
             }
             for c in self.children.iter() {
@@ -433,7 +444,8 @@ impl SceneNodeData3d {
     /// filtered by opacity: `only_transparent == false` draws the opaque casters
     /// (depth pre-pass), `true` draws the transparent ones (colored transmittance
     /// pass). An object counts as transparent when its color alpha is below
-    /// `alpha_threshold`.
+    /// `alpha_threshold` and it is not a `Mask` cutout. In the depth pass a cutout
+    /// draws with the `cutout` pipelines (plain, deformed, albedo layout) when given.
     ///
     /// `object_index` is incremented for **every** caster regardless of the
     /// filter, so each object keeps the same per-object model-uniform slot as
@@ -450,6 +462,11 @@ impl SceneNodeData3d {
         object_index: &mut u32,
         only_transparent: bool,
         alpha_threshold: f32,
+        cutout: Option<(
+            &wgpu::RenderPipeline,
+            Option<&wgpu::RenderPipeline>,
+            &wgpu::BindGroupLayout,
+        )>,
     ) {
         if !self.visible {
             return;
@@ -457,17 +474,28 @@ impl SceneNodeData3d {
 
         if let Some(ref mut o) = self.object {
             if o.casts_shadows() {
-                let transparent = o.data().color().a < alpha_threshold;
+                let is_cutout = matches!(o.data().alpha_mode(), crate::scene::AlphaMode::Mask(_));
+                let transparent = !is_cutout && o.data().color().a < alpha_threshold;
                 if transparent == only_transparent {
                     let offset = *object_index * model_stride;
-                    o.render_depth_only(
-                        render_pass,
-                        base_pipeline,
-                        deform_pipeline,
-                        transmittance_tex,
-                        model_bind_group,
-                        offset,
-                    );
+                    match cutout.filter(|_| is_cutout && !only_transparent) {
+                        Some((base, deform, layout)) => o.render_depth_only(
+                            render_pass,
+                            base,
+                            deform,
+                            Some(layout),
+                            model_bind_group,
+                            offset,
+                        ),
+                        None => o.render_depth_only(
+                            render_pass,
+                            base_pipeline,
+                            deform_pipeline,
+                            transmittance_tex,
+                            model_bind_group,
+                            offset,
+                        ),
+                    }
                 }
                 // Increment for every caster so slots stay aligned across both passes.
                 *object_index += 1;
@@ -486,6 +514,7 @@ impl SceneNodeData3d {
                 object_index,
                 only_transparent,
                 alpha_threshold,
+                cutout,
             );
         }
     }
