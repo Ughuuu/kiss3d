@@ -158,7 +158,7 @@ fn march_interval(origin: vec2<f32>, dir: vec2<f32>, start: f32, end: f32, max_s
             return vec4<f32>(0.0, 0.0, 0.0, 0.0);
         }
 
-        t += max(min(d_emit, d_occ), 0.5);
+        t += max(min(d_emit, d_occ), 0.25 * field.flags.w);
         if (t >= end) {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }

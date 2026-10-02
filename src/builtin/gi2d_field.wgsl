@@ -51,7 +51,7 @@ struct FieldUniforms {
     cur_vp_2: vec4<f32>,
     // num_rays, frame_index, temporal_blend, history_valid
     params: vec4<f32>,
-    // use_sdf, sdf_bias, num_segments, _
+    // use_sdf, sdf_bias, num_segments, world units per field pixel
     flags: vec4<f32>,
     // num_emitters, num_occluders, max_dist, max_steps
     counts: vec4<f32>,
@@ -135,7 +135,9 @@ fn trace(origin: vec2<f32>, dir: vec2<f32>) -> vec3<f32> {
     let max_dist = u.counts.z;
     let max_steps = u32(u.counts.w);
 
-    var t = 1.0;
+    // Measured in field pixels, so the march resolves the same at any zoom.
+    let pixel = u.flags.w;
+    var t = 0.5 * pixel;
     for (var step = 0u; step < max_steps; step = step + 1u) {
         let p = origin + dir * t;
 
@@ -160,7 +162,7 @@ fn trace(origin: vec2<f32>, dir: vec2<f32>) -> vec3<f32> {
             return vec3<f32>(0.0);
         }
 
-        t += max(min(d_emit, d_occ), 0.5);
+        t += max(min(d_emit, d_occ), 0.25 * pixel);
         if (t > max_dist) {
             break;
         }

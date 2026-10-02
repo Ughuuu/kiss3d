@@ -814,6 +814,12 @@ impl Gi2d {
         self.sdf_occluders = enabled;
     }
 
+    /// World units one field pixel covers, under the camera last captured.
+    fn world_per_field_pixel(&self) -> f32 {
+        let cw = self.gi_size.0.max(1) as f32;
+        (2.0 / cw) / self.vp.x_axis.x.abs().max(1e-6)
+    }
+
     /// (Re)creates the per-size textures and jump-flood pass buffers, resetting
     /// temporal history when the size changes.
     fn ensure_textures(&mut self, width: u32, height: u32) {
@@ -892,15 +898,13 @@ impl Gi2d {
             // zero-crossing slightly outside the true surface — making it
             // effectively signed near the boundary so the march's `d <= 0` blocked
             // test fires reliably instead of letting grazing rays tunnel through.
+            // The last is world units per field pixel, which the march's first
+            // step and smallest step are measured in.
             flags: [
                 if self.sdf_occluders { 1.0 } else { 0.0 },
-                {
-                    let cw = self.gi_size.0.max(1) as f32;
-                    let wpp = (2.0 / cw) / self.vp.x_axis.x.abs().max(1e-6);
-                    wpp * 2.0
-                },
+                self.world_per_field_pixel() * 2.0,
                 self.segments.len().min(MAX_SEGMENT_OCCLUDERS) as f32,
-                0.0,
+                self.world_per_field_pixel(),
             ],
             counts: [
                 self.emitters.len().min(MAX_EMITTERS) as f32,
@@ -1462,6 +1466,39 @@ mod tests {
                     shadowed
                 );
             }
+        });
+    }
+
+    #[test]
+    fn a_zoomed_in_camera_lights_the_ground_beside_its_emitter() {
+        on_gpu(64, 64, async |surface| {
+            // 32 pixels to a world unit: a whole field pixel is a sixteenth of one.
+            let mut camera = crate::camera::PanZoomCamera2d::new(Vec2::ZERO, 32.0);
+            let mut scene = SceneNode2d::empty();
+            scene.add_rectangle(4.0, 4.0);
+            let mut gi = Gi2d::new();
+            gi.set_temporal_blend(0.0);
+            gi.set_rays(64);
+            gi.set_ambient(Color::new(0.0, 0.0, 0.0, 1.0));
+            gi.set_camera(&camera);
+            gi.set_emitters(&[GiEmitter2d::new(
+                Vec2::ZERO,
+                0.1,
+                Color::new(1.0, 1.0, 1.0, 1.0),
+                8.0,
+            )]);
+            surface
+                .render(
+                    None,
+                    Some(&mut scene),
+                    None,
+                    Some(&mut camera),
+                    None,
+                    Some(&mut gi),
+                )
+                .await;
+            let beside = block_luma(surface, 38, 30, 4, 4);
+            assert!(beside > 0.1, "{}", beside);
         });
     }
 }
