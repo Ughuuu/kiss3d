@@ -10,7 +10,7 @@
 //! # Texture / atlas layout
 //!
 //! All shadow maps are packed into a single `Depth32Float` **2D texture array**
-//! (`resolution × resolution × MAX_SHADOW_VIEWS`). Using one array texture keeps
+//! (`resolution × resolution × max_views`, see [`ShadowMapper::set_max_views`]). Using one array texture keeps
 //! the material's bind group small — a single depth texture binding plus one
 //! comparison sampler — regardless of how many lights are active, so we never run
 //! into per-stage texture-binding limits even with the full `MAX_LIGHTS` budget.
@@ -19,13 +19,13 @@
 //!
 //! | Light type    | Technique                          | Layers |
 //! |---------------|------------------------------------|--------|
-//! | Directional   | single tight orthographic cascade  | 1      |
+//! | Directional   | orthographic cascades              | `num_cascades` (default 4) |
 //! | Spot          | perspective map fit to the cone    | 1      |
 //! | Point         | cube map unrolled to 6 perspectives| 6      |
 //!
 //! Point lights select the relevant cube face in the shader from the dominant
 //! axis of the light→fragment vector. The total number of views is capped at
-//! [`MAX_SHADOW_VIEWS`]; lights that do not fit keep lighting without shadows.
+//! [`ShadowMapper::max_views`]; lights that do not fit keep lighting without shadows.
 
 use crate::camera::Camera3d;
 use crate::context::Context;
@@ -35,11 +35,23 @@ use bytemuck::{Pod, Zeroable};
 use glamx::glam::camera::rh::{proj::directx, view::look_at_mat4};
 use glamx::{Mat4, Vec3};
 
-/// Maximum number of shadow views (atlas layers) across all lights.
+/// The largest shadow view budget (atlas layers across all lights)
+/// [`ShadowMapper::set_max_views`] accepts.
 ///
-/// A directional or spot light uses one view; a point light uses six. The cap
-/// bounds GPU memory and keeps the per-frame uniform fixed-size.
-pub const MAX_SHADOW_VIEWS: usize = 16;
+/// A spot light uses one view, a directional light one per cascade, a point light
+/// six. This sizes the per-frame shadow uniform (and its WGSL mirror in
+/// `default.wgsl`), so it stays a constant; the atlas itself only holds the
+/// budget's layers.
+pub const MAX_SHADOW_VIEWS: usize = 64;
+
+/// The shadow view budget a [`ShadowMapper`] starts with.
+pub const DEFAULT_SHADOW_VIEWS: u32 = 16;
+
+/// The comparison depth bias a [`ShadowMapper`] starts with.
+pub const DEFAULT_SHADOW_DEPTH_BIAS: f32 = 0.0012;
+
+/// The rasterizer depth bias `(constant, slope_scale)` a [`ShadowMapper`] starts with.
+pub const DEFAULT_SHADOW_RASTER_BIAS: (i32, f32) = (1, 1.75);
 
 /// Maximum number of lights with shadow metadata in a frame. The primary tier
 /// occupies slots `0..MAX_LIGHTS` (indexed by uniform slot); clustered shadow
@@ -55,10 +67,10 @@ pub const MAX_CASCADES: u32 = 4;
 /// constant compare bias plus receiver-plane depth bias. (Contacts stay attached
 /// because the per-light near/far planes are fit to the casters — see
 /// [`light_near_far`] — keeping the depth precision high.)
-fn shadow_depth_bias() -> wgpu::DepthBiasState {
+fn shadow_depth_bias((constant, slope_scale): (i32, f32)) -> wgpu::DepthBiasState {
     wgpu::DepthBiasState {
-        constant: 1,
-        slope_scale: 1.75,
+        constant,
+        slope_scale,
         clamp: 0.0,
     }
 }
@@ -227,6 +239,10 @@ pub struct ShadowMapper {
     resolution: u32,
     /// Slope-scaled-ish constant depth bias used by the PCF comparison.
     depth_bias: f32,
+    /// Rasterizer depth bias `(constant, slope_scale)` baked into the depth pipelines.
+    raster_bias: (i32, f32),
+    /// Atlas layers: the shadow view budget across all lights.
+    max_views: u32,
     /// Shadow-edge softness: scales the PCF tap spacing (`1.0` = default ~5x5
     /// penumbra, larger = blurrier, `0.0` = hard edges).
     softness: f32,
@@ -308,9 +324,11 @@ impl ShadowMapper {
         let ctxt = Context::get();
         let resolution = resolution.max(1);
 
-        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution);
+        let max_views = DEFAULT_SHADOW_VIEWS;
+        let raster_bias = DEFAULT_SHADOW_RASTER_BIAS;
+        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution, max_views);
         let (transmittance_atlas, transmittance_layer_views, transmittance_array_view) =
-            Self::create_transmittance_atlas(&ctxt, resolution);
+            Self::create_transmittance_atlas(&ctxt, resolution, max_views);
 
         // Comparison sampler: hardware does the depth test and (with linear
         // filtering) bilinear PCF across the 2x2 neighborhood per tap.
@@ -420,8 +438,12 @@ impl ShadowMapper {
                 ],
             });
 
-        let depth_pipeline =
-            Self::create_depth_pipeline(&ctxt, &view_bind_group_layout, &model_bind_group_layout);
+        let depth_pipeline = Self::create_depth_pipeline(
+            &ctxt,
+            &view_bind_group_layout,
+            &model_bind_group_layout,
+            raster_bias,
+        );
         let transmittance_pipeline = Self::create_transmittance_pipeline(
             &ctxt,
             &view_bind_group_layout,
@@ -448,6 +470,7 @@ impl ShadowMapper {
                 &view_bind_group_layout,
                 &model_bind_group_layout,
                 &deform_layout,
+                raster_bias,
             );
             let transmittance = Self::create_transmittance_pipeline_deform(
                 &ctxt,
@@ -461,7 +484,7 @@ impl ShadowMapper {
             (None, None)
         };
 
-        let view_capacity = MAX_SHADOW_VIEWS as u64;
+        let view_capacity = DEFAULT_SHADOW_VIEWS as u64;
         let view_uniform_buffer = ctxt.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow_view_uniform_buffer"),
             size: SHADOW_VIEW_STRIDE * view_capacity,
@@ -510,7 +533,9 @@ impl ShadowMapper {
         Self {
             enabled: true,
             resolution,
-            depth_bias: 0.0012,
+            depth_bias: DEFAULT_SHADOW_DEPTH_BIAS,
+            raster_bias,
+            max_views,
             softness: 1.0,
             num_cascades: 4,
             shadow_distance: f32::INFINITY,
@@ -564,7 +589,7 @@ impl ShadowMapper {
     /// Computes the light-space matrices for a shadow-casting light, writes them
     /// into `view_proj` (and queues the views for the depth pre-pass), and returns
     /// the light's `GpuLightShadow` metadata. `base_view` is the light's first atlas
-    /// layer; the caller must have checked it fits within [`MAX_SHADOW_VIEWS`].
+    /// layer; the caller must have checked it fits within the view budget.
     #[allow(clippy::too_many_arguments)]
     fn build_light_shadow(
         &self,
@@ -667,13 +692,14 @@ impl ShadowMapper {
     fn create_atlas(
         ctxt: &Context,
         resolution: u32,
+        layers: u32,
     ) -> (wgpu::Texture, Vec<wgpu::TextureView>, wgpu::TextureView) {
         let atlas = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow_atlas"),
             size: wgpu::Extent3d {
                 width: resolution,
                 height: resolution,
-                depth_or_array_layers: MAX_SHADOW_VIEWS as u32,
+                depth_or_array_layers: layers,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -683,7 +709,7 @@ impl ShadowMapper {
             view_formats: &[],
         });
 
-        let layer_views = (0..MAX_SHADOW_VIEWS as u32)
+        let layer_views = (0..layers)
             .map(|layer| {
                 atlas.create_view(&wgpu::TextureViewDescriptor {
                     label: Some("shadow_atlas_layer"),
@@ -710,13 +736,14 @@ impl ShadowMapper {
     fn create_transmittance_atlas(
         ctxt: &Context,
         resolution: u32,
+        layers: u32,
     ) -> (wgpu::Texture, Vec<wgpu::TextureView>, wgpu::TextureView) {
         let atlas = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow_transmittance_atlas"),
             size: wgpu::Extent3d {
                 width: resolution,
                 height: resolution,
-                depth_or_array_layers: MAX_SHADOW_VIEWS as u32,
+                depth_or_array_layers: layers,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -726,7 +753,7 @@ impl ShadowMapper {
             view_formats: &[],
         });
 
-        let layer_views = (0..MAX_SHADOW_VIEWS as u32)
+        let layer_views = (0..layers)
             .map(|layer| {
                 atlas.create_view(&wgpu::TextureViewDescriptor {
                     label: Some("shadow_transmittance_layer"),
@@ -789,6 +816,7 @@ impl ShadowMapper {
         ctxt: &Context,
         view_bind_group_layout: &wgpu::BindGroupLayout,
         model_bind_group_layout: &wgpu::BindGroupLayout,
+        raster_bias: (i32, f32),
     ) -> wgpu::RenderPipeline {
         let shader = ctxt.create_shader_module(
             Some("shadow_depth_shader"),
@@ -883,7 +911,7 @@ impl ShadowMapper {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
-                bias: shadow_depth_bias(),
+                bias: shadow_depth_bias(raster_bias),
             }),
             multisample: wgpu::MultisampleState {
                 count: 1,
@@ -906,6 +934,7 @@ impl ShadowMapper {
         view_bind_group_layout: &wgpu::BindGroupLayout,
         model_bind_group_layout: &wgpu::BindGroupLayout,
         deform_bind_group_layout: &wgpu::BindGroupLayout,
+        raster_bias: (i32, f32),
     ) -> wgpu::RenderPipeline {
         let shader = ctxt.create_shader_module(
             Some("shadow_depth_deform_shader"),
@@ -993,7 +1022,7 @@ impl ShadowMapper {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
-                bias: shadow_depth_bias(),
+                bias: shadow_depth_bias(raster_bias),
             }),
             multisample: wgpu::MultisampleState {
                 count: 1,
@@ -1375,20 +1404,94 @@ impl ShadowMapper {
         self.first_cascade_far_bound = bound.max(0.01);
     }
 
+    /// Far view distance of the highest-resolution directional cascade. Default 12.
+    pub fn first_cascade_far_bound(&self) -> f32 {
+        self.first_cascade_far_bound
+    }
+
+    /// The constant depth bias the lighting shader subtracts when comparing a
+    /// fragment against the shadow map. Default [`DEFAULT_SHADOW_DEPTH_BIAS`] (0.0012).
+    pub fn depth_bias(&self) -> f32 {
+        self.depth_bias
+    }
+
+    /// Sets the comparison depth bias. Larger values cure acne and detach contact
+    /// shadows sooner. Clamped to `>= 0`.
+    pub fn set_depth_bias(&mut self, bias: f32) {
+        self.depth_bias = bias.max(0.0);
+    }
+
+    /// The rasterizer depth bias `(constant, slope_scale)` of the shadow depth pass.
+    /// Default [`DEFAULT_SHADOW_RASTER_BIAS`] (1, 1.75).
+    pub fn raster_bias(&self) -> (i32, f32) {
+        self.raster_bias
+    }
+
+    /// Sets the rasterizer depth bias of the shadow depth pass: `constant` in
+    /// depth-buffer units and `slope_scale` times the polygon's depth slope. It is
+    /// baked into the depth pipelines, so a change rebuilds them.
+    pub fn set_raster_bias(&mut self, constant: i32, slope_scale: f32) {
+        let bias = (constant, slope_scale);
+        if bias == self.raster_bias {
+            return;
+        }
+        self.raster_bias = bias;
+        let ctxt = Context::get();
+        self.depth_pipeline = Self::create_depth_pipeline(
+            &ctxt,
+            &self.view_bind_group_layout,
+            &self.model_bind_group_layout,
+            bias,
+        );
+        if self.deform_depth_pipeline.is_some() {
+            self.deform_depth_pipeline = Some(Self::create_depth_pipeline_deform(
+                &ctxt,
+                &self.view_bind_group_layout,
+                &self.model_bind_group_layout,
+                &crate::builtin::deform::deform_bind_group_layout(),
+                bias,
+            ));
+        }
+    }
+
+    /// The shadow view budget: atlas layers shared by every shadow-casting light.
+    /// Default [`DEFAULT_SHADOW_VIEWS`] (16).
+    pub fn max_views(&self) -> u32 {
+        self.max_views
+    }
+
+    /// Sets the shadow view budget (clamped to `1..=MAX_SHADOW_VIEWS`), reallocating
+    /// the atlas. A spot light takes one view, a directional light one per cascade,
+    /// a point light six; lights past the budget light without shadows. The atlas
+    /// holds `resolution² × views` depth texels plus as many RGBA8 transmittance texels.
+    pub fn set_max_views(&mut self, views: u32) {
+        let views = views.clamp(1, MAX_SHADOW_VIEWS as u32);
+        if views == self.max_views {
+            return;
+        }
+        self.max_views = views;
+        self.reallocate_atlas();
+    }
+
     /// Sets the shadow atlas per-layer resolution, reallocating the atlas.
     pub fn set_resolution(&mut self, resolution: u32) {
         let resolution = resolution.max(1);
         if resolution == self.resolution {
             return;
         }
-        let ctxt = Context::get();
         self.resolution = resolution;
-        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution);
+        self.reallocate_atlas();
+    }
+
+    fn reallocate_atlas(&mut self) {
+        let ctxt = Context::get();
+        let (resolution, layers) = (self.resolution, self.max_views);
+        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution, layers);
         self.atlas = atlas;
         self.layer_views = layer_views;
         self.array_view = array_view;
         let (t_atlas, t_layer_views, t_array_view) =
-            Self::create_transmittance_atlas(&ctxt, resolution);
+            Self::create_transmittance_atlas(&ctxt, resolution, layers);
         self.transmittance_atlas = t_atlas;
         self.transmittance_layer_views = t_layer_views;
         self.transmittance_array_view = t_array_view;
@@ -1490,7 +1593,7 @@ impl ShadowMapper {
                 continue;
             }
             let needed = self.shadow_view_count(light);
-            if next_layer as usize + needed > MAX_SHADOW_VIEWS {
+            if next_layer as usize + needed > self.max_views as usize {
                 // Out of atlas space: this light lights without shadows.
                 continue;
             }
@@ -1518,7 +1621,7 @@ impl ShadowMapper {
                 continue;
             }
             let needed = self.shadow_view_count(light);
-            if next_layer as usize + needed > MAX_SHADOW_VIEWS {
+            if next_layer as usize + needed > self.max_views as usize {
                 // Out of atlas space; a smaller later light might still fit.
                 continue;
             }
@@ -1988,4 +2091,113 @@ fn cube_face_view_projs(eye: Vec3, near: f32, far: f32) -> [Mat4; 6] {
         out[i] = proj * view;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::camera::OrbitCamera3d;
+    use crate::color::Color;
+    use crate::light::Light;
+    use crate::scene::SceneNode3d;
+    use crate::test_gpu::{mean_luma, on_gpu};
+    use glamx::Vec3;
+
+    fn lit_cube_on_ground(point_lights: usize) -> SceneNode3d {
+        let mut scene = SceneNode3d::empty();
+        for i in 0..point_lights {
+            scene
+                .add_light(Light::point(40.0).with_intensity(2.0))
+                .set_position(Vec3::new(3.0 + i as f32 * 0.5, 3.0, 1.0));
+        }
+        let mut ground = scene.add_cube(12.0, 0.2, 12.0);
+        ground.set_color(Color::new(0.8, 0.8, 0.8, 1.0));
+        ground.set_position(Vec3::new(0.0, -1.1, 0.0));
+        scene.add_cube(2.0, 2.0, 2.0);
+        scene
+    }
+
+    #[test]
+    fn shadow_settings_start_at_their_documented_defaults() {
+        on_gpu(32, 32, async |surface| {
+            let window = surface.window();
+            assert_eq!(window.shadow_resolution(), 2048);
+            assert_eq!(window.shadow_cascades(), 4);
+            assert_eq!(window.shadow_distance(), f32::INFINITY);
+            assert_eq!(window.shadow_first_cascade_distance(), 12.0);
+            assert_eq!(window.shadow_depth_bias(), 0.0012);
+            assert_eq!(window.shadow_raster_bias(), (1, 1.75));
+            assert_eq!(window.max_shadow_views(), 16);
+        });
+    }
+
+    #[test]
+    fn a_light_past_the_view_budget_casts_no_shadow() {
+        on_gpu(64, 64, async |surface| {
+            surface.set_shadow_resolution(128);
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 6.0, 8.0), Vec3::ZERO);
+            let mut scene = lit_cube_on_ground(2);
+
+            surface.render_3d(&mut scene, &mut camera).await;
+            let slots = surface.window().shadow_mapper().shadow_slots().to_vec();
+            assert!(slots.iter().all(|&s| s != u32::MAX), "{:?}", slots);
+
+            surface.window_mut().set_max_shadow_views(6);
+            assert_eq!(surface.window().max_shadow_views(), 6);
+            surface.render_3d(&mut scene, &mut camera).await;
+            let slots = surface.window().shadow_mapper().shadow_slots().to_vec();
+            assert_eq!(slots.iter().filter(|&&s| s != u32::MAX).count(), 1);
+
+            surface.window_mut().set_max_shadow_views(1000);
+            assert_eq!(surface.window().max_shadow_views(), 64);
+        });
+    }
+
+    #[test]
+    fn a_large_depth_bias_lifts_the_shadow() {
+        on_gpu(64, 64, async |surface| {
+            surface.set_shadow_resolution(256);
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 6.0, 8.0), Vec3::ZERO);
+            let mut scene = lit_cube_on_ground(1);
+
+            surface.render_3d(&mut scene, &mut camera).await;
+            let shadowed = mean_luma(surface);
+
+            surface.window_mut().set_shadow_depth_bias(1.0);
+            surface.render_3d(&mut scene, &mut camera).await;
+            let compare_biased = mean_luma(surface);
+            assert!(
+                compare_biased > shadowed + 0.01,
+                "{} {}",
+                shadowed,
+                compare_biased
+            );
+
+            surface.window_mut().set_shadow_depth_bias(0.0012);
+            surface.window_mut().set_shadow_raster_bias(1 << 30, 1.75);
+            assert_eq!(surface.window().shadow_raster_bias(), (1 << 30, 1.75));
+            surface.render_3d(&mut scene, &mut camera).await;
+            let raster_biased = mean_luma(surface);
+            assert!(
+                raster_biased > shadowed + 0.01,
+                "{} {}",
+                shadowed,
+                raster_biased
+            );
+        });
+    }
+
+    #[test]
+    fn cascade_settings_read_back_clamped() {
+        on_gpu(32, 32, async |surface| {
+            let window = surface.window_mut();
+            window.set_shadow_cascades(9);
+            window.set_shadow_distance(40.0);
+            window.set_shadow_first_cascade_distance(0.0);
+            assert_eq!(window.shadow_cascades(), 4);
+            assert_eq!(window.shadow_distance(), 40.0);
+            assert_eq!(window.shadow_first_cascade_distance(), 0.01);
+            window.set_shadow_cascades(0);
+            assert_eq!(window.shadow_cascades(), 1);
+        });
+    }
 }

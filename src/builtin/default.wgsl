@@ -304,10 +304,10 @@ var s_reflection: sampler;
 
 // === SHADOW MAPPING (group 3) — localized block for easy merging ===
 // Maximum number of atlas views (must match builtin/shadow.rs MAX_SHADOW_VIEWS).
-const MAX_SHADOW_VIEWS: u32 = 16u;
+const MAX_SHADOW_VIEWS: u32 = 64u;
 // Per-light shadow-metadata slots (must match shadow.rs MAX_SHADOW_LIGHTS =
 // MAX_LIGHTS + MAX_SHADOW_VIEWS). Primary tier in 0..MAX_LIGHTS, clustered above.
-const MAX_SHADOW_LIGHTS: u32 = 24u;
+const MAX_SHADOW_LIGHTS: u32 = 72u;
 
 // Per-light shadow metadata (mirrors GpuLightShadow in builtin/shadow.rs).
 struct LightShadow {

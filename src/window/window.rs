@@ -42,7 +42,7 @@ pub(super) static DEFAULT_HEIGHT: u32 = 600u32;
 /// shadow sharpness against the per-frame cost of clearing/rasterizing the atlas
 /// (a point light alone uses six faces); raise it with
 /// [`Window::set_shadow_resolution`] for crisper shadows, lower it to save memory
-/// and fill (the atlas is `resolution² × MAX_SHADOW_VIEWS`).
+/// and fill (the atlas is `resolution² × views`, see [`Window::set_max_shadow_views`]).
 pub(super) static DEFAULT_SHADOW_RESOLUTION: u32 = 2048u32;
 
 /// Structure representing a window and a 3D scene.
@@ -822,7 +822,7 @@ impl Window {
     /// Sets the per-layer resolution of the shadow atlas (square), reallocating it.
     ///
     /// Higher values yield crisper shadows at the cost of memory and fill rate.
-    /// The default is 1024.
+    /// The default is 2048.
     pub fn set_shadow_resolution(&mut self, resolution: u32) {
         self.shadow_mapper.set_resolution(resolution);
     }
@@ -844,6 +844,85 @@ impl Window {
     /// Returns the current rasterizer shadow-edge softness (PCF blur).
     pub fn shadow_softness(&self) -> f32 {
         self.shadow_mapper.softness()
+    }
+
+    /// Caps how far directional shadows reach, in world units along the view:
+    /// the cascades cover the camera's near plane to `min(far plane, distance)`.
+    /// The default, `f32::INFINITY`, uses the camera's far plane.
+    pub fn set_shadow_distance(&mut self, distance: f32) {
+        self.shadow_mapper.set_shadow_distance(distance);
+    }
+
+    /// Returns how far directional shadows reach. The default is `f32::INFINITY`.
+    pub fn shadow_distance(&self) -> f32 {
+        self.shadow_mapper.shadow_distance()
+    }
+
+    /// Sets how many cascades a directional light splits its shadow range into,
+    /// clamped to `1..=4`. Each cascade takes one atlas view. The default is 4.
+    pub fn set_shadow_cascades(&mut self, cascades: u32) {
+        self.shadow_mapper.set_num_cascades(cascades);
+    }
+
+    /// Returns the number of directional shadow cascades. The default is 4.
+    pub fn shadow_cascades(&self) -> u32 {
+        self.shadow_mapper.num_cascades()
+    }
+
+    /// Sets the far view distance of the first, sharpest directional cascade: it
+    /// covers the camera's near plane to `distance` (at least 0.01). The default is 12.
+    pub fn set_shadow_first_cascade_distance(&mut self, distance: f32) {
+        self.shadow_mapper.set_first_cascade_far_bound(distance);
+    }
+
+    /// Returns the far view distance of the first directional cascade. The default is 12.
+    pub fn shadow_first_cascade_distance(&self) -> f32 {
+        self.shadow_mapper.first_cascade_far_bound()
+    }
+
+    /// Sets the depth bias the lighting shader applies when comparing against the
+    /// shadow map (at least 0). Raise it to cure acne, lower it to keep contact
+    /// shadows attached. The default is 0.0012.
+    pub fn set_shadow_depth_bias(&mut self, bias: f32) {
+        self.shadow_mapper.set_depth_bias(bias);
+    }
+
+    /// Returns the shadow comparison depth bias. The default is 0.0012.
+    pub fn shadow_depth_bias(&self) -> f32 {
+        self.shadow_mapper.depth_bias()
+    }
+
+    /// Sets the rasterizer depth bias of the shadow depth pass: `constant` in
+    /// depth-buffer units plus `slope_scale` times the polygon's depth slope. A
+    /// change rebuilds the shadow depth pipelines. The default is `(1, 1.75)`.
+    pub fn set_shadow_raster_bias(&mut self, constant: i32, slope_scale: f32) {
+        self.shadow_mapper.set_raster_bias(constant, slope_scale);
+    }
+
+    /// Returns the shadow rasterizer depth bias `(constant, slope_scale)`. The
+    /// default is `(1, 1.75)`.
+    pub fn shadow_raster_bias(&self) -> (i32, f32) {
+        self.shadow_mapper.raster_bias()
+    }
+
+    /// Sets the shadow view budget: atlas layers shared by every shadow-casting
+    /// light, clamped to `1..=MAX_SHADOW_VIEWS` (64), reallocating the atlas. A
+    /// spot light takes one view, a directional light one per cascade, a point
+    /// light six; lights past the budget light without shadows. Memory is
+    /// `resolution² × views × 8` bytes (depth plus colored transmittance). The
+    /// default is 16.
+    pub fn set_max_shadow_views(&mut self, views: u32) {
+        self.shadow_mapper.set_max_views(views);
+    }
+
+    /// Returns the shadow view budget. The default is 16.
+    pub fn max_shadow_views(&self) -> u32 {
+        self.shadow_mapper.max_views()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shadow_mapper(&self) -> &ShadowMapper {
+        &self.shadow_mapper
     }
 
     /// The current HDR finishing settings (exposure, tonemap operator, bloom).
