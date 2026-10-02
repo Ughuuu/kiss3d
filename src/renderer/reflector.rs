@@ -148,6 +148,10 @@ pub struct Reflector {
     /// plane normal (e.g. a sphere reflects only on the cap facing the plane normal,
     /// fading toward its silhouette; larger values fade faster).
     normal_falloff: f32,
+    /// Target size as a fraction of the viewport.
+    resolution_scale: f32,
+    /// Render layers the mirror draws; `None` follows the camera's.
+    render_layers: Option<u32>,
     /// World -> reflection-texture clip transform, set by the window each frame.
     view_proj: Cell<Mat4>,
     /// Bumped whenever the target is reallocated (resize). The material keys its
@@ -178,6 +182,8 @@ impl Reflector {
             local_normal: Vec3::Z,
             intensity: 1.0,
             normal_falloff: 0.0,
+            resolution_scale: 1.0,
+            render_layers: None,
             view_proj: Cell::new(Mat4::IDENTITY),
             generation: 1,
         }
@@ -313,6 +319,37 @@ impl Reflector {
     /// [`Self::with_normal_falloff`].
     pub fn set_normal_falloff(&mut self, falloff: f32) {
         self.normal_falloff = falloff.max(0.0);
+    }
+
+    /// The reflection target's size as a fraction of the viewport. Default 1.0.
+    pub fn resolution_scale(&self) -> f32 {
+        self.resolution_scale
+    }
+
+    /// Sets the reflection target's size as a fraction of the viewport, clamped to
+    /// `0.01..=4.0`: below 1 trades sharpness for fill rate and memory.
+    pub fn set_resolution_scale(&mut self, scale: f32) {
+        self.resolution_scale = scale.clamp(0.01, 4.0);
+    }
+
+    /// The target size for a `width × height` viewport: the viewport scaled by
+    /// [`Self::resolution_scale`], at least one pixel each way.
+    pub fn target_size(&self, width: u32, height: u32) -> (u32, u32) {
+        let scaled = |n: u32| ((n as f32 * self.resolution_scale).round() as u32).max(1);
+        (scaled(width), scaled(height))
+    }
+
+    /// The render-layer mask the mirror draws, or `None` (the default) to draw what
+    /// the camera draws.
+    pub fn render_layers(&self) -> Option<u32> {
+        self.render_layers
+    }
+
+    /// Sets the render-layer mask the mirror draws: an object shows in the
+    /// reflection when its layers share a bit with `layers`. `None` follows the
+    /// camera's mask.
+    pub fn set_render_layers(&mut self, layers: Option<u32>) {
+        self.render_layers = layers;
     }
 
     /// The world -> reflection-clip transform the material samples with.
@@ -563,5 +600,51 @@ impl ReflectorOit {
         pass.set_bind_group(0, &bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.draw(0..4, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::camera::OrbitCamera3d;
+    use crate::color::Color;
+    use crate::scene::SceneNode3d;
+    use crate::test_gpu::{mean_luma, on_gpu};
+    use glamx::{Quat, Vec3};
+
+    #[test]
+    fn a_mirror_draws_its_own_layers_at_its_own_size() {
+        on_gpu(64, 64, async |surface| {
+            let mut scene = SceneNode3d::empty();
+            let mut floor = scene.add_reflector(16.0, 16.0);
+            floor
+                .set_rotation(Quat::from_axis_angle(Vec3::X, -std::f32::consts::FRAC_PI_2))
+                .set_color(Color::new(0.0, 0.0, 0.0, 1.0))
+                .set_metallic(1.0)
+                .set_roughness(0.0);
+            let mut ball = scene.add_sphere(1.0);
+            ball.set_emissive(Color::new(4.0, 4.0, 4.0, 1.0));
+            ball.set_position(Vec3::new(0.0, 1.5, 0.0));
+            // Camera below the ball's horizon: the ball itself is out of frame, its
+            // reflection in.
+            let mut camera =
+                OrbitCamera3d::new(Vec3::new(0.0, 3.0, 6.0), Vec3::new(0.0, -2.0, 0.0));
+
+            surface.render_3d(&mut scene, &mut camera).await;
+            let reflected = mean_luma(surface);
+
+            floor.set_reflector_render_layers(Some(1 << 1));
+            surface.render_3d(&mut scene, &mut camera).await;
+            let hidden = mean_luma(surface);
+            assert!(reflected > hidden + 0.01, "{} {}", reflected, hidden);
+
+            floor.set_reflector_render_layers(None);
+            floor.set_reflector_resolution_scale(0.5);
+            surface.render_3d(&mut scene, &mut camera).await;
+            assert!(mean_luma(surface) > hidden + 0.01);
+            let object = floor.data();
+            let reflector = object.get_object().data().reflector().unwrap();
+            assert_eq!(reflector.target_size(64, 64), (32, 32));
+            assert_eq!(reflector.resolution_scale(), 0.5);
+        });
     }
 }

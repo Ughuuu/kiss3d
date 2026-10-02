@@ -39,7 +39,7 @@ var<uniform> model: ModelUniforms;
     num_vertices: u32,
     has_skin: u32,
     has_morph_normals: u32,
-    weights: array<vec4<f32>, 16>,
+    weights: array<vec4<f32>, 64>,
 }
 @if(skinned) @group(2) @binding(0) var<storage, read> joint_palette: array<mat4x4<f32>>;
 @if(skinned) @group(2) @binding(1) var<storage, read> skin_joints: array<vec4<u32>>;

@@ -530,6 +530,8 @@ pub struct ObjectMaterial {
     cluster_index_buf: wgpu::Buffer,
     /// Whether the real clustered buffers have been bound yet (false = placeholders).
     clustered_bound: bool,
+    /// Clusters along screen X, screen Y and view depth, from the window.
+    cluster_grid: Cell<[u32; 3]>,
     // === Per-view textures in group 0: IBL env (1/2) + SSAO (3). ===
     /// 1x1 black fallback env bound when no IBL environment is set.
     _ibl_fallback_texture: wgpu::Texture,
@@ -2147,6 +2149,7 @@ impl ObjectMaterial {
             cluster_grid_buf,
             cluster_index_buf,
             clustered_bound: false,
+            cluster_grid: Cell::new(crate::builtin::clustered::DEFAULT_GRID),
             cur_ibl_view: ibl_fallback_view.clone(),
             cur_ibl_sampler: ibl_fallback_sampler.clone(),
             cur_ao_view: ao_fallback_view.clone(),
@@ -2703,23 +2706,23 @@ impl Material3d for ObjectMaterial {
                     self.ibl_rotation.get(),
                 ],
                 cluster_grid_dims: {
-                    use crate::builtin::clustered::{GRID_X, GRID_Y, GRID_Z};
+                    let [gx, gy, gz] = self.cluster_grid.get();
                     let n = if self.clustered && !self.capture_mode.get() {
                         num_clustered
                     } else {
                         0
                     };
-                    [GRID_X as f32, GRID_Y as f32, GRID_Z as f32, n as f32]
+                    [gx as f32, gy as f32, gz as f32, n as f32]
                 },
                 cluster_depth: {
                     let (near, far) = camera.clip_planes();
                     [near, far, (far / near).ln(), 0.0]
                 },
                 cluster_tile: {
-                    use crate::builtin::clustered::{GRID_X, GRID_Y};
+                    let [gx, gy, _] = self.cluster_grid.get();
                     [
-                        viewport_width as f32 / GRID_X as f32,
-                        viewport_height as f32 / GRID_Y as f32,
+                        viewport_width as f32 / gx as f32,
+                        viewport_height as f32 / gy as f32,
                         0.0,
                         0.0,
                     ]
@@ -3084,6 +3087,10 @@ impl Material3d for ObjectMaterial {
         }
     }
 
+    fn set_cluster_grid(&mut self, grid: [u32; 3]) {
+        self.cluster_grid.set(grid);
+    }
+
     fn set_clustered_buffers(
         &mut self,
         lights: &wgpu::Buffer,
@@ -3094,10 +3101,9 @@ impl Material3d for ObjectMaterial {
         if !self.clustered {
             return;
         }
-        // Rebind on the first frame (placeholders -> real buffers) and whenever the
-        // light buffer was reallocated (its handle changed). The grid/index buffers
-        // are fixed-size, so only `force_rebind` (from a light-buffer grow) matters
-        // after the initial bind.
+        // Rebind on the first frame (placeholders -> real buffers) and whenever a
+        // buffer was reallocated (a light-buffer grow or a new grid), which
+        // `force_rebind` reports.
         if force_rebind || !self.clustered_bound {
             self.clustered_lights_buf = lights.clone();
             self.cluster_grid_buf = grid.clone();

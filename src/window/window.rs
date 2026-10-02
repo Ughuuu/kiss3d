@@ -87,6 +87,10 @@ pub struct Window {
     /// supports compute + fragment storage buffers; otherwise stays `None` and the
     /// object material falls back to the fixed 8-light path).
     pub(super) clustered: Option<crate::builtin::clustered::Clustered>,
+    /// Clusters along screen X, screen Y and view depth for clustered lighting.
+    pub(super) cluster_grid: [u32; 3],
+    /// Lights one cluster records.
+    pub(super) max_lights_per_cluster: u32,
     /// Reflection probes (localized parallax-corrected environment maps). Created
     /// on first probe registration; `None` means no probes.
     pub(super) reflection_probes: Option<crate::renderer::ReflectionProbes>,
@@ -113,6 +117,8 @@ pub struct Window {
     /// Single-sample OIT targets for the planar-reflector capture pass, so
     /// transparent surfaces appear in mirrors. Created on first use.
     pub(super) reflector_oit: Option<crate::renderer::ReflectorOit>,
+    /// The refraction snapshot of a reflector whose target is not viewport-sized.
+    pub(super) reflector_transmission: Option<crate::renderer::Transmission>,
     pub(super) post_process_render_target: RenderTarget,
     /// Second LDR target, paired with `post_process_render_target` as ping-pong
     /// buffers when chaining more than one post-processing effect: each effect reads
@@ -920,6 +926,32 @@ impl Window {
         self.shadow_mapper.max_views()
     }
 
+    /// Sets the clustered-lighting grid: clusters along screen X, screen Y and
+    /// view depth, each clamped to `1..=128`. Finer grids cull the many-light tier
+    /// tighter at the cost of memory and culling work. The default is `[16, 9, 24]`.
+    /// Clustered lighting runs where compute shaders do (not WebGL2).
+    pub fn set_cluster_grid(&mut self, grid: [u32; 3]) {
+        self.cluster_grid = grid.map(|n| n.clamp(1, crate::builtin::clustered::MAX_GRID_AXIS));
+    }
+
+    /// Returns the clustered-lighting grid. The default is `[16, 9, 24]`.
+    pub fn cluster_grid(&self) -> [u32; 3] {
+        self.cluster_grid
+    }
+
+    /// Sets how many lights one cluster records (at least 1); lights past it in a
+    /// dense cluster are dropped. The light-index list holds `clusters × this`
+    /// entries, so the renderer lowers it to fit the device's largest storage
+    /// binding. The default is 256.
+    pub fn set_max_lights_per_cluster(&mut self, lights: u32) {
+        self.max_lights_per_cluster = lights.max(1);
+    }
+
+    /// Returns how many lights one cluster records. The default is 256.
+    pub fn max_lights_per_cluster(&self) -> u32 {
+        self.max_lights_per_cluster
+    }
+
     #[cfg(test)]
     pub(crate) fn shadow_mapper(&self) -> &ShadowMapper {
         &self.shadow_mapper
@@ -1201,6 +1233,8 @@ impl Window {
             ssao: None,
             ssao_enabled: false,
             clustered: None,
+            cluster_grid: crate::builtin::clustered::DEFAULT_GRID,
+            max_lights_per_cluster: crate::builtin::clustered::DEFAULT_MAX_LIGHTS_PER_CLUSTER,
             reflection_probes: None,
             probe_capture: None,
             pending_probe_captures: Vec::new(),
@@ -1212,6 +1246,7 @@ impl Window {
             transmission: None,
             transmission_enabled: true,
             reflector_oit: None,
+            reflector_transmission: None,
             post_process_render_target: framebuffer_manager.new_render_target(width, height, true),
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
@@ -1291,6 +1326,8 @@ impl Window {
             ssao: None,
             ssao_enabled: false,
             clustered: None,
+            cluster_grid: crate::builtin::clustered::DEFAULT_GRID,
+            max_lights_per_cluster: crate::builtin::clustered::DEFAULT_MAX_LIGHTS_PER_CLUSTER,
             reflection_probes: None,
             probe_capture: None,
             pending_probe_captures: Vec::new(),
@@ -1302,6 +1339,7 @@ impl Window {
             transmission: None,
             transmission_enabled: true,
             reflector_oit: None,
+            reflector_transmission: None,
             post_process_render_target: framebuffer_manager.new_render_target(width, height, true),
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),

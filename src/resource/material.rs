@@ -239,6 +239,11 @@ pub trait Material3d {
     /// capture to clip geometry behind the mirror. `None` disables it. Default no-op.
     fn set_clip_plane(&mut self, _plane: Option<[f32; 4]>) {}
 
+    /// Supplies the clustered forward+ grid this frame's light culling uses:
+    /// clusters along screen X, screen Y and view depth. Called before `prepare`
+    /// each frame. Default no-op.
+    fn set_cluster_grid(&mut self, _grid: [u32; 3]) {}
+
     /// Supplies the clustered forward+ storage buffers for this frame (the light
     /// list, per-cluster light grid, and global light-index list). Called by the
     /// window after the light-culling compute pass when clustered lighting is

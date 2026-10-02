@@ -463,6 +463,13 @@ impl Window {
         // Signal start of new frame to all materials (for dynamic buffer clearing)
         MaterialManager3d::get_global_manager(|mm| mm.begin_frame());
 
+        {
+            let grid = self.cluster_grid;
+            MaterialManager3d::get_global_manager(|mm| {
+                mm.for_each(|mat| mat.set_cluster_grid(grid))
+            });
+        }
+
         // Supply the skybox environment to the default material for image-based
         // lighting (or clear it when no skybox is set).
         {
@@ -844,9 +851,10 @@ impl Window {
             if pass == 0 && Context::get().supports_clustered_lighting() {
                 // Cheap copy so the clustered borrow below doesn't alias the mapper.
                 let shadow_slots = self.shadow_mapper.shadow_slots().to_vec();
-                let clustered = self
-                    .clustered
-                    .get_or_insert_with(|| crate::builtin::clustered::Clustered::new(w, h));
+                let grid = (self.cluster_grid, self.max_lights_per_cluster);
+                let clustered = self.clustered.get_or_insert_with(|| {
+                    crate::builtin::clustered::Clustered::new(w, h, grid.0, grid.1)
+                });
                 let realloc = clustered.run(
                     &mut encoder,
                     &lights,
@@ -854,6 +862,7 @@ impl Window {
                     &*camera,
                     w,
                     h,
+                    grid,
                     &mut self.gpu_timer,
                 );
                 let lights_buf = clustered.lights_buffer().clone();
@@ -1945,11 +1954,14 @@ impl Window {
         // Build a mirror camera per reflector and (in the same walk) resize its
         // target + store the reflected view-proj on it. Collect the views + clip
         // plane so the renders below don't need to re-borrow the scene's reflectors.
+        let camera_layers = camera.render_layers();
         let mut jobs: Vec<(
             crate::renderer::MirrorCamera,
             wgpu::TextureView,
             wgpu::TextureView,
             [f32; 4],
+            (u32, u32),
+            u32,
         )> = Vec::new();
         scene.apply_to_objects_with_world_mut_recursive(&mut |pose, _scale, obj| {
             let local_n = match obj.reflector() {
@@ -1969,9 +1981,18 @@ impl Window {
             let clip = [normal.x, normal.y, normal.z, -normal.dot(point)];
 
             let r = obj.reflector_mut().unwrap();
-            r.resize(w, h);
+            let size = r.target_size(w, h);
+            r.resize(size.0, size.1);
             r.set_view_proj(view_proj);
-            jobs.push((mcam, r.color_view().clone(), r.depth_view().clone(), clip));
+            let layers = r.render_layers().unwrap_or(camera_layers);
+            jobs.push((
+                mcam,
+                r.color_view().clone(),
+                r.depth_view().clone(),
+                clip,
+                size,
+                layers,
+            ));
         });
 
         // Mirror the main pass's phase gating so nothing visible is missing from
@@ -1990,7 +2011,7 @@ impl Window {
             mm.for_each(|mat| mat.set_capture_mode(true));
         });
 
-        for (mut mcam, color_view, depth_view, clip) in jobs {
+        for (mut mcam, color_view, depth_view, clip, (tw, th), layers) in jobs {
             // Clip geometry behind this mirror's plane.
             MaterialManager3d::get_global_manager(|mm| {
                 mm.for_each(|mat| mat.set_clip_plane(Some(clip)));
@@ -2001,7 +2022,7 @@ impl Window {
             let mut mlights = LightCollection::with_ambient(self.ambient_intensity);
             mlights.ambient_color = self.ambient_color;
             mlights.fog = self.fog;
-            scene.data_mut().prepare(0, &mut mcam, &mut mlights, w, h);
+            scene.data_mut().prepare(0, &mut mcam, &mut mlights, tw, th);
             scene.update_deformations();
             MaterialManager3d::get_global_manager(|mm| mm.flush());
 
@@ -2019,9 +2040,9 @@ impl Window {
             let ctx = RenderContext {
                 surface_format: crate::post_processing::HDR_FORMAT,
                 sample_count: 1,
-                viewport_width: w,
-                viewport_height: h,
-                render_layers: camera.render_layers(),
+                viewport_width: tw,
+                viewport_height: th,
+                render_layers: layers,
                 // The reflected projection flips winding, so disable back-face cull.
                 force_no_cull: true,
                 shadow: Some(self.shadow_mapper.resources()),
@@ -2069,14 +2090,14 @@ impl Window {
             if has_transparent {
                 let oit = self
                     .reflector_oit
-                    .get_or_insert_with(|| crate::renderer::ReflectorOit::new(w, h));
-                oit.resize(w, h);
+                    .get_or_insert_with(|| crate::renderer::ReflectorOit::new(tw, th));
+                oit.resize(tw, th);
                 let oit_ctx = RenderContext {
                     surface_format: crate::post_processing::HDR_FORMAT,
                     sample_count: 1,
-                    viewport_width: w,
-                    viewport_height: h,
-                    render_layers: camera.render_layers(),
+                    viewport_width: tw,
+                    viewport_height: th,
+                    render_layers: layers,
                     force_no_cull: true,
                     shadow: Some(self.shadow_mapper.resources()),
                     phase: RenderPhase::Transparent,
@@ -2134,12 +2155,15 @@ impl Window {
             // `self.transmission` with the main pass is safe: passes execute in
             // submission order, and the main pass rebuilds the snapshot later.
             if !glass_nodes.is_empty() {
-                {
-                    let t = self
-                        .transmission
-                        .get_or_insert_with(|| crate::renderer::Transmission::new(w, h));
-                    t.resize(w, h);
-                }
+                // A target of another size keeps its own snapshot, so neither it nor
+                // the main pass reallocates the shared one every frame.
+                let slot = if (tw, th) == (w, h) {
+                    &mut self.transmission
+                } else {
+                    &mut self.reflector_transmission
+                };
+                let t = slot.get_or_insert_with(|| crate::renderer::Transmission::new(tw, th));
+                t.resize(tw, th);
                 // Farthest from the (reflected) eye first, so nearer glass draws
                 // over glass behind it.
                 let eye = mcam.eye();
@@ -2149,7 +2173,6 @@ impl Window {
                     db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                let t = self.transmission.as_ref().unwrap();
                 t.build(&mut menc, &color_view, &mut self.gpu_timer);
                 {
                     MaterialManager3d::get_global_manager(|mm| {
@@ -2159,9 +2182,9 @@ impl Window {
                 let glass_ctx = RenderContext {
                     surface_format: crate::post_processing::HDR_FORMAT,
                     sample_count: 1,
-                    viewport_width: w,
-                    viewport_height: h,
-                    render_layers: camera.render_layers(),
+                    viewport_width: tw,
+                    viewport_height: th,
+                    render_layers: layers,
                     force_no_cull: true,
                     shadow: Some(self.shadow_mapper.resources()),
                     phase: RenderPhase::Transmission,

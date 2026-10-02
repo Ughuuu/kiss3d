@@ -27,7 +27,10 @@ use std::cell::RefCell;
 
 /// Maximum number of morph targets blended per mesh. Targets beyond
 /// this are dropped at load time (with a warning).
-pub const MAX_MORPH_TARGETS: usize = 64;
+///
+/// The weights ride in the per-object deform uniform, sized by this in WGSL, so it
+/// stays a constant: 256 weights take 1 KiB of the 16 KiB a uniform binding may hold.
+pub const MAX_MORPH_TARGETS: usize = 256;
 
 /// Per-object control uniform for the deform vertex shader. Bound as the last entry
 /// of the deform bind group (group 4 in the color/prepass pipelines, group 2 in the
@@ -300,4 +303,18 @@ pub fn build_deform_bind_group(
             ],
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeformControl, MAX_MORPH_TARGETS};
+
+    #[test]
+    fn a_mesh_blends_up_to_256_morph_targets() {
+        let mut control = DeformControl::default();
+        control.set_weights(&[0.5; 300]);
+        assert_eq!(MAX_MORPH_TARGETS, 256);
+        assert_eq!(control.num_targets, 256);
+        assert_eq!(control.weights[63][3], 0.5);
+    }
 }

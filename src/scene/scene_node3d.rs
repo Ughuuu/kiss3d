@@ -1199,6 +1199,30 @@ impl SceneNode3d {
         self.clone()
     }
 
+    /// Sets this node's reflector target size as a fraction of the viewport
+    /// (default 1.0). No-op on non-reflector nodes. See
+    /// [`Reflector::set_resolution_scale`](crate::renderer::Reflector::set_resolution_scale).
+    pub fn set_reflector_resolution_scale(&mut self, scale: f32) -> Self {
+        self.apply_to_object_mut(&mut |o| {
+            if let Some(r) = o.reflector_mut() {
+                r.set_resolution_scale(scale);
+            }
+        });
+        self.clone()
+    }
+
+    /// Sets the render layers this node's reflector draws (`None`, the default,
+    /// follows the camera). No-op on non-reflector nodes. See
+    /// [`Reflector::set_render_layers`](crate::renderer::Reflector::set_render_layers).
+    pub fn set_reflector_render_layers(&mut self, layers: Option<u32>) -> Self {
+        self.apply_to_object_mut(&mut |o| {
+            if let Some(r) = o.reflector_mut() {
+                r.set_render_layers(layers);
+            }
+        });
+        self.clone()
+    }
+
     /// Adds a double-sided quad with the specified vertices.
     pub fn add_quad_with_vertices(
         &mut self,

@@ -8,7 +8,7 @@ pub use crate::post_processing::gi2d::{
 };
 pub use crate::post_processing::grayscales::Grayscales;
 pub use crate::post_processing::hdr::{
-    ColorGrading, HdrPipeline, HdrSettings, Tonemap, HDR_FORMAT, OIT_ACCUM_FORMAT,
+    ColorGrading, HdrPipeline, HdrSettings, Tonemap, HDR_FORMAT, MAX_BLOOM_MIPS, OIT_ACCUM_FORMAT,
     OIT_REVEAL_FORMAT,
 };
 pub use crate::post_processing::loupe::{Loupe, LoupeCorner};
