@@ -24,7 +24,8 @@
 //! stays global.
 //!
 //! Apply it with [`Window::render_2d_with`](crate::window::Window::render_2d_with) or
-//! in a chain; each frame set the camera and the emitters/occluders.
+//! in a chain; each frame set the emitters/occluders. The window hands it the
+//! camera.
 
 use crate::camera::Camera2d;
 use crate::color::Color;
@@ -703,11 +704,12 @@ impl Gi2d {
     }
 
     /// Captures `camera`'s view-projection so the GI pass can reconstruct world space
-    /// and reproject the temporal history. Call once per frame before rendering.
+    /// and reproject the temporal history. A window does this every frame with the
+    /// camera it renders through (see
+    /// [`PostProcessingEffect::set_camera_2d`]), so this is only needed when
+    /// drawing the effect outside a window's chain.
     pub fn set_camera(&mut self, camera: &impl Camera2d) {
-        let (view, proj) = camera.view_transform_pair();
-        self.vp = proj * view;
-        self.inv_vp = self.vp.inverse();
+        self.set_camera_2d(camera);
     }
 
     /// Replaces the emitter discs (truncated to [`MAX_EMITTERS`]).
@@ -1173,6 +1175,12 @@ impl Gi2d {
 impl PostProcessingEffect for Gi2d {
     fn update(&mut self, _dt: f32, _w: f32, _h: f32, _znear: f32, _zfar: f32) {}
 
+    fn set_camera_2d(&mut self, camera: &dyn Camera2d) {
+        let (view, proj) = camera.view_transform_pair();
+        self.vp = proj * view;
+        self.inv_vp = self.vp.inverse();
+    }
+
     fn draw(&mut self, target: &RenderTarget, context: &mut PostProcessingContext) {
         let ctxt = Context::get();
 
@@ -1360,13 +1368,46 @@ mod tests {
     }
 
     #[test]
+    fn a_camera_set_before_its_first_frame_lights_that_frame() {
+        on_gpu(64, 64, async |surface| {
+            let mut camera = FixedView2d::new(CoordinateSystem2d::default(), false);
+            let mut scene = SceneNode2d::empty();
+            scene.add_rectangle(64.0, 64.0);
+            let mut gi = Gi2d::new();
+            gi.set_temporal_blend(0.0);
+            gi.set_ambient(Color::new(0.0, 0.0, 0.0, 1.0));
+            gi.set_emitters(&[GiEmitter2d::new(
+                Vec2::new(-16.0, 0.0),
+                4.0,
+                Color::new(1.0, 1.0, 1.0, 1.0),
+                4.0,
+            )]);
+            let mut lit = Vec::new();
+            for _ in 0..2 {
+                gi.set_camera(&camera);
+                surface
+                    .render(
+                        None,
+                        Some(&mut scene),
+                        None,
+                        Some(&mut camera),
+                        None,
+                        Some(&mut gi),
+                    )
+                    .await;
+                lit.push(block_luma(surface, 8, 24, 16, 16));
+            }
+            assert!(lit[1] > 0.1, "{:?}", lit);
+            assert!((lit[0] - lit[1]).abs() < 0.02, "{:?}", lit);
+        });
+    }
+
+    #[test]
     fn a_segment_wall_shadows_what_lies_behind_it() {
         on_gpu(64, 64, async |surface| {
             let mut camera = FixedView2d::new(CoordinateSystem2d::default(), false);
             let mut scene = SceneNode2d::empty();
             scene.add_rectangle(64.0, 64.0);
-            // A first frame gives the camera its viewport, which `set_camera` reads.
-            surface.render_2d(&mut scene, &mut camera).await;
             let wall = [GiSegmentOccluder2d::new(
                 Vec2::new(0.0, -60.0),
                 Vec2::new(0.0, 60.0),

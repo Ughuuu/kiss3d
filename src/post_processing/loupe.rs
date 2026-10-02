@@ -28,6 +28,7 @@
 //! # }
 //! ```
 
+use crate::camera::Camera2d;
 use crate::context::Context;
 use crate::post_processing::post_processing_effect::{
     FormatPipelines, PostProcessingContext, PostProcessingEffect,
@@ -444,5 +445,11 @@ impl PostProcessingEffect for Loupe {
 
     fn reads_depth(&self) -> bool {
         self.inner.as_ref().is_some_and(|inner| inner.reads_depth())
+    }
+
+    fn set_camera_2d(&mut self, camera: &dyn Camera2d) {
+        if let Some(inner) = &mut self.inner {
+            inner.set_camera_2d(camera);
+        }
     }
 }

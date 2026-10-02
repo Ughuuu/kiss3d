@@ -1443,6 +1443,7 @@ impl Window {
                         RenderTarget::Offscreen(o) => &o.color_view,
                         RenderTarget::Screen => &frame_view,
                     };
+                    pp.set_camera_2d(&*camera_2d);
                     pp.update(0.016, w as f32, h as f32, znear, zfar);
                     let mut pp_context = PostProcessingContext {
                         encoder: &mut encoder,
@@ -1516,6 +1517,7 @@ impl Window {
                     }
                 };
 
+                pp.set_camera_2d(&*camera_2d);
                 // TODO: use the real time value instead of 0.016!
                 pp.update(0.016, w as f32, h as f32, znear, zfar);
                 let mut pp_context = PostProcessingContext {

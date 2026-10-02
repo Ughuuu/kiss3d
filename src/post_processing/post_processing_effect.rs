@@ -1,5 +1,6 @@
 //! Trait implemented by every post-processing effect.
 
+use crate::camera::Camera2d;
 use crate::resource::RenderTarget;
 use std::collections::HashMap;
 
@@ -85,4 +86,10 @@ pub trait PostProcessingEffect {
     fn reads_depth(&self) -> bool {
         false
     }
+
+    /// Hands the effect the 2D camera the frame renders through, once that
+    /// camera has taken the frame's size. A window calls it every frame before
+    /// [`update`](Self::update), so an effect that maps 2D world space onto the
+    /// screen reads a correct view from the first frame. Default: ignored.
+    fn set_camera_2d(&mut self, _camera: &dyn Camera2d) {}
 }
