@@ -1,8 +1,8 @@
 //! Screen-space 2D global illumination ([`Gi2d`]).
 //!
 //! A post-processing effect that lights the scene by ray-marching incoming light
-//! against analytic emitter/occluder discs, giving soft shadows and colored light
-//! bleed. This is the brute-force form of the technique that *radiance cascades*
+//! against analytic emitter discs and occluder discs and segments, giving soft
+//! shadows and colored light bleed. This is the brute-force form of the technique that *radiance cascades*
 //! accelerate.
 //!
 //! To stay real-time it runs in two passes with three optimizations:
@@ -24,7 +24,8 @@
 //! stays global.
 //!
 //! Apply it with [`Window::render_2d_with`](crate::window::Window::render_2d_with) or
-//! in a chain; each frame set the camera and the emitters/occluders.
+//! in a chain; each frame set the emitters/occluders. The window hands it the
+//! camera.
 
 use crate::camera::Camera2d;
 use crate::color::Color;
@@ -41,6 +42,8 @@ use glamx::{Mat3, Vec2};
 pub const MAX_EMITTERS: usize = 32;
 /// Maximum number of occluder discs (matches `MAX_OCCLUDERS` in `gi2d_field.wgsl`).
 pub const MAX_OCCLUDERS: usize = 64;
+/// Maximum number of occluder segments (matches `MAX_SEGMENTS` in `gi2d_field.wgsl`).
+pub const MAX_SEGMENT_OCCLUDERS: usize = 128;
 
 const SEED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 const SDF_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
@@ -86,6 +89,41 @@ impl GiOccluder2d {
     }
 }
 
+/// A line segment that blocks light (casts shadows) in the 2D GI solution: every
+/// point within `radius` of the segment from `a` to `b` occludes.
+#[derive(Copy, Clone, Debug)]
+pub struct GiSegmentOccluder2d {
+    /// World-space start point.
+    pub a: Vec2,
+    /// World-space end point.
+    pub b: Vec2,
+    /// Half thickness; raised to half a field pixel, the thinnest the march
+    /// cannot step over.
+    pub radius: f32,
+}
+
+impl GiSegmentOccluder2d {
+    /// A new occluder segment from `a` to `b`, `radius` thick on each side.
+    pub fn new(a: Vec2, b: Vec2, radius: f32) -> Self {
+        GiSegmentOccluder2d { a, b, radius }
+    }
+
+    /// The closed outline of a polygon: one segment per edge, the last joining
+    /// the final point back to the first. Fewer than two points give no segment.
+    pub fn polygon(points: &[Vec2], radius: f32) -> Vec<Self> {
+        if points.len() < 2 {
+            return Vec::new();
+        }
+        let next = points.iter().cycle().skip(1);
+        points
+            .iter()
+            .zip(next)
+            .take(if points.len() == 2 { 1 } else { points.len() })
+            .map(|(&a, &b)| Self::new(a, b, radius))
+            .collect()
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct GpuEmitter {
@@ -101,6 +139,13 @@ struct GpuOccluder {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct GpuSegment {
+    ab: [f32; 4],
+    radius: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct FieldUniforms {
     inv_vp: [[f32; 4]; 3],
     prev_vp: [[f32; 4]; 3],
@@ -110,6 +155,7 @@ struct FieldUniforms {
     counts: [f32; 4],
     emitters: [GpuEmitter; MAX_EMITTERS],
     occluders: [GpuOccluder; MAX_OCCLUDERS],
+    segments: [GpuSegment; MAX_SEGMENT_OCCLUDERS],
 }
 
 #[repr(C)]
@@ -251,6 +297,7 @@ pub struct Gi2d {
     sdf_occluders: bool,
     emitters: Vec<GiEmitter2d>,
     occluders: Vec<GiOccluder2d>,
+    segments: Vec<GiSegmentOccluder2d>,
 }
 
 impl Default for Gi2d {
@@ -650,15 +697,17 @@ impl Gi2d {
             sdf_occluders: false,
             emitters: Vec::new(),
             occluders: Vec::new(),
+            segments: Vec::new(),
         }
     }
 
     /// Captures `camera`'s view-projection so the GI pass can reconstruct world space
-    /// and reproject the temporal history. Call once per frame before rendering.
+    /// and reproject the temporal history. A window does this every frame with the
+    /// camera it renders through (see
+    /// [`PostProcessingEffect::set_camera_2d`]), so this is only needed when
+    /// drawing the effect outside a window's chain.
     pub fn set_camera(&mut self, camera: &impl Camera2d) {
-        let (view, proj) = camera.view_transform_pair();
-        self.vp = proj * view;
-        self.inv_vp = self.vp.inverse();
+        self.set_camera_2d(camera);
     }
 
     /// Replaces the emitter discs (truncated to [`MAX_EMITTERS`]).
@@ -673,6 +722,28 @@ impl Gi2d {
         self.occluders.clear();
         self.occluders
             .extend(occluders.iter().take(MAX_OCCLUDERS).copied());
+    }
+
+    /// Replaces the occluder segments (truncated to [`MAX_SEGMENT_OCCLUDERS`]). They
+    /// block light beside the discs, on both the analytic and the distance-field
+    /// path; [`GiSegmentOccluder2d::polygon`] turns a polygon into its edges.
+    pub fn set_segment_occluders(&mut self, segments: &[GiSegmentOccluder2d]) {
+        self.segments.clear();
+        self.segments
+            .extend(segments.iter().take(MAX_SEGMENT_OCCLUDERS).copied());
+    }
+
+    /// The cascade-0 probe spacing in field pixels (radiance cascades only).
+    /// Default 2.
+    pub fn cascade_probe_spacing(&self) -> u32 {
+        self.probe_spacing
+    }
+
+    /// Sets the cascade-0 probe spacing in field pixels (radiance cascades only),
+    /// rounded up to a power of two in `1..=16`. A finer grid resolves light and
+    /// shadow detail more tightly; the cascade textures grow as it shrinks.
+    pub fn set_cascade_probe_spacing(&mut self, spacing: u32) {
+        self.probe_spacing = spacing.clamp(1, 16).next_power_of_two();
     }
 
     /// Sets the scene-wide ambient term applied where no light reaches.
@@ -741,6 +812,12 @@ impl Gi2d {
         self.sdf_occluders = enabled;
     }
 
+    /// World units one field pixel covers, under the camera last captured.
+    fn world_per_field_pixel(&self) -> f32 {
+        let cw = self.gi_size.0.max(1) as f32;
+        (2.0 / cw) / self.vp.x_axis.x.abs().max(1e-6)
+    }
+
     /// (Re)creates the per-size textures and jump-flood pass buffers, resetting
     /// temporal history when the size changes.
     fn ensure_textures(&mut self, width: u32, height: u32) {
@@ -799,6 +876,12 @@ impl Gi2d {
         for (slot, o) in occluders.iter_mut().zip(self.occluders.iter()) {
             slot.pos_radius = [o.position.x, o.position.y, o.radius, 0.0];
         }
+        let mut segments = [GpuSegment::zeroed(); MAX_SEGMENT_OCCLUDERS];
+        let thinnest = 0.5 * self.world_per_field_pixel();
+        for (slot, s) in segments.iter_mut().zip(self.segments.iter()) {
+            slot.ab = [s.a.x, s.a.y, s.b.x, s.b.y];
+            slot.radius = [s.radius.max(thinnest), 0.0, 0.0, 0.0];
+        }
         FieldUniforms {
             inv_vp: mat3_to_padded(&self.inv_vp),
             prev_vp: mat3_to_padded(&self.prev_vp),
@@ -814,15 +897,13 @@ impl Gi2d {
             // zero-crossing slightly outside the true surface — making it
             // effectively signed near the boundary so the march's `d <= 0` blocked
             // test fires reliably instead of letting grazing rays tunnel through.
+            // The last is world units per field pixel, which the march's first
+            // step and smallest step are measured in.
             flags: [
                 if self.sdf_occluders { 1.0 } else { 0.0 },
-                {
-                    let cw = self.gi_size.0.max(1) as f32;
-                    let wpp = (2.0 / cw) / self.vp.x_axis.x.abs().max(1e-6);
-                    wpp * 2.0
-                },
-                0.0,
-                0.0,
+                self.world_per_field_pixel() * 2.0,
+                self.segments.len().min(MAX_SEGMENT_OCCLUDERS) as f32,
+                self.world_per_field_pixel(),
             ],
             counts: [
                 self.emitters.len().min(MAX_EMITTERS) as f32,
@@ -832,6 +913,7 @@ impl Gi2d {
             ],
             emitters,
             occluders,
+            segments,
         }
     }
 
@@ -1096,6 +1178,12 @@ impl Gi2d {
 impl PostProcessingEffect for Gi2d {
     fn update(&mut self, _dt: f32, _w: f32, _h: f32, _znear: f32, _zfar: f32) {}
 
+    fn set_camera_2d(&mut self, camera: &dyn Camera2d) {
+        let (view, proj) = camera.view_transform_pair();
+        self.vp = proj * view;
+        self.inv_vp = self.vp.inverse();
+    }
+
     fn draw(&mut self, target: &RenderTarget, context: &mut PostProcessingContext) {
         let ctxt = Context::get();
 
@@ -1251,4 +1339,165 @@ fn make_gi2d_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Gi2d, GiEmitter2d, GiSegmentOccluder2d};
+    use crate::camera::{CoordinateSystem2d, FixedView2d};
+    use crate::color::Color;
+    use crate::scene::SceneNode2d;
+    use crate::test_gpu::{block_luma, on_gpu};
+    use glamx::Vec2;
+
+    #[test]
+    fn a_polygon_outline_closes_its_last_edge() {
+        let square = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(0.0, 1.0),
+        ];
+        let edges = GiSegmentOccluder2d::polygon(&square, 0.5);
+        assert_eq!(edges.len(), 4);
+        assert_eq!((edges[3].a, edges[3].b), (square[3], square[0]));
+        assert_eq!(GiSegmentOccluder2d::polygon(&square[..2], 0.5).len(), 1);
+        assert!(GiSegmentOccluder2d::polygon(&square[..1], 0.5).is_empty());
+    }
+
+    /// Mean luma of the block right of the wall, level with the emitter.
+    fn behind_the_wall(surface: &crate::window::OffscreenSurface) -> f32 {
+        block_luma(surface, 44, 24, 16, 16)
+    }
+
+    #[test]
+    fn a_camera_set_before_its_first_frame_lights_that_frame() {
+        on_gpu(64, 64, async |surface| {
+            let mut camera = FixedView2d::new(CoordinateSystem2d::default(), false);
+            let mut scene = SceneNode2d::empty();
+            scene.add_rectangle(64.0, 64.0);
+            let mut gi = Gi2d::new();
+            gi.set_temporal_blend(0.0);
+            gi.set_ambient(Color::new(0.0, 0.0, 0.0, 1.0));
+            gi.set_emitters(&[GiEmitter2d::new(
+                Vec2::new(-16.0, 0.0),
+                4.0,
+                Color::new(1.0, 1.0, 1.0, 1.0),
+                4.0,
+            )]);
+            let mut lit = Vec::new();
+            for _ in 0..2 {
+                gi.set_camera(&camera);
+                surface
+                    .render(
+                        None,
+                        Some(&mut scene),
+                        None,
+                        Some(&mut camera),
+                        None,
+                        Some(&mut gi),
+                    )
+                    .await;
+                lit.push(block_luma(surface, 8, 24, 16, 16));
+            }
+            assert!(lit[1] > 0.1, "{:?}", lit);
+            assert!((lit[0] - lit[1]).abs() < 0.02, "{:?}", lit);
+        });
+    }
+
+    #[test]
+    fn a_segment_wall_shadows_what_lies_behind_it() {
+        on_gpu(64, 64, async |surface| {
+            let mut camera = FixedView2d::new(CoordinateSystem2d::default(), false);
+            let mut scene = SceneNode2d::empty();
+            scene.add_rectangle(64.0, 64.0);
+            let wall = [GiSegmentOccluder2d::new(
+                Vec2::new(0.0, -60.0),
+                Vec2::new(0.0, 60.0),
+                1.0,
+            )];
+            // (cascades, sdf) for each solver path.
+            for (cascades, sdf) in [(false, false), (false, true), (true, false), (true, true)] {
+                let mut gi = Gi2d::new();
+                gi.set_temporal_blend(0.0);
+                gi.set_rays(64);
+                gi.set_ambient(Color::new(0.0, 0.0, 0.0, 1.0));
+                gi.set_radiance_cascades(cascades);
+                gi.set_sdf_occluders(sdf);
+                gi.set_cascade_probe_spacing(3);
+                assert_eq!(gi.cascade_probe_spacing(), 4);
+                gi.set_camera(&camera);
+                gi.set_emitters(&[GiEmitter2d::new(
+                    Vec2::new(-24.0, 0.0),
+                    4.0,
+                    Color::new(1.0, 1.0, 1.0, 1.0),
+                    4.0,
+                )]);
+                surface
+                    .render(
+                        None,
+                        Some(&mut scene),
+                        None,
+                        Some(&mut camera),
+                        None,
+                        Some(&mut gi),
+                    )
+                    .await;
+                let open = behind_the_wall(surface);
+                gi.set_segment_occluders(&wall);
+                surface
+                    .render(
+                        None,
+                        Some(&mut scene),
+                        None,
+                        Some(&mut camera),
+                        None,
+                        Some(&mut gi),
+                    )
+                    .await;
+                let shadowed = behind_the_wall(surface);
+                assert!(
+                    open > shadowed + 0.05,
+                    "cascades {} sdf {}: {} {}",
+                    cascades,
+                    sdf,
+                    open,
+                    shadowed
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_zoomed_in_camera_lights_the_ground_beside_its_emitter() {
+        on_gpu(64, 64, async |surface| {
+            // 32 pixels to a world unit: a whole field pixel is a sixteenth of one.
+            let mut camera = crate::camera::PanZoomCamera2d::new(Vec2::ZERO, 32.0);
+            let mut scene = SceneNode2d::empty();
+            scene.add_rectangle(4.0, 4.0);
+            let mut gi = Gi2d::new();
+            gi.set_temporal_blend(0.0);
+            gi.set_rays(64);
+            gi.set_ambient(Color::new(0.0, 0.0, 0.0, 1.0));
+            gi.set_camera(&camera);
+            gi.set_emitters(&[GiEmitter2d::new(
+                Vec2::ZERO,
+                0.1,
+                Color::new(1.0, 1.0, 1.0, 1.0),
+                8.0,
+            )]);
+            surface
+                .render(
+                    None,
+                    Some(&mut scene),
+                    None,
+                    Some(&mut camera),
+                    None,
+                    Some(&mut gi),
+                )
+                .await;
+            let beside = block_luma(surface, 38, 30, 4, 4);
+            assert!(beside > 0.1, "{}", beside);
+        });
+    }
 }

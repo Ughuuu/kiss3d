@@ -1,4 +1,7 @@
 //! A post-processing effect to highlight edges.
+//!
+//! The edges are found in the scene's depth, which the window hands every pass
+//! of a chain holding this effect, so it works first, last or in between.
 
 use crate::context::Context;
 use crate::post_processing::post_processing_effect::{
@@ -262,6 +265,10 @@ impl PostProcessingEffect for SobelEdgeHighlight {
         self.zf = zfar;
     }
 
+    fn reads_depth(&self) -> bool {
+        true
+    }
+
     fn draw(&mut self, target: &RenderTarget, context: &mut PostProcessingContext) {
         let pipeline = self.pipeline.get(context.output_format);
         let ctxt = Context::get();
@@ -343,5 +350,107 @@ impl PostProcessingEffect for SobelEdgeHighlight {
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.draw(0..4, 0..1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SobelEdgeHighlight;
+    use crate::camera::OrbitCamera3d;
+    use crate::color::{Color, WHITE};
+    use crate::post_processing::{Grayscales, PostProcessingEffect};
+    use crate::scene::SceneNode3d;
+    use crate::test_gpu::{on_gpu, on_gpu_with};
+    use crate::window::{CanvasSetup, NumSamples, OffscreenSurface};
+    use glamx::{Quat, Vec3};
+
+    /// Pixels of a bright cube on a bright background left dark by `chain`.
+    async fn dark_pixels(
+        surface: &mut OffscreenSurface,
+        chain: &mut [&mut dyn PostProcessingEffect],
+    ) -> usize {
+        let mut scene = SceneNode3d::empty();
+        scene
+            .add_cube(2.0, 2.0, 2.0)
+            .set_emissive(Color::new(4.0, 4.0, 4.0, 1.0))
+            .set_rotation(Quat::from_rotation_z(0.4));
+        let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+        surface.set_background_color(WHITE);
+        surface
+            .render_chain(Some(&mut scene), None, Some(&mut camera), None, None, chain)
+            .await;
+        surface
+            .snap_image()
+            .pixels()
+            .filter(|p| p.0[1] < 64)
+            .count()
+    }
+
+    /// The same, with `chain` run on the film before the tonemap.
+    async fn dark_film_pixels(
+        surface: &mut OffscreenSurface,
+        chain: &mut [&mut dyn PostProcessingEffect],
+    ) -> usize {
+        let mut scene = SceneNode3d::empty();
+        scene
+            .add_cube(2.0, 2.0, 2.0)
+            .set_emissive(Color::new(4.0, 4.0, 4.0, 1.0))
+            .set_rotation(Quat::from_rotation_z(0.4));
+        let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+        surface.set_background_color(WHITE);
+        surface
+            .render_chains(
+                Some(&mut scene),
+                None,
+                Some(&mut camera),
+                None,
+                None,
+                chain,
+                &mut [],
+            )
+            .await;
+        surface
+            .snap_image()
+            .pixels()
+            .filter(|p| p.0[1] < 64)
+            .count()
+    }
+
+    #[test]
+    fn sobel_outlines_a_cube_in_the_film_chain() {
+        on_gpu(64, 64, async |surface| {
+            let mut sobel = SobelEdgeHighlight::new(4.0);
+            let edges = dark_film_pixels(surface, &mut [&mut sobel]).await;
+            assert!(edges > 40, "edge pass on the film: {}", edges);
+        });
+    }
+
+    async fn sobel_outlines_the_cube_wherever_it_sits(surface: &mut OffscreenSurface) {
+        let mut gray = Grayscales::new();
+        let mut sobel = SobelEdgeHighlight::new(4.0);
+        let plain = dark_pixels(surface, &mut [&mut gray]).await;
+        let after = dark_pixels(surface, &mut [&mut gray, &mut sobel]).await;
+        let before = dark_pixels(surface, &mut [&mut sobel, &mut gray]).await;
+        assert!(plain < 4, "without the edge pass: {}", plain);
+        assert!(after > 40, "edge pass after grayscale: {}", after);
+        assert!(before > 40, "edge pass before grayscale: {}", before);
+    }
+
+    #[test]
+    fn sobel_outlines_a_cube_after_another_pass() {
+        on_gpu(64, 64, async |surface| {
+            sobel_outlines_the_cube_wherever_it_sits(surface).await
+        });
+    }
+
+    #[test]
+    fn sobel_outlines_a_multisampled_cube_after_another_pass() {
+        let setup = CanvasSetup {
+            samples: NumSamples::Four,
+            ..CanvasSetup::default()
+        };
+        on_gpu_with(setup, async |surface| {
+            sobel_outlines_the_cube_wherever_it_sits(surface).await
+        });
     }
 }

@@ -285,12 +285,23 @@ impl SceneNodeData3d {
     /// uses, so each object maps to a stable per-object uniform slot.
     ///
     /// [`render_depth_only`]: Self::render_depth_only
+    ///
+    /// The last argument is the alpha cutoff of a `Mask` caster, `None` otherwise.
     #[doc(hidden)]
-    pub fn collect_shadow_models(&self, f: &mut dyn FnMut(Pose3, Vec3, Color)) {
+    pub fn collect_shadow_models(&self, f: &mut dyn FnMut(Pose3, Vec3, Color, Option<f32>)) {
         if self.visible {
             if let Some(ref o) = self.object {
                 if o.casts_shadows() {
-                    f(self.world_transform, self.world_scale, o.data().color());
+                    let cutoff = match o.data().alpha_mode() {
+                        crate::scene::AlphaMode::Mask(cutoff) => Some(cutoff),
+                        _ => None,
+                    };
+                    f(
+                        self.world_transform,
+                        self.world_scale,
+                        o.data().color(),
+                        cutoff,
+                    );
                 }
             }
             for c in self.children.iter() {
@@ -433,7 +444,8 @@ impl SceneNodeData3d {
     /// filtered by opacity: `only_transparent == false` draws the opaque casters
     /// (depth pre-pass), `true` draws the transparent ones (colored transmittance
     /// pass). An object counts as transparent when its color alpha is below
-    /// `alpha_threshold`.
+    /// `alpha_threshold` and it is not a `Mask` cutout. In the depth pass a cutout
+    /// draws with the `cutout` pipelines (plain, deformed, albedo layout) when given.
     ///
     /// `object_index` is incremented for **every** caster regardless of the
     /// filter, so each object keeps the same per-object model-uniform slot as
@@ -450,6 +462,11 @@ impl SceneNodeData3d {
         object_index: &mut u32,
         only_transparent: bool,
         alpha_threshold: f32,
+        cutout: Option<(
+            &wgpu::RenderPipeline,
+            Option<&wgpu::RenderPipeline>,
+            &wgpu::BindGroupLayout,
+        )>,
     ) {
         if !self.visible {
             return;
@@ -457,17 +474,28 @@ impl SceneNodeData3d {
 
         if let Some(ref mut o) = self.object {
             if o.casts_shadows() {
-                let transparent = o.data().color().a < alpha_threshold;
+                let is_cutout = matches!(o.data().alpha_mode(), crate::scene::AlphaMode::Mask(_));
+                let transparent = !is_cutout && o.data().color().a < alpha_threshold;
                 if transparent == only_transparent {
                     let offset = *object_index * model_stride;
-                    o.render_depth_only(
-                        render_pass,
-                        base_pipeline,
-                        deform_pipeline,
-                        transmittance_tex,
-                        model_bind_group,
-                        offset,
-                    );
+                    match cutout.filter(|_| is_cutout && !only_transparent) {
+                        Some((base, deform, layout)) => o.render_depth_only(
+                            render_pass,
+                            base,
+                            deform,
+                            Some(layout),
+                            model_bind_group,
+                            offset,
+                        ),
+                        None => o.render_depth_only(
+                            render_pass,
+                            base_pipeline,
+                            deform_pipeline,
+                            transmittance_tex,
+                            model_bind_group,
+                            offset,
+                        ),
+                    }
                 }
                 // Increment for every caster so slots stay aligned across both passes.
                 *object_index += 1;
@@ -486,6 +514,7 @@ impl SceneNodeData3d {
                 object_index,
                 only_transparent,
                 alpha_threshold,
+                cutout,
             );
         }
     }
@@ -1199,6 +1228,30 @@ impl SceneNode3d {
         self.clone()
     }
 
+    /// Sets this node's reflector target size as a fraction of the viewport
+    /// (default 1.0). No-op on non-reflector nodes. See
+    /// [`Reflector::set_resolution_scale`](crate::renderer::Reflector::set_resolution_scale).
+    pub fn set_reflector_resolution_scale(&mut self, scale: f32) -> Self {
+        self.apply_to_object_mut(&mut |o| {
+            if let Some(r) = o.reflector_mut() {
+                r.set_resolution_scale(scale);
+            }
+        });
+        self.clone()
+    }
+
+    /// Sets the render layers this node's reflector draws (`None`, the default,
+    /// follows the camera). No-op on non-reflector nodes. See
+    /// [`Reflector::set_render_layers`](crate::renderer::Reflector::set_render_layers).
+    pub fn set_reflector_render_layers(&mut self, layers: Option<u32>) -> Self {
+        self.apply_to_object_mut(&mut |o| {
+            if let Some(r) = o.reflector_mut() {
+                r.set_render_layers(layers);
+            }
+        });
+        self.clone()
+    }
+
     /// Adds a double-sided quad with the specified vertices.
     pub fn add_quad_with_vertices(
         &mut self,
@@ -1355,10 +1408,10 @@ impl SceneNode3d {
         model
     }
 
-    /// Returns a weak handle to this node's shared data. Used by the glTF loader
-    /// to let a [`crate::scene::Skin3d`] reference its skeleton's joint nodes
-    /// without keeping them (or the scene graph) alive.
-    pub(crate) fn downgrade(&self) -> Weak<RefCell<SceneNodeData3d>> {
+    /// Returns a weak handle to this node's shared data. A [`crate::scene::Skin3d`]
+    /// holds its skeleton's joint nodes this way, without keeping them (or the
+    /// scene graph) alive.
+    pub fn downgrade(&self) -> Weak<RefCell<SceneNodeData3d>> {
         Rc::downgrade(&self.data)
     }
 
@@ -1446,16 +1499,18 @@ impl SceneNode3d {
     }
 
     /// Sets the morph-target weights on this node's object and every descendant
-    /// object whose target count matches `weights.len()`.
+    /// object whose mesh carries `weights.len()` targets.
     ///
     /// glTF attaches each mesh primitive as a child object node and shares one weight
     /// vector across them, so an animation channel targeting the mesh node fans the
-    /// weights out to all its primitives here.
+    /// weights out to all its primitives here. The count is the mesh's, so a mesh
+    /// built outside the loader takes weights on the first call too.
     pub fn set_morph_weights(&self, weights: &[f32]) {
         let children = {
             let mut data = self.data.borrow_mut();
             if let Some(obj) = data.object.as_mut() {
-                if obj.data().morph_target_count() == weights.len() && !weights.is_empty() {
+                let targets = obj.mesh().borrow().morph_target_count();
+                if targets == weights.len() && !weights.is_empty() {
                     obj.data_mut().set_morph_weights(weights);
                 }
             }
@@ -2297,6 +2352,24 @@ impl SceneNode3d {
         self.clone()
     }
 
+    /// Sets whether shadows darken this node's object (see
+    /// [`Object3d::set_receives_shadows`](crate::scene::Object3d::set_receives_shadows)).
+    /// Defaults to `true`.
+    #[inline]
+    pub fn set_receives_shadows(&mut self, receives_shadows: bool) -> Self {
+        self.apply_to_object_mut(&mut |o| o.set_receives_shadows(receives_shadows));
+        self.clone()
+    }
+
+    /// Sets whether this node's object tests and writes depth (see
+    /// [`Object3d::set_depth_test`](crate::scene::Object3d::set_depth_test)).
+    /// Defaults to `true`; `false` draws it over everything.
+    #[inline]
+    pub fn set_depth_test(&mut self, depth_test: bool) -> Self {
+        self.apply_to_object_mut(&mut |o| o.set_depth_test(depth_test));
+        self.clone()
+    }
+
     // === PBR Texture Maps ===
 
     /// Sets the normal map for this node's object only.
@@ -2678,7 +2751,7 @@ impl SceneNode3d {
         let mut any = false;
         self.apply_to_objects_recursive(&mut |obj| {
             let d = obj.data();
-            if d.surface_rendering_active() && d.alpha_mode().is_transparent(d.color().a) {
+            if d.surface_rendering_active() && d.draws_translucent() {
                 any = true;
             }
         });

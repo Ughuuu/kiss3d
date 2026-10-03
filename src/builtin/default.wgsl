@@ -38,11 +38,11 @@ const MAX_PROBES: u32 = 8u;
 struct Probe {
     // xyz: world center; w: 1.0 if active.
     center_active: vec4<f32>,
-    // xyz: parallax-box min (world); w: array layer.
-    box_min_layer: vec4<f32>,
-    // xyz: parallax-box max (world); w: intensity.
-    box_max_intensity: vec4<f32>,
-    // x: rotation; y: falloff; z: max LOD; w: unused.
+    // xyz: parallax-box half extents; w: array layer.
+    half_layer: vec4<f32>,
+    // Parallax-box orientation, a unit quaternion (xyz, w).
+    orientation: vec4<f32>,
+    // x: rotation; y: falloff; z: max LOD; w: intensity.
     params: vec4<f32>,
 }
 
@@ -158,13 +158,25 @@ fn ibl_sample(dir: vec3<f32>, lod: f32) -> vec3<f32> {
 
 // === Reflection probes ===
 
+// Rotates `v` by the unit quaternion `q`.
+fn quat_rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+    let t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+// `v` in probe `i`'s box frame: centered on the probe, its axes the box's.
+fn probe_local(i: u32, v: vec3<f32>) -> vec3<f32> {
+    let q = frame.probes[i].orientation;
+    return quat_rotate(vec4<f32>(-q.xyz, q.w), v);
+}
+
 // Influence weight of probe `i` at world position `P`: 1 well inside the box,
 // ramping to 0 over `falloff` world units at the boundary (0 outside).
 fn probe_weight(i: u32, p: vec3<f32>) -> f32 {
-    let bmin = frame.probes[i].box_min_layer.xyz;
-    let bmax = frame.probes[i].box_max_intensity.xyz;
+    let half = frame.probes[i].half_layer.xyz;
     let falloff = frame.probes[i].params.y;
-    let d = min(p - bmin, bmax - p); // per-axis distance to the nearer face
+    let local = probe_local(i, p - frame.probes[i].center_active.xyz);
+    let d = half - abs(local); // per-axis distance to the nearer face
     let edge = min(d.x, min(d.y, d.z));
     return clamp(edge / falloff, 0.0, 1.0);
 }
@@ -173,16 +185,16 @@ fn probe_weight(i: u32, p: vec3<f32>) -> f32 {
 // from `P` with the box, then re-aim from the probe center to the hit point so the
 // reflection tracks local geometry instead of a distant environment.
 fn probe_parallax(i: u32, p: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
-    let bmin = frame.probes[i].box_min_layer.xyz;
-    let bmax = frame.probes[i].box_max_intensity.xyz;
-    let center = frame.probes[i].center_active.xyz;
-    let invd = 1.0 / dir;
-    let t1 = (bmin - p) * invd;
-    let t2 = (bmax - p) * invd;
+    let half = frame.probes[i].half_layer.xyz;
+    let local_p = probe_local(i, p - frame.probes[i].center_active.xyz);
+    let local_d = probe_local(i, dir);
+    let invd = 1.0 / local_d;
+    let t1 = (-half - local_p) * invd;
+    let t2 = (half - local_p) * invd;
     let tmax = max(t1, t2);
     let t = min(min(tmax.x, tmax.y), tmax.z);
-    let hit = p + dir * max(t, 0.0);
-    return normalize(hit - center);
+    let hit = local_p + local_d * max(t, 0.0);
+    return normalize(quat_rotate(frame.probes[i].orientation, hit));
 }
 
 // Samples probe `i`'s equirectangular layer in `dir` at the given mip LOD.
@@ -191,7 +203,7 @@ fn probe_sample(i: u32, dir: vec3<f32>, lod: f32) -> vec3<f32> {
     let c = cos(rot);
     let s = sin(rot);
     let rd = vec3<f32>(c * dir.x + s * dir.z, dir.y, -s * dir.x + c * dir.z);
-    let layer = i32(frame.probes[i].box_min_layer.w + 0.5);
+    let layer = i32(frame.probes[i].half_layer.w + 0.5);
     return textureSampleLevel(ibl_probes, ibl_samp, equirect_dir_to_uv(rd), layer, lod).rgb;
 }
 
@@ -304,10 +316,10 @@ var s_reflection: sampler;
 
 // === SHADOW MAPPING (group 3) — localized block for easy merging ===
 // Maximum number of atlas views (must match builtin/shadow.rs MAX_SHADOW_VIEWS).
-const MAX_SHADOW_VIEWS: u32 = 16u;
+const MAX_SHADOW_VIEWS: u32 = 64u;
 // Per-light shadow-metadata slots (must match shadow.rs MAX_SHADOW_LIGHTS =
 // MAX_LIGHTS + MAX_SHADOW_VIEWS). Primary tier in 0..MAX_LIGHTS, clustered above.
-const MAX_SHADOW_LIGHTS: u32 = 24u;
+const MAX_SHADOW_LIGHTS: u32 = 72u;
 
 // Per-light shadow metadata (mirrors GpuLightShadow in builtin/shadow.rs).
 struct LightShadow {
@@ -638,7 +650,7 @@ struct VertexInput {
     num_vertices: u32,
     has_skin: u32,
     has_morph_normals: u32,
-    weights: array<vec4<f32>, 16>,
+    weights: array<vec4<f32>, 64>,
 }
 @if(deform) @group(3) @binding(0) var<storage, read> joint_palette: array<mat4x4<f32>>;
 @if(deform) @group(3) @binding(1) var<storage, read> skin_joints: array<vec4<u32>>;
@@ -1361,7 +1373,7 @@ fn shade(in: VertexOutput) -> vec4<f32> {
             if probe.x >= 0.0 {
                 let pi = u32(probe.x);
                 let p_lod = frame.probes[pi].params.z;
-                let p_int = frame.probes[pi].box_max_intensity.w;
+                let p_int = frame.probes[pi].params.w;
                 let p_spec = probe_sample(pi, probe_parallax(pi, in.world_pos, r_dir), roughness * p_lod) * p_int;
                 let p_irr = probe_sample(pi, probe_parallax(pi, in.world_pos, N), p_lod) * p_int;
                 @if(clearcoat) {

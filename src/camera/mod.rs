@@ -20,10 +20,18 @@ pub enum Projection {
     /// Perspective projection driven by the camera's field of view.
     #[default]
     Perspective,
-    /// Orthographic (parallel) projection. `scale` is reserved for future
-    /// per-camera control; the built-in `OrbitCamera3d` derives the orthographic
-    /// half-height from its orbit distance so zooming keeps working.
-    Orthographic,
+    /// Orthographic (parallel) projection.
+    Orthographic {
+        /// The full height of the view volume, in world units. `None`, the default,
+        /// derives it from the orbit distance and the field of view, so scrolling
+        /// still zooms; a set height stays fixed while the distance changes.
+        height: Option<f32>,
+    },
+}
+
+#[cfg(feature = "serde")]
+pub(crate) fn all_render_layers() -> u32 {
+    u32::MAX
 }
 
 /// Physically-based camera exposure, expressed as an EV100 value.

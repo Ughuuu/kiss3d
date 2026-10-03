@@ -149,6 +149,8 @@ pub mod window;
 
 #[cfg(test)]
 mod shader_validity;
+#[cfg(test)]
+mod test_gpu;
 
 pub mod prelude {
     pub use crate::builtin::*;

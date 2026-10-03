@@ -104,8 +104,10 @@ pub struct EnvLight<'a> {
 pub struct ProbeData {
     /// World-space center (capture viewpoint).
     pub center: Vec3,
-    /// Half-extents of the parallax/influence box (world AABB), centered on `center`.
+    /// Half-extents of the parallax/influence box, centered on `center`.
     pub half_extents: Vec3,
+    /// Orientation of the parallax/influence box (identity: axis-aligned).
+    pub orientation: glamx::Quat,
     /// Soft-edge width (world units) over which the probe fades to the global env.
     pub falloff: f32,
     /// Luminance multiplier.
@@ -238,6 +240,11 @@ pub trait Material3d {
     /// with `dot((a,b,c), world_pos) + d < 0` are discarded. Used by reflector
     /// capture to clip geometry behind the mirror. `None` disables it. Default no-op.
     fn set_clip_plane(&mut self, _plane: Option<[f32; 4]>) {}
+
+    /// Supplies the clustered forward+ grid this frame's light culling uses:
+    /// clusters along screen X, screen Y and view depth. Called before `prepare`
+    /// each frame. Default no-op.
+    fn set_cluster_grid(&mut self, _grid: [u32; 3]) {}
 
     /// Supplies the clustered forward+ storage buffers for this frame (the light
     /// list, per-cluster light grid, and global light-index list). Called by the

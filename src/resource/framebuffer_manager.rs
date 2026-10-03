@@ -72,6 +72,15 @@ impl RenderTarget {
         }
     }
 
+    /// Points this target's depth at `depth`, a single-sampled view it does not
+    /// own, so an effect reading the target reads that depth.
+    pub(crate) fn share_depth(&mut self, depth: &wgpu::TextureView) {
+        if let RenderTarget::Offscreen(o) = self {
+            o.depth_texture = depth.texture().clone();
+            o.depth_view = depth.clone();
+        }
+    }
+
     /// Resizes this render target.
     pub fn resize(&mut self, width: u32, height: u32, surface_format: wgpu::TextureFormat) {
         match self {
@@ -90,11 +99,14 @@ impl RenderTarget {
 
 impl OffscreenBuffers {
     /// Creates new off-screen buffers with the specified dimensions.
+    ///
+    /// The depth texture is always created and always sampleable, so the last
+    /// argument no longer changes anything; it is kept for existing callers.
     pub fn new(
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
-        create_depth_texture: bool,
+        _create_depth_texture: bool,
     ) -> Self {
         let ctxt = Context::get();
 
@@ -138,11 +150,9 @@ impl OffscreenBuffers {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: depth_format,
-            usage: if create_depth_texture {
-                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
-            } else {
-                wgpu::TextureUsages::RENDER_ATTACHMENT
-            },
+            // Always sampleable: a post pass that reads the scene depth may be
+            // handed this target's depth whichever way the target was made.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
 

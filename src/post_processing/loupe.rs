@@ -28,6 +28,7 @@
 //! # }
 //! ```
 
+use crate::camera::Camera2d;
 use crate::context::Context;
 use crate::post_processing::post_processing_effect::{
     FormatPipelines, PostProcessingContext, PostProcessingEffect,
@@ -440,5 +441,15 @@ impl PostProcessingEffect for Loupe {
         render_pass.set_bind_group(0, &bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.draw(0..4, 0..1);
+    }
+
+    fn reads_depth(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| inner.reads_depth())
+    }
+
+    fn set_camera_2d(&mut self, camera: &dyn Camera2d) {
+        if let Some(inner) = &mut self.inner {
+            inner.set_camera_2d(camera);
+        }
     }
 }

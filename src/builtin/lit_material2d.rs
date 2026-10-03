@@ -130,6 +130,8 @@ impl GpuData for LitMaterial2dGpuData {
 /// [module docs](crate::builtin)).
 pub struct LitMaterial2d {
     pipeline: PipelineCache,
+    /// The pipeline of an object with backface culling on.
+    pipeline_cull: PipelineCache,
     object_bind_group_layout: wgpu::BindGroupLayout,
     texture_bind_group_layout: wgpu::BindGroupLayout,
     frame_uniform_buffer: wgpu::Buffer,
@@ -223,7 +225,7 @@ impl LitMaterial2d {
             ),
         );
 
-        let pipeline = PipelineCache::new(move |sample_count| {
+        let build = std::rc::Rc::new(move |sample_count: u32, cull: bool| {
             let ctxt = Context::get();
             let vertex_buffer_layouts = [
                 Some(wgpu::VertexBufferLayout {
@@ -303,7 +305,7 @@ impl LitMaterial2d {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     strip_index_format: None,
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
+                    cull_mode: cull.then_some(wgpu::Face::Back),
                     polygon_mode: wgpu::PolygonMode::Fill,
                     unclipped_depth: false,
                     conservative: false,
@@ -314,6 +316,12 @@ impl LitMaterial2d {
                 cache: None,
             })
         });
+
+        let pipeline = {
+            let build = build.clone();
+            PipelineCache::new(move |sample_count| build(sample_count, false))
+        };
+        let pipeline_cull = PipelineCache::new(move |sample_count| build(sample_count, true));
 
         let frame_uniform_buffer = ctxt.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lit2d_frame_uniform_buffer"),
@@ -332,6 +340,7 @@ impl LitMaterial2d {
 
         LitMaterial2d {
             pipeline,
+            pipeline_cull,
             object_bind_group_layout,
             texture_bind_group_layout,
             frame_uniform_buffer,
@@ -447,6 +456,7 @@ impl Material2d for LitMaterial2d {
                     let kind = match light.kind {
                         Light2dKind::Point => 0.0,
                         Light2dKind::Spot => 1.0,
+                        Light2dKind::Directional => 2.0,
                     };
                     let dir = light.direction.normalize_or_zero();
                     *slot = GpuLight {
@@ -522,7 +532,7 @@ impl Material2d for LitMaterial2d {
         _transform: Pose2,
         _scale: Vec2,
         _camera: &mut dyn Camera2d,
-        _data: &ObjectData2d,
+        data: &ObjectData2d,
         mesh: &mut GpuMesh2d,
         instances: &mut InstancesBuffer2d,
         gpu_data: &mut dyn GpuData,
@@ -578,7 +588,12 @@ impl Material2d for LitMaterial2d {
             None => return,
         };
 
-        let pipeline = self.pipeline.get(context.sample_count);
+        let pipeline = if data.backface_culling_enabled() {
+            &self.pipeline_cull
+        } else {
+            &self.pipeline
+        }
+        .get(context.sample_count);
         render_pass.set_pipeline(&pipeline);
         render_pass.set_bind_group(0, &self.frame_bind_group, &[]);
         render_pass.set_bind_group(1, object_bind_group, &[]);
@@ -590,5 +605,61 @@ impl Material2d for LitMaterial2d {
         render_pass.set_vertex_buffer(4, inst_deformations_buf.slice(..));
         render_pass.set_index_buffer(faces_buf.slice(..), VERTEX_INDEX_FORMAT);
         render_pass.draw_indexed(0..mesh.num_indices(), 0, 0..num_instances as u32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::camera::{CoordinateSystem2d, FixedView2d};
+    use crate::color::Color;
+    use crate::light2d::{Light2d, Light2dManager, MAX_LIGHTS_2D};
+    use crate::scene::SceneNode2d;
+    use crate::test_gpu::{luma_at, on_gpu};
+    use glamx::Vec2;
+
+    fn set_lights(lights: &[Light2d]) {
+        Light2dManager::get_global_manager(|m| {
+            m.set_ambient(Color::new(0.0, 0.0, 0.0, 1.0));
+            m.set_lights(lights);
+        });
+    }
+
+    #[test]
+    fn a_directional_light_reaches_past_any_radius() {
+        on_gpu(64, 64, async |surface| {
+            let mut camera = FixedView2d::new(CoordinateSystem2d::default(), false);
+            let mut scene = SceneNode2d::empty();
+            scene.add_lit_sprite(40.0, 40.0);
+            let white = Color::new(1.0, 1.0, 1.0, 1.0);
+            let far = Vec2::new(5000.0, 0.0);
+
+            set_lights(&[Light2d::point(far, white, 2.0, 100.0)]);
+            surface.render_2d(&mut scene, &mut camera).await;
+            assert!(luma_at(surface, 32, 32) < 0.05);
+
+            let mut sun = Light2d::directional(Vec2::new(-1.0, 0.0), white, 2.0);
+            sun.position = far;
+            set_lights(&[sun]);
+            surface.render_2d(&mut scene, &mut camera).await;
+            assert!(luma_at(surface, 32, 32) > 0.3);
+        });
+    }
+
+    #[test]
+    fn every_light_up_to_the_cap_shades() {
+        on_gpu(64, 64, async |surface| {
+            let mut camera = FixedView2d::new(CoordinateSystem2d::default(), false);
+            let mut scene = SceneNode2d::empty();
+            scene.add_lit_sprite(40.0, 40.0);
+            let white = Color::new(1.0, 1.0, 1.0, 1.0);
+            // Every light but the last lies far out of reach.
+            let mut lights =
+                vec![Light2d::point(Vec2::new(5000.0, 0.0), white, 2.0, 10.0); MAX_LIGHTS_2D];
+            lights[MAX_LIGHTS_2D - 1] = Light2d::point(Vec2::ZERO, white, 2.0, 200.0);
+            set_lights(&lights);
+            assert_eq!(MAX_LIGHTS_2D, 64);
+            surface.render_2d(&mut scene, &mut camera).await;
+            assert!(luma_at(surface, 32, 32) > 0.3);
+        });
     }
 }

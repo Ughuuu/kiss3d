@@ -1,0 +1,91 @@
+//! Helpers for tests that render on a real GPU through an [`OffscreenSurface`].
+//! A machine without an adapter skips them, as the shader-validity test does.
+
+use crate::context::Context;
+use crate::window::{CanvasSetup, NumSamples, OffscreenSurface};
+
+async fn adapter_available() -> bool {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+        .is_ok()
+}
+
+/// Runs `test` on a fresh single-sampled `width × height` surface and fails on
+/// any wgpu validation error it raised.
+pub(crate) fn on_gpu(width: u32, height: u32, test: impl AsyncFnOnce(&mut OffscreenSurface)) {
+    let setup = CanvasSetup {
+        samples: NumSamples::One,
+        ..CanvasSetup::default()
+    };
+    run_on_gpu(width, height, setup, test);
+}
+
+/// [`on_gpu`] on a 64 × 64 surface built from `setup`.
+pub(crate) fn on_gpu_with(setup: CanvasSetup, test: impl AsyncFnOnce(&mut OffscreenSurface)) {
+    run_on_gpu(64, 64, setup, test);
+}
+
+fn run_on_gpu(
+    width: u32,
+    height: u32,
+    setup: CanvasSetup,
+    test: impl AsyncFnOnce(&mut OffscreenSurface),
+) {
+    crate::pollster::block_on(async {
+        if !adapter_available().await {
+            eprintln!("no GPU adapter found, skipping");
+            return;
+        }
+        let mut surface = OffscreenSurface::with_setup(width, height, setup).await;
+        let scope = Context::get()
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        test(&mut surface).await;
+        let err = scope.pop().await;
+        assert!(err.is_none(), "wgpu validation error: {:?}", err);
+    });
+}
+
+fn luma([r, g, b]: [u8; 3]) -> f32 {
+    (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0
+}
+
+/// Mean luma of the last frame, `0.0..=1.0`.
+pub(crate) fn mean_luma(surface: &OffscreenSurface) -> f32 {
+    let image = surface.snap_image();
+    let sum: f32 = image.pixels().map(|p| luma(p.0)).sum();
+    sum / (image.width() * image.height()) as f32
+}
+
+/// Luma of one pixel of the last frame, `(0, 0)` at the top left.
+pub(crate) fn luma_at(surface: &OffscreenSurface, x: u32, y: u32) -> f32 {
+    luma(surface.snap_image().get_pixel(x, y).0)
+}
+
+/// Mean luma of the `width × height` block whose top-left pixel is `(x, y)`.
+pub(crate) fn block_luma(
+    surface: &OffscreenSurface,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> f32 {
+    let image = surface.snap_image();
+    let mut sum = 0.0;
+    for py in y..y + height {
+        for px in x..x + width {
+            sum += luma(image.get_pixel(px, py).0);
+        }
+    }
+    sum / (width * height) as f32
+}
