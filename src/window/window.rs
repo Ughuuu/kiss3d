@@ -21,6 +21,7 @@ use crate::resource::{
     FramebufferManager, MaterialManager2d, MeshManager2d, RenderTarget, Texture, TextureManager,
 };
 use crate::scene::SceneNode3d;
+#[cfg(feature = "text")]
 use crate::text::TextRenderer;
 use crate::window::canvas::CanvasSetup;
 use crate::window::{Canvas, NumSamples};
@@ -70,6 +71,7 @@ pub struct Window {
     pub(super) point_renderer_2d: PointRenderer2d,
     pub(super) point_renderer: PointRenderer3d,
     pub(super) polyline_renderer: PolylineRenderer3d,
+    #[cfg(feature = "text")]
     pub(super) text_renderer: TextRenderer,
     pub(super) framebuffer_manager: FramebufferManager,
     /// Real-time shadow mapper for the rasterization pipeline.
@@ -1260,6 +1262,7 @@ impl Window {
             point_renderer_2d: PointRenderer2d::new(),
             point_renderer: PointRenderer3d::new(),
             polyline_renderer: PolylineRenderer3d::new(),
+            #[cfg(feature = "text")]
             text_renderer: TextRenderer::new(),
             #[cfg(feature = "egui")]
             egui_context: EguiContext::new(),
@@ -1352,6 +1355,7 @@ impl Window {
             point_renderer_2d: PointRenderer2d::new(),
             point_renderer: PointRenderer3d::new(),
             polyline_renderer: PolylineRenderer3d::new(),
+            #[cfg(feature = "text")]
             text_renderer: TextRenderer::new(),
             #[cfg(feature = "egui")]
             egui_context: EguiContext::new(),

@@ -1532,6 +1532,7 @@ impl Window {
         }
 
         // Render text
+        #[cfg(feature = "text")]
         {
             let mut context_2d_encoder = RenderContext2dEncoder {
                 encoder: &mut encoder,
@@ -1673,6 +1674,7 @@ impl Window {
         camera.handle_event(&self.canvas, &WindowEvent::FramebufferSize(w, h));
         camera.update(&self.canvas);
 
+        #[cfg(feature = "text")]
         let sample_count = self.canvas.sample_count();
 
         let ctxt = Context::get();
@@ -1776,6 +1778,7 @@ impl Window {
         );
 
         // Render text on top of the path-traced image.
+        #[cfg(feature = "text")]
         {
             let mut context_2d_encoder = RenderContext2dEncoder {
                 encoder: &mut encoder,

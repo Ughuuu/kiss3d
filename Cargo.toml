@@ -30,6 +30,7 @@ name = "kiss3d"
 path = "src/lib.rs"
 
 [features]
+default = ["text", "egui-default-fonts", "image-formats"]
 # `rfd` powers the inspector's native "Open…" image dialogs (unused on wasm, which
 # falls back to a path text field).
 egui = ["dep:egui", "dep:egui-wgpu", "dep:rfd"]
@@ -40,14 +41,22 @@ serde = ["dep:serde", "glamx/serde", "bitflags/serde", "rgb/serde", "wgpu/serde"
 # `.raytrace_3d`. This is mainly for debugging and experiments comparing the rasterizer and
 # the raytracer.
 rt_switcher = []
+# `Window::draw_text` and `text::Font` over rusttype, and the WorkSans face the
+# egui renderer starts from. An app with its own text stack turns it off.
+text = ["dep:rusttype"]
+# egui's bundled faces (Ubuntu-Light, Hack and two emoji fonts); off, the app
+# hands egui its fonts.
+egui-default-fonts = ["egui?/default_fonts"]
+# Every format the image crate decodes; off, PNG and JPEG only.
+image-formats = ["image/default-formats"]
 
 [dependencies]
 bitflags     = "2"
 bytemuck     = { version = "1", features = ["derive"] }
-egui         = { version = "0.36", optional = true, default-features = true }
+egui         = { version = "0.36", optional = true, default-features = false }
 egui-wgpu    = { version = "0.36", optional = true }
 gltf         = { version = "1.4", features = ["import", "utils", "names"] }
-image        = { version = "0.25", default-features = false, features = ["default-formats"] }
+image        = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 log          = "0.4"
 web-time     = "1"
 kiss3d-macro = { version = "0.36.0", path = "kiss3d-macro" }
@@ -55,7 +64,7 @@ glamx         = { version = "0.3", features = ["bytemuck"] }
 ffmpeg-the-third = { version = "4", optional = true }
 num-traits   = "0.2"
 rgb          = "0.8"
-rusttype     = { version = "0.9", features = ["gpu_cache"] }
+rusttype     = { version = "0.9", features = ["gpu_cache"], optional = true }
 serde        = { version = "1", features = ["derive"], optional = true }
 wgpu         = "30"
 winit        = "0.30"
@@ -114,6 +123,22 @@ web-sys = { version = "0.3", features = [
     "Element",
     "DomRect",
 ] }
+
+[[example]]
+name = "text"
+required-features = ["text"]
+
+[[example]]
+name = "dda_raycast2d"
+required-features = ["text"]
+
+[[example]]
+name = "material_pbr"
+required-features = ["text"]
+
+[[example]]
+name = "raytracing"
+required-features = ["text"]
 
 [dev-dependencies]
 env_logger = "0.11"

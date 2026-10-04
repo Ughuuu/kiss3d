@@ -19,30 +19,33 @@ impl EguiRenderer {
     pub fn new() -> EguiRenderer {
         let egui_ctx = EguiContext::default();
 
-        // Load fonts manually - use kiss3d's embedded font
-        let mut fonts = egui::FontDefinitions::default();
+        #[cfg(feature = "text")]
+        {
+            // Load fonts manually - use kiss3d's embedded font
+            let mut fonts = egui::FontDefinitions::default();
 
-        // Add WorkSans font from kiss3d
-        fonts.font_data.insert(
-            "WorkSans".to_owned(),
-            egui::FontData::from_static(include_bytes!("../text/WorkSans-Regular.ttf")).into(),
-        );
+            // Add WorkSans font from kiss3d
+            fonts.font_data.insert(
+                "WorkSans".to_owned(),
+                egui::FontData::from_static(include_bytes!("../text/WorkSans-Regular.ttf")).into(),
+            );
 
-        // Set it as the proportional font
-        fonts
-            .families
-            .get_mut(&egui::FontFamily::Proportional)
-            .unwrap()
-            .insert(0, "WorkSans".to_owned());
+            // Set it as the proportional font
+            fonts
+                .families
+                .get_mut(&egui::FontFamily::Proportional)
+                .unwrap()
+                .insert(0, "WorkSans".to_owned());
 
-        // Set it as the monospace font too
-        fonts
-            .families
-            .get_mut(&egui::FontFamily::Monospace)
-            .unwrap()
-            .insert(0, "WorkSans".to_owned());
+            // Set it as the monospace font too
+            fonts
+                .families
+                .get_mut(&egui::FontFamily::Monospace)
+                .unwrap()
+                .insert(0, "WorkSans".to_owned());
 
-        egui_ctx.set_fonts(fonts);
+            egui_ctx.set_fonts(fonts);
+        }
 
         // Set default pixels_per_point to avoid DPI warnings.
         // Not using 1.0 exactly so that draw_ui() gets a chance
