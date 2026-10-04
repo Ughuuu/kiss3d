@@ -240,10 +240,7 @@ fn build_bloom(bloom_layout: &wgpu::BindGroupLayout) -> BloomPipelines {
 
     let bloom_shader = ctxt.create_shader_module(
         Some("hdr_bloom_shader"),
-        &crate::builtin::compile_shader_with_common(
-            "package::hdr_bloom",
-            include_str!("../builtin/hdr_bloom.wgsl"),
-        ),
+        &crate::builtin::linked("package::hdr_bloom", &[]),
     );
 
     let bloom_pipeline_layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -336,10 +333,7 @@ fn build_exposure(
     let ctxt = Context::get();
     let meter_shader = ctxt.create_shader_module(
         Some("hdr_autoexposure_meter"),
-        &crate::builtin::compile_shader_with_common(
-            "package::auto_exposure_meter",
-            include_str!("../builtin/auto_exposure_meter.wgsl"),
-        ),
+        &crate::builtin::linked("package::auto_exposure_meter", &[]),
     );
     let make_1x1_pipeline =
         |label: &str, layout: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule| {
@@ -390,10 +384,7 @@ fn build_exposure(
 
     let adapt_shader = ctxt.create_shader_module(
         Some("hdr_autoexposure_adapt"),
-        &crate::builtin::compile_shader_with_common(
-            "package::auto_exposure_adapt",
-            include_str!("../builtin/auto_exposure_adapt.wgsl"),
-        ),
+        &crate::builtin::linked("package::auto_exposure_adapt", &[]),
     );
     let adapt = make_1x1_pipeline("hdr_autoexposure_adapt", adapt_layout, &adapt_shader);
     ExposurePipelines { meter, adapt }
@@ -640,18 +631,7 @@ impl HdrPipeline {
 
         // `hdr_tonemap` imports the shared `apply_tonemap` from the `tonemap_ops`
         // WESL module (composed here instead of source concatenation).
-        let tonemap_wgsl = crate::builtin::compile_wesl(
-            &[
-                ("package::tonemap_ops", crate::builtin::TONEMAP_OPS_WESL),
-                (
-                    "package::hdr_tonemap",
-                    include_str!("../builtin/hdr_tonemap.wgsl"),
-                ),
-                ("package::common", crate::builtin::COMMON_WESL),
-            ],
-            "package::hdr_tonemap",
-            &[],
-        );
+        let tonemap_wgsl = crate::builtin::linked("package::hdr_tonemap", &[]);
         let tonemap_shader = ctxt.create_shader_module(Some("hdr_tonemap_shader"), &tonemap_wgsl);
 
         let tonemap_pipeline_layout =

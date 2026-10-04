@@ -33,10 +33,7 @@ impl SceneDepth {
         });
         let shader = ctxt.create_shader_module(
             Some("scene_depth_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::depth_resolve",
-                include_str!("../builtin/depth_resolve.wgsl"),
-            ),
+            &crate::builtin::linked("package::depth_resolve", &[]),
         );
         let pipeline = ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("scene_depth_pipeline"),

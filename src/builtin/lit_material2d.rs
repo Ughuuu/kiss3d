@@ -219,10 +219,7 @@ impl LitMaterial2d {
 
         let shader = ctxt.create_shader_module(
             Some("lit2d_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::lit2d",
-                include_str!("lit2d.wgsl"),
-            ),
+            &crate::builtin::linked("package::lit2d", &[]),
         );
 
         let build = std::rc::Rc::new(move |sample_count: u32, cull: bool| {

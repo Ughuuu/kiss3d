@@ -401,31 +401,19 @@ impl Gi2d {
 
         let field_shader = ctxt.create_shader_module(
             Some("gi2d_field_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::gi2d_field",
-                include_str!("../builtin/gi2d_field.wgsl"),
-            ),
+            &crate::builtin::linked("package::gi2d_field", &[]),
         );
         let composite_shader = ctxt.create_shader_module(
             Some("gi2d_composite_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::gi2d_composite",
-                include_str!("../builtin/gi2d_composite.wgsl"),
-            ),
+            &crate::builtin::linked("package::gi2d_composite", &[]),
         );
         let jfa_seed_shader = ctxt.create_shader_module(
             Some("gi2d_jfa_seed_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::gi2d_jfa_seed",
-                include_str!("../builtin/gi2d_jfa_seed.wgsl"),
-            ),
+            &crate::builtin::linked("package::gi2d_jfa_seed", &[]),
         );
         let jfa_shader = ctxt.create_shader_module(
             Some("gi2d_jfa_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::gi2d_jfa",
-                include_str!("../builtin/gi2d_jfa.wgsl"),
-            ),
+            &crate::builtin::linked("package::gi2d_jfa", &[]),
         );
 
         let make_pipeline = |label: &str,
@@ -499,17 +487,11 @@ impl Gi2d {
             });
         let cascade_shader = ctxt.create_shader_module(
             Some("gi2d_cascade_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::gi2d_cascade",
-                include_str!("../builtin/gi2d_cascade.wgsl"),
-            ),
+            &crate::builtin::linked("package::gi2d_cascade", &[]),
         );
         let cascade_composite_shader = ctxt.create_shader_module(
             Some("gi2d_cascade_composite_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::gi2d_cascade_composite",
-                include_str!("../builtin/gi2d_cascade_composite.wgsl"),
-            ),
+            &crate::builtin::linked("package::gi2d_cascade_composite", &[]),
         );
         let cascade_pipeline = make_pipeline(
             "gi2d_cascade_pipeline",

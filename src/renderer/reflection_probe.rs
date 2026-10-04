@@ -373,10 +373,7 @@ impl ReflectionProbes {
         let ctxt = Context::get();
         let shader = ctxt.create_shader_module(
             Some("reflection_probe_downsample"),
-            &crate::builtin::compile_shader_with_common(
-                "package::env_downsample",
-                crate::builtin::ENV_DOWNSAMPLE_WESL,
-            ),
+            &crate::builtin::linked("package::env_downsample", &[]),
         );
         let layout = ctxt.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("reflection_probe_downsample_layout"),
@@ -602,10 +599,7 @@ impl ProbeCapture {
 
         let shader = ctxt.create_shader_module(
             Some("cube_to_equirect"),
-            &crate::builtin::compile_shader_with_common(
-                "package::cube_to_equirect",
-                include_str!("../builtin/cube_to_equirect.wgsl"),
-            ),
+            &crate::builtin::linked("package::cube_to_equirect", &[]),
         );
         let reproject_layout = ctxt.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("probe_reproject_layout"),

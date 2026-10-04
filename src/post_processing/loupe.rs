@@ -177,10 +177,7 @@ impl Loupe {
 
         let shader = ctxt.create_shader_module(
             Some("loupe_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::loupe",
-                include_str!("../builtin/loupe.wgsl"),
-            ),
+            &crate::builtin::linked("package::loupe", &[]),
         );
 
         let vertex_buffer_layout = wgpu::VertexBufferLayout {

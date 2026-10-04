@@ -129,10 +129,7 @@ impl SobelEdgeHighlight {
         // Load shader
         let shader = ctxt.create_shader_module(
             Some("sobel_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::sobel",
-                include_str!("../builtin/sobel.wgsl"),
-            ),
+            &crate::builtin::linked("package::sobel", &[]),
         );
 
         // Vertex buffer layout

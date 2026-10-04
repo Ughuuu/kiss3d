@@ -852,11 +852,7 @@ impl ShadowMapper {
     ) -> wgpu::RenderPipeline {
         let shader = ctxt.create_shader_module(
             Some("shadow_depth_shader"),
-            &crate::builtin::compile_wesl(
-                &[("package::shadow_depth", crate::builtin::SHADOW_DEPTH_WESL)],
-                "package::shadow_depth",
-                &[("skinned", false)],
-            ),
+            &crate::builtin::linked("package::shadow_depth", &[("skinned", false)]),
         );
 
         let layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -970,11 +966,7 @@ impl ShadowMapper {
     ) -> wgpu::RenderPipeline {
         let shader = ctxt.create_shader_module(
             Some("shadow_depth_deform_shader"),
-            &crate::builtin::compile_wesl(
-                &[("package::shadow_depth", crate::builtin::SHADOW_DEPTH_WESL)],
-                "package::shadow_depth",
-                &[("skinned", true)],
-            ),
+            &crate::builtin::linked("package::shadow_depth", &[("skinned", true)]),
         );
 
         let layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1081,14 +1073,7 @@ impl ShadowMapper {
     ) -> wgpu::RenderPipeline {
         let shader = ctxt.create_shader_module(
             Some("shadow_transmittance_deform_shader"),
-            &crate::builtin::compile_wesl(
-                &[(
-                    "package::shadow_transmittance",
-                    crate::builtin::SHADOW_TRANSMITTANCE_WESL,
-                )],
-                "package::shadow_transmittance",
-                &[("skinned", true)],
-            ),
+            &crate::builtin::linked("package::shadow_transmittance", &[("skinned", true)]),
         );
 
         let layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1223,14 +1208,7 @@ impl ShadowMapper {
     ) -> wgpu::RenderPipeline {
         let shader = ctxt.create_shader_module(
             Some("shadow_transmittance_shader"),
-            &crate::builtin::compile_wesl(
-                &[(
-                    "package::shadow_transmittance",
-                    crate::builtin::SHADOW_TRANSMITTANCE_WESL,
-                )],
-                "package::shadow_transmittance",
-                &[("skinned", false)],
-            ),
+            &crate::builtin::linked("package::shadow_transmittance", &[("skinned", false)]),
         );
 
         let layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

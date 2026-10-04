@@ -364,10 +364,7 @@ impl SkinnedMaterial2d {
 
         let shader = ctxt.create_shader_module(
             Some("skinned2d_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::skinned2d",
-                include_str!("skinned2d.wgsl"),
-            ),
+            &crate::builtin::linked("package::skinned2d", &[]),
         );
 
         let build = Rc::new(move |sample_count: u32, cull: bool| {

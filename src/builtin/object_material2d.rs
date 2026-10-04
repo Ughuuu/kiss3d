@@ -46,21 +46,13 @@ impl ShaderFeatures2d {
     }
 }
 
-/// Compiles `object2d.wgsl` to specialized WGSL for `features` via WESL conditional
-/// translation; dead-code elimination then strips the unused paths and bindings.
-fn compile_object2d_wgsl(features: ShaderFeatures2d) -> String {
+/// The `object2d.wgsl` variant `build.rs` linked for `features`.
+fn compile_object2d_wgsl(features: ShaderFeatures2d) -> &'static str {
     let feats: Vec<(&str, bool)> = ShaderFeatures2d::TABLE
         .iter()
         .map(|(name, bit)| (*name, features.has(*bit)))
         .collect();
-    crate::builtin::compile_wesl(
-        &[
-            ("package::object2d", include_str!("object2d.wgsl")),
-            ("package::common", crate::builtin::COMMON_WESL),
-        ],
-        "package::object2d",
-        &feats,
-    )
+    crate::builtin::linked("package::object2d", &feats)
 }
 
 /// Frame-level uniforms (view, projection) for 2D rendering.
@@ -525,10 +517,7 @@ impl ObjectMaterial2d {
         // Load wireframe shader
         let wireframe_shader = ctxt.create_shader_module(
             Some("planar_wireframe_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::wireframe_polyline2d",
-                include_str!("wireframe_polyline2d.wgsl"),
-            ),
+            &crate::builtin::linked("package::wireframe_polyline2d", &[]),
         );
 
         // Wireframe pipeline, built lazily per MSAA sample count.
@@ -689,10 +678,7 @@ impl ObjectMaterial2d {
         // Load points shader
         let points_shader = ctxt.create_shader_module(
             Some("planar_points_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::wireframe_points2d",
-                include_str!("wireframe_points2d.wgsl"),
-            ),
+            &crate::builtin::linked("package::wireframe_points2d", &[]),
         );
 
         // Points pipeline, built lazily per MSAA sample count.

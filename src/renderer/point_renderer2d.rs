@@ -88,10 +88,7 @@ impl PointRenderer2d {
         // Load shader
         let shader = ctxt.create_shader_module(
             Some("planar_point_renderer_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::points2d",
-                include_str!("../builtin/points2d.wgsl"),
-            ),
+            &crate::builtin::linked("package::points2d", &[]),
         );
 
         // No vertex buffers - using storage buffer and vertex_index. Built lazily per

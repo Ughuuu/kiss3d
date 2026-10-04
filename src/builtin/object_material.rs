@@ -620,6 +620,7 @@ type SurfacePipelineBuilder = Rc<
     dyn Fn(
         &wgpu::PipelineLayout,
         &wgpu::ShaderModule,
+        &[(&str, f64)],
         bool,
         Option<wgpu::Face>,
         bool,
@@ -664,12 +665,11 @@ struct DefaultShadowResources {
     _transmittance_sampler: wgpu::Sampler,
 }
 
-/// Conditional-compilation features for the object shader. Each bit maps to a WESL
-/// `@if(...)` feature flag in `default.wgsl`; a per-object/per-frame mask selects a
-/// specialized shader variant so the features an object/frame doesn't use — and the
-/// registers and bindings they need — are stripped out entirely. The vertex/binding
-/// layout is identical across variants (unused bindings simply strip away), so all
-/// variants share the same pipeline layout and bind groups. See `compile_object_wgsl`.
+/// Features of the object shader. The three in [`Self::LAYOUT`] change what
+/// `default.wgsl` declares, so each set of them is a module `build.rs` linked
+/// with `@if`; every other bit is an `override has_<name>` constant a pipeline
+/// sets, so a feature an object or frame doesn't use is a branch the backend
+/// folds away. All variants share the same pipeline layout and bind groups.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub(crate) struct ShaderFeatures(u32);
 
@@ -696,8 +696,8 @@ impl ShaderFeatures {
     // Per-mesh geometry.
     const VERTEX_COLORS: u32 = 1 << 16;
 
-    /// `(WESL feature name, bit)` — names MUST match the `@if(...)` flags in
-    /// `default.wgsl`.
+    /// `(feature name, bit)`: a layout flag's `@if` name in `default.wgsl`,
+    /// and `has_<name>` for an `override`.
     const TABLE: [(&'static str, u32); 17] = [
         ("deform", Self::DEFORM),
         ("clustered", Self::CLUSTERED),
@@ -717,6 +717,24 @@ impl ShaderFeatures {
         ("reflector", Self::REFLECTOR),
         ("vertex_colors", Self::VERTEX_COLORS),
     ];
+
+    /// The flags that change what the shader declares, and so pick its module.
+    const LAYOUT: u32 = Self::DEFORM | Self::CLUSTERED | Self::VERTEX_COLORS;
+
+    /// The `override` constants a pipeline sets: `has_<name>` for every flag
+    /// outside [`Self::LAYOUT`].
+    fn constants(self) -> Vec<(String, f64)> {
+        Self::TABLE
+            .iter()
+            .filter(|(_, bit)| bit & Self::LAYOUT == 0)
+            .map(|(name, bit)| {
+                (
+                    format!("has_{name}"),
+                    if self.has(*bit) { 1.0 } else { 0.0 },
+                )
+            })
+            .collect()
+    }
 
     #[inline]
     fn has(self, bit: u32) -> bool {
@@ -742,23 +760,15 @@ impl ShaderFeatures {
     }
 }
 
-/// Compiles `default.wgsl` to specialized WGSL for `features`, via WESL conditional
-/// translation. Dead-code elimination (WESL "strip") then removes the now-unreachable
-/// helpers and their bindings, so the output is both leaner (fewer live registers →
-/// higher GPU occupancy) and, on the non-`clustered`/non-`deform` variants, free of
-/// storage bindings (WebGL2-safe).
-fn compile_object_wgsl(features: ShaderFeatures) -> String {
-    let feats: Vec<(&str, bool)> = ShaderFeatures::TABLE
-        .iter()
-        .map(|(name, bit)| (*name, features.has(*bit)))
-        .collect();
-    crate::builtin::compile_wesl(
-        &[
-            ("package::default", include_str!("default.wgsl")),
-            ("package::pbr_env", crate::builtin::PBR_ENV_WESL),
-        ],
+/// The object shader `build.rs` linked for `features`' layout flags.
+fn compile_object_wgsl(features: ShaderFeatures) -> &'static str {
+    crate::builtin::linked(
         "package::default",
-        &feats,
+        &[
+            ("clustered", features.has(ShaderFeatures::CLUSTERED)),
+            ("deform", features.has(ShaderFeatures::DEFORM)),
+            ("vertex_colors", features.has(ShaderFeatures::VERTEX_COLORS)),
+        ],
     )
 }
 
@@ -1287,6 +1297,7 @@ impl ObjectMaterial {
         let build_opaque = std::rc::Rc::new(
             |layout: &wgpu::PipelineLayout,
              shader: &wgpu::ShaderModule,
+             constants: &[(&str, f64)],
              vertex_colors: bool,
              cull_mode: Option<wgpu::Face>,
              depth_test: bool,
@@ -1316,7 +1327,10 @@ impl ObjectMaterial {
                             blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                             write_mask: wgpu::ColorWrites::ALL,
                         })],
-                        compilation_options: Default::default(),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants,
+                            ..Default::default()
+                        },
                     }),
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1348,6 +1362,7 @@ impl ObjectMaterial {
         let build_oit = std::rc::Rc::new(
             |layout: &wgpu::PipelineLayout,
              shader: &wgpu::ShaderModule,
+             constants: &[(&str, f64)],
              vertex_colors: bool,
              cull_mode: Option<wgpu::Face>,
              depth_test: bool,
@@ -1404,7 +1419,10 @@ impl ObjectMaterial {
                                 write_mask: wgpu::ColorWrites::RED,
                             }),
                         ],
-                        compilation_options: Default::default(),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants,
+                            ..Default::default()
+                        },
                     }),
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
@@ -2190,20 +2208,20 @@ impl ObjectMaterial {
         }
     }
 
-    /// Returns the WESL-compiled, specialized shader module for `features`, compiling
-    /// and caching it on first use. The vertex/binding layout is identical across
-    /// variants — unused bindings simply strip away — so every module is compatible
-    /// with the shared pipeline layouts.
+    /// Returns the shader module for `features`' layout flags, creating and
+    /// caching it on first use. Every module is compatible with the shared
+    /// pipeline layouts; the other flags are constants of the pipeline.
     fn shader_module(&self, features: ShaderFeatures) -> Rc<wgpu::ShaderModule> {
-        if let Some(m) = self.shader_modules.borrow().get(&features) {
+        let layout = ShaderFeatures(features.0 & ShaderFeatures::LAYOUT);
+        if let Some(m) = self.shader_modules.borrow().get(&layout) {
             return m.clone();
         }
-        let wgsl = compile_object_wgsl(features);
+        let wgsl = compile_object_wgsl(layout);
         let module =
-            Rc::new(Context::get().create_shader_module(Some("object_material_shader"), &wgsl));
+            Rc::new(Context::get().create_shader_module(Some("object_material_shader"), wgsl));
         self.shader_modules
             .borrow_mut()
-            .insert(features, module.clone());
+            .insert(layout, module.clone());
         module
     }
 
@@ -2233,10 +2251,13 @@ impl ObjectMaterial {
         // The prepass reaches here with its features already collapsed by
         // `prepass_key`, so it never asks for the colour slot.
         let vertex_colors = features.has(ShaderFeatures::VERTEX_COLORS);
+        let owned = features.constants();
+        let constants: Vec<(&str, f64)> = owned.iter().map(|(n, v)| (n.as_str(), *v)).collect();
         let pipeline = match kind {
             PipelineKind::OpaqueCull => (self.build_opaque)(
                 layout,
                 &module,
+                &constants,
                 vertex_colors,
                 Some(wgpu::Face::Back),
                 depth_test,
@@ -2246,6 +2267,7 @@ impl ObjectMaterial {
             PipelineKind::OpaqueNoCull => (self.build_opaque)(
                 layout,
                 &module,
+                &constants,
                 vertex_colors,
                 None,
                 depth_test,
@@ -2255,6 +2277,7 @@ impl ObjectMaterial {
             PipelineKind::OitCull => (self.build_oit)(
                 layout,
                 &module,
+                &constants,
                 vertex_colors,
                 Some(wgpu::Face::Back),
                 depth_test,
@@ -2264,6 +2287,7 @@ impl ObjectMaterial {
             PipelineKind::OitNoCull => (self.build_oit)(
                 layout,
                 &module,
+                &constants,
                 vertex_colors,
                 None,
                 depth_test,

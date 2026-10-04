@@ -96,15 +96,7 @@ impl Skybox {
         // `skybox` imports the shared equirect mapping from the `pbr_env` module.
         let shader = ctxt.create_shader_module(
             Some("skybox_shader"),
-            &crate::builtin::compile_wesl(
-                &[
-                    ("package::skybox", include_str!("../builtin/skybox.wgsl")),
-                    ("package::pbr_env", crate::builtin::PBR_ENV_WESL),
-                    ("package::common", crate::builtin::COMMON_WESL),
-                ],
-                "package::skybox",
-                &[],
-            ),
+            &crate::builtin::linked("package::skybox", &[]),
         );
 
         // Built lazily per MSAA sample count to match the HDR scene attachment.
