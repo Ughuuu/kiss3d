@@ -1669,6 +1669,7 @@ impl WgpuCanvas {
                     current_size.width,
                     current_size.height,
                     self.sample_count,
+                    self.depth_readable,
                 );
                 self.depth_texture = new_depth;
                 self.depth_view = new_depth_view;
