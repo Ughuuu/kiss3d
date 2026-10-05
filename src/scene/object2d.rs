@@ -45,7 +45,7 @@ pub enum Blend2d {
 impl Blend2d {
     /// The wgpu blend state realizing this mode for a straight-(non-premultiplied)
     /// color target, or `None` for [`Blend2d::Opaque`] (blending disabled).
-    pub(crate) fn blend_state(self) -> Option<wgpu::BlendState> {
+    pub fn blend_state(self) -> Option<wgpu::BlendState> {
         use wgpu::{BlendComponent, BlendFactor, BlendOperation, BlendState};
         let alpha_over = BlendComponent {
             src_factor: BlendFactor::One,
@@ -158,7 +158,8 @@ impl ObjectData2d {
         self.draw_surface
     }
 
-    /// Whether this object uses backface culling or not.
+    /// Whether this object's surface skips its back faces. Defaults to `false`;
+    /// see [`Object2d::enable_backface_culling`].
     #[inline]
     pub fn backface_culling_enabled(&self) -> bool {
         self.cull
@@ -400,7 +401,7 @@ impl Object2d {
             lines_use_perspective: true,
             points_use_perspective: true,
             draw_surface: true,
-            cull: true,
+            cull: false,
             blend: Blend2d::default(),
             normal_map: None,
             lit_params: None,
@@ -607,7 +608,10 @@ impl Object2d {
         &mut self.data
     }
 
-    /// Enables or disables backface culling for this object.
+    /// Enables or disables backface culling for this object's surface. A front
+    /// face winds counter-clockwise on screen, as every built-in shape does under
+    /// a y-up camera; a mirroring scale or a y-down camera turns its back to the
+    /// viewer. Defaults to `false`: both faces draw, as a flipped sprite needs.
     #[inline]
     pub fn enable_backface_culling(&mut self, active: bool) {
         self.data.cull = active;
@@ -881,5 +885,64 @@ impl Object2d {
     #[inline]
     pub fn set_texture(&mut self, texture: Arc<Texture>) {
         self.data.texture = texture
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::camera::{CoordinateSystem2d, FixedView2d};
+    use crate::color::Color;
+    use crate::light2d::Light2dManager;
+    use crate::scene::{Border, SceneNode2d, SpriteSheet, Tilemap};
+    use crate::test_gpu::{luma_at, on_gpu};
+    use glamx::Vec2;
+
+    #[test]
+    fn culling_drops_only_a_mirrored_2d_surface() {
+        on_gpu(64, 64, async |surface| {
+            Light2dManager::get_global_manager(|m| m.set_ambient(Color::new(1.0, 1.0, 1.0, 1.0)));
+            let mut camera = FixedView2d::new(CoordinateSystem2d::default(), false);
+            let mut scene = SceneNode2d::empty();
+            let mut shapes = [
+                scene.add_rectangle(40.0, 40.0),
+                scene.add_lit_sprite(40.0, 40.0),
+                scene.add_nine_slice(
+                    Vec2::new(40.0, 40.0),
+                    Border::uniform(8.0),
+                    Border::uniform(0.25),
+                ),
+                scene.add_circle(20.0),
+                {
+                    let mut map = Tilemap::new(1, 1, Vec2::new(40.0, 40.0), SpriteSheet::new(1, 1));
+                    map.set_tile(0, 0, 0);
+                    let node = map.node();
+                    scene.add_child(node.clone());
+                    node
+                },
+            ];
+            for shape in &mut shapes {
+                shape.set_visible(false);
+            }
+            for shape in &mut shapes {
+                shape.set_visible(true);
+                let scale = shape.local_scale();
+                assert!(!shape.data().get_object().data().backface_culling_enabled());
+                surface.render_2d(&mut scene, &mut camera).await;
+                assert!(luma_at(surface, 32, 32) > 0.5);
+
+                shape.enable_backface_culling(true);
+                surface.render_2d(&mut scene, &mut camera).await;
+                assert!(luma_at(surface, 32, 32) > 0.5);
+
+                shape.set_local_scale(-scale.x, scale.y);
+                surface.render_2d(&mut scene, &mut camera).await;
+                assert!(luma_at(surface, 32, 32) < 0.1);
+
+                shape.enable_backface_culling(false);
+                surface.render_2d(&mut scene, &mut camera).await;
+                assert!(luma_at(surface, 32, 32) > 0.5);
+                shape.set_visible(false);
+            }
+        });
     }
 }

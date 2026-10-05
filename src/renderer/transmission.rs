@@ -99,10 +99,7 @@ impl Transmission {
         // smooth instead of blocky when magnified across rough glass.
         let downsample_shader = ctxt.create_shader_module(
             Some("transmission_downsample"),
-            &crate::builtin::compile_shader_with_common(
-                "package::transmission_downsample",
-                include_str!("../builtin/transmission_downsample.wgsl"),
-            ),
+            &crate::builtin::linked("package::transmission_downsample", &[]),
         );
         let downsample_layout = ctxt.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("transmission_downsample_layout"),

@@ -28,8 +28,8 @@ pub const OIT_ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Flo
 /// Weighted-blended OIT revealage target (product of `1 - alpha`).
 pub const OIT_REVEAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
 
-/// Number of mip levels in the bloom chain (each half the previous resolution).
-const BLOOM_MIPS: u32 = 5;
+/// The most levels [`HdrSettings::bloom_mips`] takes.
+pub const MAX_BLOOM_MIPS: u32 = 12;
 
 /// Tonemapping operator applied during the HDR resolve pass.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -113,6 +113,9 @@ pub struct HdrSettings {
     pub bloom_knee: f32,
     /// Additive intensity of the bloom contribution.
     pub bloom_intensity: f32,
+    /// Levels in the bloom chain, each half the previous resolution, clamped to
+    /// `1..=MAX_BLOOM_MIPS`. More levels spread the glow wider. Default 5.
+    pub bloom_mips: u32,
     /// Artistic color grading applied before the tonemap operator.
     pub color_grading: ColorGrading,
     /// When enabled, the exposure is computed automatically from the scene's
@@ -138,6 +141,7 @@ impl Default for HdrSettings {
             bloom_threshold: 1.0,
             bloom_knee: 0.5,
             bloom_intensity: 0.04,
+            bloom_mips: 5,
             color_grading: ColorGrading::default(),
             auto_exposure: false,
             auto_exposure_speed: 3.0,
@@ -236,10 +240,7 @@ fn build_bloom(bloom_layout: &wgpu::BindGroupLayout) -> BloomPipelines {
 
     let bloom_shader = ctxt.create_shader_module(
         Some("hdr_bloom_shader"),
-        &crate::builtin::compile_shader_with_common(
-            "package::hdr_bloom",
-            include_str!("../builtin/hdr_bloom.wgsl"),
-        ),
+        &crate::builtin::linked("package::hdr_bloom", &[]),
     );
 
     let bloom_pipeline_layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -332,10 +333,7 @@ fn build_exposure(
     let ctxt = Context::get();
     let meter_shader = ctxt.create_shader_module(
         Some("hdr_autoexposure_meter"),
-        &crate::builtin::compile_shader_with_common(
-            "package::auto_exposure_meter",
-            include_str!("../builtin/auto_exposure_meter.wgsl"),
-        ),
+        &crate::builtin::linked("package::auto_exposure_meter", &[]),
     );
     let make_1x1_pipeline =
         |label: &str, layout: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule| {
@@ -386,10 +384,7 @@ fn build_exposure(
 
     let adapt_shader = ctxt.create_shader_module(
         Some("hdr_autoexposure_adapt"),
-        &crate::builtin::compile_shader_with_common(
-            "package::auto_exposure_adapt",
-            include_str!("../builtin/auto_exposure_adapt.wgsl"),
-        ),
+        &crate::builtin::linked("package::auto_exposure_adapt", &[]),
     );
     let adapt = make_1x1_pipeline("hdr_autoexposure_adapt", adapt_layout, &adapt_shader);
     ExposurePipelines { meter, adapt }
@@ -636,18 +631,7 @@ impl HdrPipeline {
 
         // `hdr_tonemap` imports the shared `apply_tonemap` from the `tonemap_ops`
         // WESL module (composed here instead of source concatenation).
-        let tonemap_wgsl = crate::builtin::compile_wesl(
-            &[
-                ("package::tonemap_ops", crate::builtin::TONEMAP_OPS_WESL),
-                (
-                    "package::hdr_tonemap",
-                    include_str!("../builtin/hdr_tonemap.wgsl"),
-                ),
-                ("package::common", crate::builtin::COMMON_WESL),
-            ],
-            "package::hdr_tonemap",
-            &[],
-        );
+        let tonemap_wgsl = crate::builtin::linked("package::hdr_tonemap", &[]);
         let tonemap_shader = ctxt.create_shader_module(Some("hdr_tonemap_shader"), &tonemap_wgsl);
 
         let tonemap_pipeline_layout =
@@ -851,10 +835,11 @@ impl HdrPipeline {
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         );
 
-        let targets = Self::create_targets(width, height, sample_count);
+        let settings = HdrSettings::default();
+        let targets = Self::create_targets(width, height, sample_count, settings.bloom_mips);
 
         HdrPipeline {
-            settings: HdrSettings::default(),
+            settings,
             width,
             height,
             sample_count,
@@ -1023,7 +1008,7 @@ impl HdrPipeline {
     }
 
     /// (Re)creates the HDR scene target and bloom chain textures.
-    fn create_targets(width: u32, height: u32, sample_count: u32) -> HdrTargets {
+    fn create_targets(width: u32, height: u32, sample_count: u32, bloom_mips: u32) -> HdrTargets {
         let ctxt = Context::get();
         let width = width.max(1);
         let height = height.max(1);
@@ -1072,37 +1057,7 @@ impl HdrPipeline {
             (None, None)
         };
 
-        // Bloom mip chain: each level is half the previous resolution.
-        let mut bloom_mips = Vec::with_capacity(BLOOM_MIPS as usize);
-        let mut mw = width;
-        let mut mh = height;
-        for i in 0..BLOOM_MIPS {
-            mw = (mw / 2).max(1);
-            mh = (mh / 2).max(1);
-            let tex = ctxt.create_texture(&wgpu::TextureDescriptor {
-                label: Some("hdr_bloom_mip"),
-                size: wgpu::Extent3d {
-                    width: mw,
-                    height: mh,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: HDR_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-            bloom_mips.push(BloomMip {
-                _texture: tex,
-                view,
-                width: mw,
-                height: mh,
-            });
-            let _ = i;
-        }
+        let bloom_mips = Self::create_bloom_mips(width, height, bloom_mips);
 
         // Weighted-blended OIT targets. The single-sample copies are always present
         // (the composite samples them); under MSAA they double as the geometry pass's
@@ -1164,6 +1119,43 @@ impl HdrPipeline {
         }
     }
 
+    /// The bloom chain: `count` (clamped to `1..=MAX_BLOOM_MIPS`) levels, each half
+    /// the previous resolution, the first half of `width × height`.
+    fn create_bloom_mips(width: u32, height: u32, count: u32) -> Vec<BloomMip> {
+        let ctxt = Context::get();
+        let count = count.clamp(1, MAX_BLOOM_MIPS);
+        let mut bloom_mips = Vec::with_capacity(count as usize);
+        let mut mw = width;
+        let mut mh = height;
+        for _ in 0..count {
+            mw = (mw / 2).max(1);
+            mh = (mh / 2).max(1);
+            let tex = ctxt.create_texture(&wgpu::TextureDescriptor {
+                label: Some("hdr_bloom_mip"),
+                size: wgpu::Extent3d {
+                    width: mw,
+                    height: mh,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: HDR_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            bloom_mips.push(BloomMip {
+                _texture: tex,
+                view,
+                width: mw,
+                height: mh,
+            });
+        }
+        bloom_mips
+    }
+
     /// Resizes the HDR resources if the size or sample count changed.
     pub fn resize(&mut self, width: u32, height: u32, sample_count: u32) {
         let width = width.max(1);
@@ -1178,7 +1170,7 @@ impl HdrPipeline {
             self.oit_composite_pipeline =
                 Self::create_oit_composite_pipeline(&self.oit_layout, sample_count);
         }
-        let targets = Self::create_targets(width, height, sample_count);
+        let targets = Self::create_targets(width, height, sample_count, self.settings.bloom_mips);
         self.scene_texture = targets.scene_texture;
         self.scene_view = targets.scene_view;
         self._scene_msaa_texture = targets.scene_msaa_texture;
@@ -1641,6 +1633,10 @@ impl HdrPipeline {
 
         let bloom_enabled = self.settings.bloom_enabled && self.settings.bloom_intensity > 0.0;
         if bloom_enabled {
+            let levels = self.settings.bloom_mips.clamp(1, MAX_BLOOM_MIPS) as usize;
+            if self.bloom_mips.len() != levels {
+                self.bloom_mips = Self::create_bloom_mips(self.width, self.height, levels as u32);
+            }
             self.run_bloom(encoder, input, gpu);
         }
 
@@ -1745,5 +1741,37 @@ impl HdrPipeline {
         pass.set_bind_group(0, &bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.draw(0..4, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::camera::OrbitCamera3d;
+    use crate::color::Color;
+    use crate::scene::SceneNode3d;
+    use crate::test_gpu::{luma_at, on_gpu};
+    use glamx::Vec3;
+
+    #[test]
+    fn more_bloom_levels_spread_the_glow_further() {
+        on_gpu(128, 128, async |surface| {
+            let mut scene = SceneNode3d::empty();
+            scene
+                .add_sphere(0.3)
+                .set_emissive(Color::new(40.0, 40.0, 40.0, 1.0));
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+            assert_eq!(surface.window().hdr_settings().bloom_mips, 5);
+            surface.set_bloom_enabled(true);
+            surface.set_bloom(1.0, 0.5);
+
+            surface.window_mut().hdr_settings_mut().bloom_mips = 1;
+            surface.render_3d(&mut scene, &mut camera).await;
+            let narrow = luma_at(surface, 64, 16);
+
+            surface.window_mut().hdr_settings_mut().bloom_mips = 8;
+            surface.render_3d(&mut scene, &mut camera).await;
+            let wide = luma_at(surface, 64, 16);
+            assert!(wide > narrow + 0.01, "{} {}", narrow, wide);
+        });
     }
 }

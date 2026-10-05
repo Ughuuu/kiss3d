@@ -131,6 +131,11 @@ impl Canvas {
         self.canvas.depth_view()
     }
 
+    /// Make the depth buffer one an effect can read, or stop.
+    pub(crate) fn set_depth_readable(&mut self, readable: bool) {
+        self.canvas.set_depth_readable(readable)
+    }
+
     /// Gets the MSAA texture view if MSAA is enabled.
     pub fn msaa_view(&self) -> Option<&wgpu::TextureView> {
         self.canvas.msaa_view()

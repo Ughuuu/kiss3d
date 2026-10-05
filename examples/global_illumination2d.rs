@@ -159,7 +159,6 @@ async fn main() {
         gi.set_cascade_count(cascade_levels);
         gi.set_cascade_base_directions(base_directions);
 
-        gi.set_camera(&camera);
         if !window
             .render_2d_with(&mut scene, &mut camera, &mut gi)
             .await

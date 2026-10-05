@@ -46,7 +46,6 @@ async fn main() {
 
     let mut t = 0.0f32;
     while {
-        gi.set_camera(&camera);
         let mut chain: [&mut dyn PostProcessingEffect; 2] = [&mut gi, &mut crt];
         window
             .render_2d_with_chain(&mut scene, &mut camera, &mut chain)

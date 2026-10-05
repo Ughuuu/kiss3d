@@ -28,6 +28,8 @@ struct ModelUniforms {
     transform: mat4x4<f32>,
     scale: mat3x3<f32>,
     color: vec4<f32>,
+    // x: the alpha cutoff of a `Mask` caster, 0 otherwise.
+    params: vec4<f32>,
 }
 
 @group(1) @binding(0)
@@ -39,7 +41,7 @@ var<uniform> model: ModelUniforms;
     num_vertices: u32,
     has_skin: u32,
     has_morph_normals: u32,
-    weights: array<vec4<f32>, 16>,
+    weights: array<vec4<f32>, 64>,
 }
 @if(skinned) @group(2) @binding(0) var<storage, read> joint_palette: array<mat4x4<f32>>;
 @if(skinned) @group(2) @binding(1) var<storage, read> skin_joints: array<vec4<u32>>;
@@ -155,4 +157,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let a = model.color.a;
     let t = vec3<f32>(1.0) - a * (vec3<f32>(1.0) - albedo);
     return vec4<f32>(t, 1.0);
+}
+
+// Depth-only cutout for an alpha-masked (`Mask`) caster in the shadow depth pass:
+// texels whose alpha falls below the cutoff cast no shadow, as they draw nothing.
+@fragment
+fn fs_alpha_test(in: VertexOutput) {
+    let alpha = model.color.a * textureSample(t_albedo, s_albedo, in.uv).a;
+    if (alpha < model.params.x) {
+        discard;
+    }
 }

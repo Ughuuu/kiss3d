@@ -98,6 +98,7 @@ Thanks to all the Rustaceans for their help, and their OpenGL bindings.
 #[macro_use]
 extern crate bitflags;
 extern crate num_traits as num;
+#[cfg(feature = "text")]
 extern crate rusttype;
 #[cfg(feature = "serde")]
 extern crate serde;
@@ -144,11 +145,14 @@ pub mod procedural;
 pub mod renderer;
 pub mod resource;
 pub mod scene;
+#[cfg(feature = "text")]
 pub mod text;
 pub mod window;
 
 #[cfg(test)]
 mod shader_validity;
+#[cfg(test)]
+mod test_gpu;
 
 pub mod prelude {
     pub use crate::builtin::*;
@@ -162,6 +166,7 @@ pub mod prelude {
     pub use crate::renderer::*;
     pub use crate::resource::*;
     pub use crate::scene::*;
+    #[cfg(feature = "text")]
     pub use crate::text::*;
     pub use crate::window::*;
     pub use glamx::{

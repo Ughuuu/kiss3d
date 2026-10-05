@@ -172,8 +172,9 @@ fn build_mesh_data(
             uvs.push(Vec2::new(uv_max.x, uv_max.y));
             uvs.push(Vec2::new(uv_min.x, uv_max.y));
 
-            faces.push([base, base + 1, base + 2]);
-            faces.push([base, base + 2, base + 3]);
+            // Counter-clockwise, the front a culled 2D surface keeps.
+            faces.push([base, base + 2, base + 1]);
+            faces.push([base, base + 3, base + 2]);
         }
     }
 

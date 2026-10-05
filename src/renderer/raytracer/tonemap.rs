@@ -96,17 +96,7 @@ impl Tonemap {
 
         // The RT tonemap pass imports the shared `apply_tonemap` from the
         // `tonemap_ops` WESL module (composed here instead of source concatenation).
-        let shader_wgsl = crate::builtin::compile_wesl(
-            &[
-                ("package::tonemap_ops", crate::builtin::TONEMAP_OPS_WESL),
-                (
-                    "package::rt_tonemap",
-                    include_str!("../../builtin/raytrace/tonemap.wgsl"),
-                ),
-            ],
-            "package::rt_tonemap",
-            &[],
-        );
+        let shader_wgsl = crate::builtin::linked("package::rt_tonemap", &[]);
         let shader = ctxt.create_shader_module(Some("rt_tonemap_shader"), &shader_wgsl);
 
         let vertex_buffer_layout = wgpu::VertexBufferLayout {

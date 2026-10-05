@@ -288,6 +288,8 @@ impl GpuData for SkinnedMaterial2dGpuData {
 
 struct SkinnedMaterial2d {
     pipeline: PipelineCache,
+    /// The pipeline of a mesh with backface culling on.
+    pipeline_cull: PipelineCache,
     frame_bind_group: wgpu::BindGroup,
     frame_uniform_buffer: wgpu::Buffer,
     object_bind_group_layout: wgpu::BindGroupLayout,
@@ -362,13 +364,10 @@ impl SkinnedMaterial2d {
 
         let shader = ctxt.create_shader_module(
             Some("skinned2d_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::skinned2d",
-                include_str!("skinned2d.wgsl"),
-            ),
+            &crate::builtin::linked("package::skinned2d", &[]),
         );
 
-        let pipeline = PipelineCache::new(move |sample_count| {
+        let build = Rc::new(move |sample_count: u32, cull: bool| {
             let ctxt = Context::get();
             let vertex_layouts = [
                 Some(wgpu::VertexBufferLayout {
@@ -432,7 +431,7 @@ impl SkinnedMaterial2d {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     strip_index_format: None,
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
+                    cull_mode: cull.then_some(wgpu::Face::Back),
                     polygon_mode: wgpu::PolygonMode::Fill,
                     unclipped_depth: false,
                     conservative: false,
@@ -443,6 +442,12 @@ impl SkinnedMaterial2d {
                 cache: None,
             })
         });
+
+        let pipeline = {
+            let build = build.clone();
+            PipelineCache::new(move |sample_count| build(sample_count, false))
+        };
+        let pipeline_cull = PipelineCache::new(move |sample_count| build(sample_count, true));
 
         let frame_uniform_buffer = ctxt.create_buffer(&wgpu::BufferDescriptor {
             label: Some("skinned2d_frame_uniform"),
@@ -461,6 +466,7 @@ impl SkinnedMaterial2d {
 
         SkinnedMaterial2d {
             pipeline,
+            pipeline_cull,
             frame_bind_group,
             frame_uniform_buffer,
             object_bind_group_layout,
@@ -541,7 +547,7 @@ impl Material2d for SkinnedMaterial2d {
         _transform: Pose2,
         _scale: Vec2,
         _camera: &mut dyn Camera2d,
-        _data: &ObjectData2d,
+        data: &ObjectData2d,
         _mesh: &mut GpuMesh2d,
         _instances: &mut InstancesBuffer2d,
         gpu_data: &mut dyn GpuData,
@@ -561,7 +567,12 @@ impl Material2d for SkinnedMaterial2d {
             None => return,
         };
 
-        let pipeline = self.pipeline.get(context.sample_count);
+        let pipeline = if data.backface_culling_enabled() {
+            &self.pipeline_cull
+        } else {
+            &self.pipeline
+        }
+        .get(context.sample_count);
         render_pass.set_pipeline(&pipeline);
         render_pass.set_bind_group(0, &self.frame_bind_group, &[]);
         render_pass.set_bind_group(1, object_bind_group, &[]);

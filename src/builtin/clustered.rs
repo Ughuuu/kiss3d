@@ -1,7 +1,8 @@
 //! Clustered (forward+) lighting.
 //!
-//! The view frustum is divided into a fixed 3D grid of clusters
-//! ([`GRID_X`] × [`GRID_Y`] × [`GRID_Z`]). A compute pass builds each cluster's
+//! The view frustum is divided into a 3D grid of clusters
+//! ([`DEFAULT_GRID`] unless [`Window::set_cluster_grid`](crate::window::Window::set_cluster_grid)
+//! says otherwise). A compute pass builds each cluster's
 //! view-space AABB (only when the projection or viewport changes), and a second
 //! compute pass culls the scene's "clustered" lights into the clusters they touch,
 //! writing a per-cluster `(offset, count)` slice into a global light-index list.
@@ -29,19 +30,14 @@ use glamx::Mat4;
 const BUILD_SRC: &str = include_str!("clustered_build.wgsl");
 const CULL_SRC: &str = include_str!("clustered_cull.wgsl");
 
-/// Number of clusters along the screen X axis.
-pub const GRID_X: u32 = 16;
-/// Number of clusters along the screen Y axis.
-pub const GRID_Y: u32 = 9;
-/// Number of depth slices (clusters along the view Z axis).
-pub const GRID_Z: u32 = 24;
-/// Total number of clusters in the grid.
-pub const NUM_CLUSTERS: u32 = GRID_X * GRID_Y * GRID_Z;
-/// Maximum lights recorded per cluster (the per-cluster index list is clamped to
-/// this; lights beyond it in a very dense cluster are dropped).
-pub const MAX_LIGHTS_PER_CLUSTER: u32 = 256;
-/// Length (in `u32`s) of the global light-index list.
-pub const INDEX_LIST_LEN: u32 = NUM_CLUSTERS * MAX_LIGHTS_PER_CLUSTER;
+/// The cluster grid a window starts with: clusters along screen X, screen Y and
+/// view depth.
+pub const DEFAULT_GRID: [u32; 3] = [16, 9, 24];
+/// The lights a cluster records by default; lights past it in a very dense cluster
+/// are dropped.
+pub const DEFAULT_MAX_LIGHTS_PER_CLUSTER: u32 = 256;
+/// The most clusters along any one axis of the grid.
+pub const MAX_GRID_AXIS: u32 = 128;
 
 /// Uniforms shared by the cluster-build and light-cull compute passes.
 ///
@@ -72,8 +68,12 @@ pub(crate) struct Clustered {
     /// Per-cluster `(offset, count)` into `light_index_list`, written by cull.
     cluster_grid: wgpu::Buffer,
     /// Global light-index list, written by cull, read by the fragment shader.
-    /// Each cluster owns a fixed `MAX_LIGHTS_PER_CLUSTER` slice at `cluster * stride`.
+    /// Each cluster owns a fixed `max_lights_per_cluster` slice at `cluster * stride`.
     light_index_list: wgpu::Buffer,
+    /// Clusters along screen X, screen Y and view depth.
+    grid: [u32; 3],
+    /// Lights a cluster records.
+    max_lights_per_cluster: u32,
     /// Compute-pass uniforms.
     uniforms: wgpu::Buffer,
     /// Cached key gating AABB rebuilds: (projection hash, width, height).
@@ -90,26 +90,14 @@ pub(crate) struct Clustered {
 }
 
 impl Clustered {
-    /// Creates the clustered-lighting resources for the given viewport.
-    pub(crate) fn new(width: u32, height: u32) -> Clustered {
+    /// Creates the clustered-lighting resources for the given viewport and grid.
+    pub(crate) fn new(width: u32, height: u32, grid: [u32; 3], max_per_cluster: u32) -> Clustered {
         let ctxt = Context::get();
 
+        let (grid, max_lights_per_cluster) = fit_grid(&ctxt, grid, max_per_cluster);
         let clustered_lights = alloc_lights(&ctxt, 1);
-        let cluster_aabbs = ctxt.create_buffer_simple(
-            Some("clustered_aabbs"),
-            (NUM_CLUSTERS as u64) * 32, // ClusterAABB = 2 * vec4<f32>
-            wgpu::BufferUsages::STORAGE,
-        );
-        let cluster_grid = ctxt.create_buffer_simple(
-            Some("clustered_grid"),
-            (NUM_CLUSTERS as u64) * 8, // vec2<u32>
-            wgpu::BufferUsages::STORAGE,
-        );
-        let light_index_list = ctxt.create_buffer_simple(
-            Some("clustered_index_list"),
-            (INDEX_LIST_LEN as u64) * 4, // u32
-            wgpu::BufferUsages::STORAGE,
-        );
+        let (cluster_aabbs, cluster_grid, light_index_list) =
+            alloc_grid(&ctxt, grid, max_lights_per_cluster);
         let uniforms = ctxt.create_buffer_simple(
             Some("clustered_uniforms"),
             std::mem::size_of::<ClusterUniforms>() as u64,
@@ -154,6 +142,8 @@ impl Clustered {
             cluster_aabbs,
             cluster_grid,
             light_index_list,
+            grid,
+            max_lights_per_cluster,
             uniforms,
             aabb_key: None,
             width: width.max(1),
@@ -208,11 +198,29 @@ impl Clustered {
         true
     }
 
+    /// Reallocates the grid buffers when `grid` or `max_per_cluster` differ from
+    /// the current ones. Returns `true` when the buffer handles changed.
+    fn configure(&mut self, ctxt: &Context, grid: [u32; 3], max_per_cluster: u32) -> bool {
+        let (grid, max_per_cluster) = fit_grid(ctxt, grid, max_per_cluster);
+        if grid == self.grid && max_per_cluster == self.max_lights_per_cluster {
+            return false;
+        }
+        let (aabbs, cells, index) = alloc_grid(ctxt, grid, max_per_cluster);
+        self.cluster_aabbs = aabbs;
+        self.cluster_grid = cells;
+        self.light_index_list = index;
+        self.grid = grid;
+        self.max_lights_per_cluster = max_per_cluster;
+        self.aabb_key = None;
+        true
+    }
+
     /// Per-frame update: uploads the clustered lights, (re)builds cluster AABBs when
     /// the projection/viewport changed, and dispatches the light-culling pass.
     ///
-    /// Returns `true` if the `clustered_lights` buffer handle changed this frame (the
-    /// object material must then rebuild its frame bind group).
+    /// Returns `true` if a buffer handle changed this frame (the object material
+    /// must then rebuild its frame bind group).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -221,14 +229,17 @@ impl Clustered {
         camera: &dyn Camera3d,
         width: u32,
         height: u32,
+        (grid, max_per_cluster): ([u32; 3], u32),
         gpu: &mut crate::renderer::timings::GpuTimer,
     ) -> bool {
         let ctxt = Context::get();
         self.resize(width, height);
+        let regrid = self.configure(&ctxt, grid, max_per_cluster);
+        let [grid_x, grid_y, grid_z] = self.grid;
 
         let (_primary, clustered) = lights.split_primary_clustered();
         let num = clustered.len() as u32;
-        let realloc = self.ensure_light_capacity(&ctxt, num.max(1));
+        let realloc = self.ensure_light_capacity(&ctxt, num.max(1)) || regrid;
 
         // Upload the clustered lights (overflow point/spot lights), stamping each
         // with the shadow-metadata slot the shadow mapper assigned it this frame
@@ -251,15 +262,20 @@ impl Clustered {
         let view = view_pose.to_mat4();
         let (near, far) = camera.clip_planes();
         let tile = [
-            self.width as f32 / GRID_X as f32,
-            self.height as f32 / GRID_Y as f32,
+            self.width as f32 / grid_x as f32,
+            self.height as f32 / grid_y as f32,
         ];
         let uniforms = ClusterUniforms {
             inv_proj: proj.inverse().to_cols_array_2d(),
             view: view.to_cols_array_2d(),
-            grid: [GRID_X, GRID_Y, GRID_Z, num],
+            grid: [grid_x, grid_y, grid_z, num],
             screen: [self.width as f32, self.height as f32, tile[0], tile[1]],
-            depth: [near, far, (far / near).ln(), 0.0],
+            depth: [
+                near,
+                far,
+                (far / near).ln(),
+                self.max_lights_per_cluster as f32,
+            ],
         };
         ctxt.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -288,7 +304,7 @@ impl Clustered {
             });
             pass.set_pipeline(&self.build_pipeline);
             pass.set_bind_group(0, &group, &[]);
-            pass.dispatch_workgroups(GRID_X.div_ceil(4), GRID_Y.div_ceil(4), GRID_Z.div_ceil(4));
+            pass.dispatch_workgroups(grid_x.div_ceil(4), grid_y.div_ceil(4), grid_z.div_ceil(4));
         }
 
         // No clustered lights → leave the grid as-is; the fragment shader gates the
@@ -331,7 +347,7 @@ impl Clustered {
         });
         pass.set_pipeline(&self.cull_pipeline);
         pass.set_bind_group(0, &group, &[]);
-        pass.dispatch_workgroups(NUM_CLUSTERS.div_ceil(64), 1, 1);
+        pass.dispatch_workgroups((grid_x * grid_y * grid_z).div_ceil(64), 1, 1);
 
         realloc
     }
@@ -398,6 +414,42 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// Clamps each grid axis to `1..=MAX_GRID_AXIS` and the per-cluster light count to
+/// at least 1 and to what keeps the light-index list within the device's largest
+/// storage binding.
+fn fit_grid(ctxt: &Context, grid: [u32; 3], max_per_cluster: u32) -> ([u32; 3], u32) {
+    let grid = grid.map(|n| n.clamp(1, MAX_GRID_AXIS));
+    let clusters = (grid[0] * grid[1] * grid[2]) as u64;
+    let max_binding = ctxt.device.limits().max_storage_buffer_binding_size;
+    let fits = (max_binding / (clusters * 4)).clamp(1, u32::MAX as u64) as u32;
+    (grid, max_per_cluster.clamp(1, fits))
+}
+
+/// Allocates the per-cluster AABB, cell and light-index buffers for `grid`.
+fn alloc_grid(
+    ctxt: &Context,
+    grid: [u32; 3],
+    max_per_cluster: u32,
+) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+    let clusters = (grid[0] * grid[1] * grid[2]) as u64;
+    let aabbs = ctxt.create_buffer_simple(
+        Some("clustered_aabbs"),
+        clusters * 32, // ClusterAABB = 2 * vec4<f32>
+        wgpu::BufferUsages::STORAGE,
+    );
+    let cells = ctxt.create_buffer_simple(
+        Some("clustered_grid"),
+        clusters * 8, // vec2<u32>
+        wgpu::BufferUsages::STORAGE,
+    );
+    let index = ctxt.create_buffer_simple(
+        Some("clustered_index_list"),
+        clusters * max_per_cluster as u64 * 4, // u32
+        wgpu::BufferUsages::STORAGE,
+    );
+    (aabbs, cells, index)
+}
+
 /// Allocates a `clustered_lights` storage buffer holding `capacity` lights.
 fn alloc_lights(ctxt: &Context, capacity: u32) -> wgpu::Buffer {
     ctxt.create_buffer_simple(
@@ -405,4 +457,53 @@ fn alloc_lights(ctxt: &Context, capacity: u32) -> wgpu::Buffer {
         (capacity as u64) * 64, // GpuLight = 64 bytes
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::camera::OrbitCamera3d;
+    use crate::color::Color;
+    use crate::context::Context;
+    use crate::light::Light;
+    use crate::scene::SceneNode3d;
+    use crate::test_gpu::{mean_luma, on_gpu};
+    use glamx::Vec3;
+
+    #[test]
+    fn a_cluster_drops_the_lights_past_its_cap() {
+        on_gpu(64, 64, async |surface| {
+            if !Context::get().supports_clustered_lighting() {
+                return;
+            }
+            let mut scene = SceneNode3d::empty();
+            scene
+                .add_cube(10.0, 0.2, 10.0)
+                .set_color(Color::new(0.8, 0.8, 0.8, 1.0));
+            for i in 0..24 {
+                let a = i as f32 * std::f32::consts::TAU / 24.0;
+                scene
+                    .add_light(
+                        Light::point(3.0)
+                            .with_intensity(1.0)
+                            .with_casts_shadows(false),
+                    )
+                    .set_position(Vec3::new(a.cos() * 2.0, 0.6, a.sin() * 2.0));
+            }
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 6.0, 6.0), Vec3::ZERO);
+            let window = surface.window_mut();
+            assert_eq!(window.cluster_grid(), [16, 9, 24]);
+            assert_eq!(window.max_lights_per_cluster(), 256);
+
+            surface.render_3d(&mut scene, &mut camera).await;
+            let all = mean_luma(surface);
+
+            let window = surface.window_mut();
+            window.set_cluster_grid([4, 4, 0]);
+            window.set_max_lights_per_cluster(1);
+            assert_eq!(window.cluster_grid(), [4, 4, 1]);
+            surface.render_3d(&mut scene, &mut camera).await;
+            let capped = mean_luma(surface);
+            assert!(all > capped + 0.01, "{} {}", all, capped);
+        });
+    }
 }

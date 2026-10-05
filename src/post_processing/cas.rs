@@ -86,10 +86,7 @@ impl Cas {
 
         let shader = ctxt.create_shader_module(
             Some("cas_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::cas",
-                include_str!("../builtin/cas.wgsl"),
-            ),
+            &crate::builtin::linked("package::cas", &[]),
         );
 
         let vertex_buffer_layout = wgpu::VertexBufferLayout {

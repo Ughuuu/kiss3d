@@ -171,10 +171,7 @@ impl Ssao {
         };
         let ssao_pipeline = make_pipeline(
             "ssao",
-            &crate::builtin::compile_shader_with_common(
-                "package::ssao",
-                include_str!("../builtin/ssao.wgsl"),
-            ),
+            &crate::builtin::linked("package::ssao", &[]),
             &ssao_layout,
         );
         let blur_pipeline = make_pipeline(
