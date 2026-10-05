@@ -2102,11 +2102,16 @@ impl WgpuCanvas {
         }
     }
 
-    /// Let the platform compose text through its input method.
+    /// Let the platform compose text through its input method. Not on Android,
+    /// where winit's switch is the on-screen keyboard itself, which
+    /// [`set_keyboard_visible`](Self::set_keyboard_visible) shows with focus.
     pub fn set_ime_allowed(&self, allowed: bool) {
+        #[cfg(not(target_os = "android"))]
         if let Some(window) = &self.window {
             window.set_ime_allowed(allowed);
         }
+        #[cfg(target_os = "android")]
+        let _ = allowed;
     }
 
     /// How many pixels of the window the on-screen keyboard covers, from the

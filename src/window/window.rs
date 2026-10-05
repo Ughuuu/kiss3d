@@ -412,7 +412,8 @@ impl Window {
         self.ime_events.borrow().clone()
     }
 
-    /// Let the platform compose text through its input method.
+    /// Let the platform compose text through its input method. On Android this
+    /// never raises the on-screen keyboard; [`Self::set_keyboard_visible`] does.
     pub fn set_ime_allowed(&self, allowed: bool) {
         self.canvas.set_ime_allowed(allowed);
     }
