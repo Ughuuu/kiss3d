@@ -407,6 +407,12 @@ impl Window {
         let color_view = self.hdr.scene_render_view().clone();
         let resolve_view = self.hdr.scene_resolve_view().cloned();
 
+        // Only a depth-reading effect samples the depth, and a multisampled depth
+        // buffer has to be built for it before the scene draws into it.
+        let reads_depth = film_processing.iter().any(|pp| pp.reads_depth())
+            || post_processing.iter().any(|pp| pp.reads_depth());
+        self.canvas.set_depth_readable(reads_depth);
+
         // The depth attachment must match the scene target's sample count. The
         // canvas depth texture is built at the canvas's sample count; a
         // single-sampled offscreen frame uses the offscreen target's depth.
@@ -1408,8 +1414,6 @@ impl Window {
         // scene alpha for snapshots and host-app embedding.
         let force_opaque = !offscreen;
 
-        let reads_depth = film_processing.iter().any(|pp| pp.reads_depth())
-            || post_processing.iter().any(|pp| pp.reads_depth());
         if reads_depth {
             let depth = if depth_view.texture().sample_count() == 1 {
                 depth_view.clone()

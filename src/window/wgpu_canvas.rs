@@ -343,6 +343,9 @@ pub struct WgpuCanvas {
     modifiers_state: ModifiersState,
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    /// Whether an effect reads the depth, which a multisampled one must then be
+    /// a texture for.
+    depth_readable: bool,
     /// Multisampling texture for MSAA (if enabled)
     msaa_texture: Option<wgpu::Texture>,
     msaa_view: Option<wgpu::TextureView>,
@@ -689,8 +692,13 @@ impl WgpuCanvas {
         surface.configure(&ctxt.device, &surface_config);
 
         // Create depth texture
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, canvas_setup.samples as u32);
+        let (depth_texture, depth_view) = Self::create_depth_texture(
+            &ctxt.device,
+            width,
+            height,
+            canvas_setup.samples as u32,
+            false,
+        );
 
         // Create MSAA texture if needed
         let sample_count = canvas_setup.samples as u32;
@@ -1026,6 +1034,7 @@ impl WgpuCanvas {
             modifiers_state: ModifiersState::default(),
             depth_texture,
             depth_view,
+            depth_readable: false,
             msaa_texture,
             msaa_view,
             sample_count,
@@ -1122,7 +1131,7 @@ impl WgpuCanvas {
         };
 
         let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, sample_count);
+            Self::create_depth_texture(&ctxt.device, width, height, sample_count, false);
         let (msaa_texture, msaa_view) = if sample_count > 1 {
             let (tex, view) = Self::create_msaa_texture(
                 &ctxt.device,
@@ -1150,6 +1159,7 @@ impl WgpuCanvas {
             modifiers_state: ModifiersState::default(),
             depth_texture,
             depth_view,
+            depth_readable: false,
             msaa_texture,
             msaa_view,
             sample_count,
@@ -1207,8 +1217,13 @@ impl WgpuCanvas {
             surface.configure(&ctxt.device, &self.surface_config);
         }
 
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, self.sample_count);
+        let (depth_texture, depth_view) = Self::create_depth_texture(
+            &ctxt.device,
+            width,
+            height,
+            self.sample_count,
+            self.depth_readable,
+        );
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
 
@@ -1226,6 +1241,27 @@ impl WgpuCanvas {
 
         // Dropped, not rebuilt: the next capture makes one at the new size.
         self.readback_texture.replace(None);
+    }
+
+    /// Make the depth buffer one an effect can read, or stop; a multisampled
+    /// one is rebuilt to match.
+    pub(crate) fn set_depth_readable(&mut self, readable: bool) {
+        if self.depth_readable == readable {
+            return;
+        }
+        self.depth_readable = readable;
+        if self.sample_count > 1 {
+            let ctxt = Context::get();
+            let (depth_texture, depth_view) = Self::create_depth_texture(
+                &ctxt.device,
+                self.surface_config.width.max(1),
+                self.surface_config.height.max(1),
+                self.sample_count,
+                readable,
+            );
+            self.depth_texture = depth_texture;
+            self.depth_view = depth_view;
+        }
     }
 
     /// Changes the MSAA sample count, recreating the size-dependent attachments
@@ -1246,8 +1282,13 @@ impl WgpuCanvas {
         let width = self.surface_config.width.max(1);
         let height = self.surface_config.height.max(1);
 
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, sample_count);
+        let (depth_texture, depth_view) = Self::create_depth_texture(
+            &ctxt.device,
+            width,
+            height,
+            sample_count,
+            self.depth_readable,
+        );
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
 
@@ -1273,8 +1314,16 @@ impl WgpuCanvas {
         width: u32,
         height: u32,
         sample_count: u32,
+        readable: bool,
     ) -> (wgpu::Texture, wgpu::TextureView) {
         let sample_count = sample_count.max(1);
+        // A multisampled depth is a texture only while an effect reads it: GLES
+        // makes it a multisampled texture then, which some drivers cannot attach.
+        let usage = if sample_count == 1 || readable {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        };
         // Ensure minimum dimensions of 1x1 to avoid wgpu validation errors
         let width = width.max(1);
         let height = height.max(1);
@@ -1289,7 +1338,7 @@ impl WgpuCanvas {
             sample_count,
             dimension: wgpu::TextureDimension::D2,
             format: Context::depth_format(),
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1570,6 +1619,7 @@ impl WgpuCanvas {
                             width,
                             height,
                             self.sample_count,
+                            self.depth_readable,
                         );
                         self.depth_texture = new_depth;
                         self.depth_view = new_depth_view;
