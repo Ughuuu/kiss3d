@@ -170,6 +170,19 @@ fn shaders() -> Vec<Shader> {
     all
 }
 
+/// The name a module-scope declaration introduces; none for a `const_assert`.
+fn declared_name(decl: &wesl::syntax::GlobalDeclaration) -> Option<String> {
+    use wesl::syntax::GlobalDeclaration as D;
+    let ident = match decl {
+        D::Declaration(d) => &d.ident,
+        D::TypeAlias(t) => &t.ident,
+        D::Struct(s) => &s.ident,
+        D::Function(f) => &f.ident,
+        _ => return None,
+    };
+    Some(ident.name().clone())
+}
+
 fn main() {
     let src = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -192,10 +205,16 @@ fn main() {
             for (name, on) in features {
                 options.features.set(*name, *on);
             }
-            let wgsl = wesl::Compiler::new_with_resolver(options, resolver)
+            let mut linked = wesl::Compiler::new_with_resolver(options, resolver)
                 .compile_module(&shader.root.parse().expect("a module path"))
-                .unwrap_or_else(|e| panic!("linking {} {:?}: {}", shader.root, features, e))
-                .to_string();
+                .unwrap_or_else(|e| panic!("linking {} {:?}: {}", shader.root, features, e));
+            // wesl adds imported modules in hash order; WGSL reads module scope in
+            // any order, and two builds of the same sources must match.
+            linked
+                .syntax
+                .global_declarations
+                .sort_by_cached_key(|decl| declared_name(decl));
+            let wgsl = linked.to_string();
             let mut name = shader.root.replace("::", "_");
             for (flag, on) in features {
                 let _ = write!(name, "__{flag}_{}", u8::from(*on));
