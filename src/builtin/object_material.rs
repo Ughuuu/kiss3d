@@ -128,7 +128,10 @@ struct FrameUniforms {
     lights: [GpuLight; MAX_LIGHTS],
     num_lights: u32,
     ambient_intensity: f32,
-    _padding: [f32; 2],
+    // The transmission background's coarsest mip: GLES cannot ask a texture how
+    // many levels it has, so the shader reads it here.
+    transmission_max_lod: f32,
+    _padding: f32,
     // Global ambient light color (rgb); a is unused.
     ambient_color: [f32; 4],
     // Distance fog color (rgb) + max fog opacity (a).
@@ -578,6 +581,8 @@ pub struct ObjectMaterial {
     cur_bg_view: wgpu::TextureView,
     /// Identity of the bound background view (`0` = fallback) to avoid rebuilds.
     bg_bound_ptr: usize,
+    /// The bound background's coarsest mip, for `FrameUniforms`.
+    bg_max_lod: f32,
     /// Packed probe records + count + max LOD, written into the frame uniform.
     probe_records: Cell<[GpuProbe; MAX_PROBES]>,
     probe_count: Cell<u32>,
@@ -1161,14 +1166,15 @@ impl ObjectMaterial {
         let ao_fallback_view =
             ao_fallback_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // 1x1x1 black fallback reflection-probe array, bound when no probes exist
-        // (the probe layout binding is always present).
+        // 1x1 black fallback reflection-probe array, bound when no probes exist
+        // (the probe layout binding is always present). Two layers: GLES picks a
+        // texture's target at creation, and a one-layer one is no array.
         let probe_fallback_texture = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("object_material_probe_fallback"),
             size: wgpu::Extent3d {
                 width: 1,
                 height: 1,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: 2,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -1184,7 +1190,7 @@ impl ObjectMaterial {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &[0u8; 8],
+            &[0u8; 16],
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(8),
@@ -1193,7 +1199,7 @@ impl ObjectMaterial {
             wgpu::Extent3d {
                 width: 1,
                 height: 1,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: 2,
             },
         );
         let probe_fallback_view =
@@ -2174,6 +2180,7 @@ impl ObjectMaterial {
             cur_bg_view: ibl_fallback_view.clone(),
             bg_sampler,
             bg_bound_ptr: 0,
+            bg_max_lod: 0.0,
             _ibl_fallback_texture: ibl_fallback_texture,
             ibl_fallback_view,
             ibl_fallback_sampler,
@@ -2704,7 +2711,8 @@ impl Material3d for ObjectMaterial {
                 lights: gpu_lights,
                 num_lights: num_primary,
                 ambient_intensity: lights.ambient,
-                _padding: [0.0; 2],
+                transmission_max_lod: self.bg_max_lod,
+                _padding: 0.0,
                 ambient_color: [
                     lights.ambient_color.r,
                     lights.ambient_color.g,
@@ -3105,12 +3113,14 @@ impl Material3d for ObjectMaterial {
             Some(view) => {
                 self.cur_bg_view = view.clone();
                 self.bg_bound_ptr = 1;
+                self.bg_max_lod = view.texture().mip_level_count().saturating_sub(1) as f32;
                 self.rebuild_frame_bind_group();
             }
             None => {
                 if self.bg_bound_ptr != 0 {
                     self.cur_bg_view = self.ibl_fallback_view.clone();
                     self.bg_bound_ptr = 0;
+                    self.bg_max_lod = 0.0;
                     self.rebuild_frame_bind_group();
                 }
             }

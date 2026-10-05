@@ -53,7 +53,9 @@ struct FrameUniforms {
     lights: array<LightData, MAX_LIGHTS>,
     num_lights: u32,
     ambient_intensity: f32,
-    _padding: vec2<f32>,
+    // The transmission background's coarsest mip; GLES has no `textureNumLevels`.
+    transmission_max_lod: f32,
+    _padding: f32,
     ambient_color: vec4<f32>,
     fog_color: vec4<f32>,
     // (mode, param_a, param_b, height_falloff): mode 0 off / 1 linear / 2 exp / 3 exp2.
@@ -1456,7 +1458,7 @@ fn shade(in: VertexOutput) -> vec4<f32> {
         // NDC delta -> UV delta (x keeps sign, y flips for the top-left texture origin).
         let uv_delta = vec2<f32>(exit_ndc.x - surf_ndc.x, surf_ndc.y - exit_ndc.y) * 0.5;
         let t_uv = clamp(base_uv + uv_delta, vec2<f32>(0.0), vec2<f32>(1.0));
-        let t_max_lod = f32(textureNumLevels(transmission_bg) - 1u);
+        let t_max_lod = frame.transmission_max_lod;
         var transmitted = textureSampleLevel(
             transmission_bg, transmission_bg_samp, t_uv, roughness * t_max_lod
         ).rgb;

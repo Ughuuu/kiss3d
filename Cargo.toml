@@ -146,6 +146,8 @@ required-features = ["text"]
 [dev-dependencies]
 env_logger = "0.11"
 rand       = "0.10"
+# Writes every built-in shader as the GLSL ES a GLES device compiles.
+naga       = { version = "30", features = ["wgsl-in", "glsl-out"] }
 
 [patch.crates-io]
 #glamx = { path = "../glamx" }

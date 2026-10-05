@@ -6,7 +6,10 @@ use crate::context::Context;
 /// can bind as `texture_depth_2d`.
 pub(crate) struct SceneDepth {
     layout: wgpu::BindGroupLayout,
-    pipeline: wgpu::RenderPipeline,
+    pipeline_layout: wgpu::PipelineLayout,
+    shader: wgpu::ShaderModule,
+    /// The resolve pipeline and the sample count it was made for.
+    pipeline: Option<(u32, wgpu::RenderPipeline)>,
     target: Option<wgpu::TextureView>,
 }
 
@@ -19,7 +22,7 @@ impl SceneDepth {
                 binding: 0,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Depth,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     view_dimension: wgpu::TextureViewDimension::D2,
                     multisampled: true,
                 },
@@ -35,20 +38,55 @@ impl SceneDepth {
             Some("scene_depth_shader"),
             &crate::builtin::linked("package::depth_resolve", &[]),
         );
-        let pipeline = ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        SceneDepth {
+            layout,
+            pipeline_layout,
+            shader,
+            pipeline: None,
+            target: None,
+        }
+    }
+
+    /// The resolve pipeline for a source with `samples` samples.
+    fn pipeline(&mut self, samples: u32) -> &wgpu::RenderPipeline {
+        if self
+            .pipeline
+            .as_ref()
+            .is_none_or(|(made, _)| *made != samples)
+        {
+            let constants = [("samples", f64::from(samples))];
+            let pipeline = Self::make_pipeline(&self.pipeline_layout, &self.shader, &constants);
+            self.pipeline = Some((samples, pipeline));
+        }
+        &self
+            .pipeline
+            .as_ref()
+            .expect("the pipeline was just made")
+            .1
+    }
+
+    fn make_pipeline(
+        layout: &wgpu::PipelineLayout,
+        shader: &wgpu::ShaderModule,
+        constants: &[(&str, f64)],
+    ) -> wgpu::RenderPipeline {
+        Context::get().create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("scene_depth_pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("fs_main"),
                 targets: &[],
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants,
+                    ..Default::default()
+                },
             }),
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -61,12 +99,7 @@ impl SceneDepth {
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
-        });
-        SceneDepth {
-            layout,
-            pipeline,
-            target: None,
-        }
+        })
     }
 
     /// The multisampled `depth` resolved into a single-sampled texture this
@@ -77,6 +110,7 @@ impl SceneDepth {
         depth: &wgpu::TextureView,
     ) -> wgpu::TextureView {
         let size = depth.texture().size();
+        let samples = depth.texture().sample_count();
         let stale = self
             .target
             .as_ref()
@@ -120,7 +154,7 @@ impl SceneDepth {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(self.pipeline(samples));
         pass.set_bind_group(0, &bind_group, &[]);
         pass.draw(0..3, 0..1);
         drop(pass);

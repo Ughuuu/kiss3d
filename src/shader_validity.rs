@@ -357,6 +357,26 @@ mod tests {
                     .await;
             }
 
+            // 7) A depth-reading effect on a multisampled surface, which resolves the
+            // scene's depth (`SceneDepth`) before the effect reads it.
+            {
+                let setup = crate::window::CanvasSetup {
+                    samples: crate::window::NumSamples::Four,
+                    ..crate::window::CanvasSetup::default()
+                };
+                let mut msaa = OffscreenSurface::with_setup(96, 96, setup).await;
+                let mut edges = SobelEdgeHighlight::new(0.1);
+                msaa.render(
+                    Some(&mut scene),
+                    None,
+                    Some(&mut cam),
+                    None,
+                    None,
+                    Some(&mut edges),
+                )
+                .await;
+            }
+
             // Any invalid shader/pipeline created above is captured here.
             let err = scope.pop().await;
             assert!(err.is_none(), "shader validation error: {:?}", err);

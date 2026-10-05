@@ -44,6 +44,10 @@ use glamx::{Mat4, Vec3};
 /// budget's layers.
 pub const MAX_SHADOW_VIEWS: usize = 64;
 
+/// Layers an atlas has at least, with a budget of one view. GLES picks a
+/// texture's target at creation, and a one-layer one is no array.
+const MIN_ATLAS_LAYERS: u32 = 2;
+
 /// The shadow view budget a [`ShadowMapper`] starts with.
 pub const DEFAULT_SHADOW_VIEWS: u32 = 16;
 
@@ -731,7 +735,7 @@ impl ShadowMapper {
             size: wgpu::Extent3d {
                 width: resolution,
                 height: resolution,
-                depth_or_array_layers: layers,
+                depth_or_array_layers: layers.max(MIN_ATLAS_LAYERS),
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -775,7 +779,7 @@ impl ShadowMapper {
             size: wgpu::Extent3d {
                 width: resolution,
                 height: resolution,
-                depth_or_array_layers: layers,
+                depth_or_array_layers: layers.max(MIN_ATLAS_LAYERS),
             },
             mip_level_count: 1,
             sample_count: 1,
