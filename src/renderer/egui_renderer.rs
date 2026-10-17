@@ -9,6 +9,10 @@ pub struct EguiRenderer {
     egui_ctx: EguiContext,
     renderer: egui_wgpu::Renderer,
     shapes: Vec<egui::epaint::ClippedShape>,
+    /// `shapes` tessellated, at the points-per-pixel they were tessellated at:
+    /// a frame that ran no pass draws these again rather than tessellating the
+    /// same shapes. `None` once the shapes change.
+    primitives: Option<(f32, Vec<egui::ClippedPrimitive>)>,
     textures_delta: egui::TexturesDelta,
     cursor: egui::CursorIcon,
     retain_shapes: bool,
@@ -84,6 +88,7 @@ impl EguiRenderer {
             egui_ctx,
             renderer,
             shapes: Vec::new(),
+            primitives: None,
             textures_delta: Default::default(),
             cursor: egui::CursorIcon::Default,
             retain_shapes: false,
@@ -106,6 +111,7 @@ impl EguiRenderer {
         // they are dropped once they have been rendered too (see
         // `set_retain_shapes`).
         self.shapes.clear();
+        self.primitives = None;
         self.egui_ctx.begin_pass(raw_input);
     }
 
@@ -130,6 +136,7 @@ impl EguiRenderer {
     /// since otherwise rendering them already dropped them.
     pub fn clear_shapes(&mut self) {
         self.shapes.clear();
+        self.primitives = None;
     }
 
     /// What the last pass asked the pointer to look like over the widget it
@@ -143,6 +150,7 @@ impl EguiRenderer {
         let output = self.egui_ctx.end_pass();
         self.cursor = output.platform_output.cursor_icon;
         self.shapes = output.shapes;
+        self.primitives = None;
         // Append rather than replace: if a previous frame's render was skipped
         // (e.g. failed to acquire surface texture), we must not lose its texture
         // deltas (such as the font atlas glyph upload).
@@ -222,8 +230,23 @@ impl EguiRenderer {
             }
         }
 
-        // Prepare clipped primitives
-        let clipped_primitives = self.egui_ctx.tessellate(self.shapes.clone(), scale_factor);
+        let stale = match &self.primitives {
+            Some((ppp, _)) => *ppp != scale_factor,
+            None => true,
+        };
+        if stale {
+            // Kept only while a later frame may tessellate them again.
+            let shapes = if self.retain_shapes {
+                self.shapes.clone()
+            } else {
+                std::mem::take(&mut self.shapes)
+            };
+            let tessellated = self.egui_ctx.tessellate(shapes, scale_factor);
+            self.primitives = Some((scale_factor, tessellated));
+        }
+        let Some((_, clipped_primitives)) = &self.primitives else {
+            return;
+        };
 
         // Create screen descriptor
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -239,7 +262,7 @@ impl EguiRenderer {
             &ctxt.device,
             &ctxt.queue,
             &mut encoder,
-            &clipped_primitives,
+            clipped_primitives,
             &screen_descriptor,
         );
 
@@ -269,7 +292,7 @@ impl EguiRenderer {
             let mut render_pass = render_pass.forget_lifetime();
 
             self.renderer
-                .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+                .render(&mut render_pass, clipped_primitives, &screen_descriptor);
         }
 
         // Submit the egui commands
@@ -283,6 +306,7 @@ impl EguiRenderer {
         self.textures_delta.clear();
         if !self.retain_shapes {
             self.shapes.clear();
+            self.primitives = None;
         }
     }
 }
