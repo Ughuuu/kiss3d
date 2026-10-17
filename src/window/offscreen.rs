@@ -509,4 +509,45 @@ mod tests {
         let four = edge_pixels_at(NumSamples::Four);
         assert!(four > single + 10, "{} {}", single, four);
     }
+
+    /// A press and its release read through `events()` in one frame, as a
+    /// tap delivers them. Fed only at render, the pass that frame answered the
+    /// frame before, and a host skipping passes left the click unanswered.
+    #[cfg(feature = "egui")]
+    #[test]
+    fn a_click_read_before_the_pass_is_answered_by_that_pass() {
+        use crate::event::{Action, Modifiers, MouseButton, WindowEvent};
+        let button = |ctx: &egui::Context| {
+            egui::Area::new(egui::Id::new("go"))
+                .fixed_pos(egui::pos2(20.0, 20.0))
+                .show(ctx, |ui| ui.button("go"))
+                .inner
+        };
+        on_gpu(200, 100, async |surface| {
+            let mut flat = SceneNode2d::empty();
+            let mut camera_2d = FixedView2d::new(CoordinateSystem2d::default(), false);
+            let mut at = egui::Pos2::ZERO;
+            // A new area is hit-tested only once it has been shown a frame.
+            for _ in 0..3 {
+                surface.draw_ui(|ctx| at = button(ctx).rect.center());
+                surface.render_2d(&mut flat, &mut camera_2d).await;
+            }
+
+            let window = surface.window_mut();
+            let ppp = window.egui_pixels_per_point() as f64;
+            let none = Modifiers::empty();
+            window.unhandled_events.borrow_mut().extend([
+                WindowEvent::CursorPos(at.x as f64 * ppp, at.y as f64 * ppp, none),
+                WindowEvent::MouseButton(MouseButton::Button1, Action::Press, none),
+                WindowEvent::MouseButton(MouseButton::Button1, Action::Release, none),
+            ]);
+            assert!(window.has_unread_ui_input());
+
+            let mut clicked = false;
+            surface.draw_ui(|ctx| clicked |= button(ctx).clicked());
+            assert!(clicked);
+            surface.render_2d(&mut flat, &mut camera_2d).await;
+            assert!(!surface.window().has_unread_ui_input());
+        });
+    }
 }

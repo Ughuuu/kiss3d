@@ -60,6 +60,10 @@ pub(super) struct ScreenCopy2d {
 pub struct Window {
     pub(super) events: Rc<Receiver<WindowEvent>>,
     pub(super) unhandled_events: Rc<RefCell<Vec<WindowEvent>>>,
+    /// Whether the poll that closes `handle_events` queued events `events()`
+    /// has not read yet. `wait_events` answers at once while it is set: the
+    /// window system only reports what arrives after them.
+    pub(super) events_queued: bool,
     pub(super) ime_events: Rc<RefCell<Vec<crate::event::ImeEvent>>>,
     /// Made on the first frame a material asks; remade when the film resizes.
     pub(super) screen_2d: Option<ScreenCopy2d>,
@@ -1253,6 +1257,7 @@ impl Window {
             canvas,
             events: Rc::new(event_receive),
             unhandled_events: Rc::new(RefCell::new(Vec::new())),
+            events_queued: false,
             ime_events: Rc::new(RefCell::new(Vec::new())),
             screen_2d: None,
             ambient_intensity: 0.2,
@@ -1346,6 +1351,7 @@ impl Window {
             canvas,
             events: Rc::new(event_receive),
             unhandled_events: Rc::new(RefCell::new(Vec::new())),
+            events_queued: false,
             ime_events: Rc::new(RefCell::new(Vec::new())),
             screen_2d: None,
             ambient_intensity: 0.2,

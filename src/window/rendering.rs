@@ -1901,7 +1901,7 @@ impl Window {
             let deadline = std::time::Instant::now() + STARTUP_SURFACE_TIMEOUT;
             loop {
                 std::thread::sleep(SURFACE_RETRY_INTERVAL);
-                self.canvas.poll_events();
+                self.events_queued |= self.canvas.poll_events();
 
                 if let Some(frame) = self.canvas.get_current_texture() {
                     self.first_frame = false;

@@ -96,7 +96,8 @@ impl Canvas {
     }
 
     /// Poll all events that occurred since the last call to this method.
-    pub fn poll_events(&mut self) {
+    /// Answers whether any arrived.
+    pub fn poll_events(&mut self) -> bool {
         self.canvas.poll_events()
     }
 

@@ -31,6 +31,13 @@ pub(crate) struct EguiContext {
     /// lands at the next `begin_pass`, so the context answers with the old
     /// one until then and every size computed from it would be a frame late.
     pub(crate) zoom: f32,
+    /// How many of the events the app read through `events()` this frame the
+    /// pass has been handed already, so `handle_events` does not feed them twice.
+    pub(crate) fed: usize,
+    /// Where the pointer was as of the last event fed, in physical pixels. A
+    /// button event carries no position, and the canvas's own is where the
+    /// pointer is now, which a click followed by a move has already left.
+    pub(crate) pointer: Option<(f64, f64)>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) start_time: std::time::Instant,
 }
@@ -45,6 +52,8 @@ impl EguiContext {
             rerun_input: RawInput::default(),
             cursor: egui::CursorIcon::Default,
             zoom: 1.0,
+            fed: 0,
+            pointer: None,
             #[cfg(not(target_arch = "wasm32"))]
             start_time: std::time::Instant::now(),
         }
@@ -300,6 +309,7 @@ impl Window {
 
         match *event {
             WindowEvent::CursorPos(x, y, _) => {
+                self.egui_context.pointer = Some((x, y));
                 // Convert physical pixels to logical coordinates
                 let pos = egui::Pos2::new((x as f32) / scale_factor, (y as f32) / scale_factor);
                 self.egui_context
@@ -315,7 +325,7 @@ impl Window {
                     _ => return,
                 };
 
-                if let Some(pos) = self.cursor_pos() {
+                if let Some(pos) = self.egui_context.pointer.or_else(|| self.cursor_pos()) {
                     // Convert physical pixels to logical coordinates
                     let pos = egui::Pos2::new(
                         (pos.0 as f32) / scale_factor,
@@ -558,7 +568,10 @@ impl Window {
             .context()
             .set_zoom_factor(self.egui_context.zoom);
 
-        // Build raw input with accumulated events
+        // What the app read through `events()` this frame is otherwise fed in
+        // `handle_events`, after this pass: the pass would answer the last
+        // frame's input, and a host that skips passes would never answer this.
+        self.feed_read_events();
         let mut raw_input = std::mem::take(&mut self.egui_context.raw_input);
         // The display's own scale, which egui multiplies by the zoom factor to
         // reach `pixels_per_point`. Setting that directly instead would pin the
@@ -582,6 +595,25 @@ impl Window {
         self.egui_context.rerun_input = raw_input;
         self.egui_context.renderer.begin_frame(first);
         self.egui_context.pass_active = true;
+    }
+
+    /// Feeds egui the events the app has read through [`Self::events`] since
+    /// the last feed.
+    fn feed_read_events(&mut self) {
+        let read: Vec<WindowEvent> =
+            self.unhandled_events.borrow()[self.egui_context.fed..].to_vec();
+        self.egui_context.fed += read.len();
+        for event in &read {
+            self.feed_egui_event(event);
+        }
+    }
+
+    /// Whether egui holds input no pass has answered: events the app has read
+    /// this frame, or ones fed since the last pass. A host that skips passes
+    /// runs one while this is true, or a click waits for the next input.
+    pub fn has_unread_ui_input(&self) -> bool {
+        !self.egui_context.raw_input.events.is_empty()
+            || self.unhandled_events.borrow().len() > self.egui_context.fed
     }
 
     /// Closes the egui pass opened by `draw_ui`/`draw_inspector`, if any, so the

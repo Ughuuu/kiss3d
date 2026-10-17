@@ -733,17 +733,7 @@ impl WgpuCanvas {
                     let canvas_clone = canvas.clone();
                     let closure =
                         Closure::<dyn FnMut(_)>::new(move |event: web_sys::PointerEvent| {
-                            // Get coordinates relative to canvas, accounting for CSS scaling
-                            let rect = canvas_clone.get_bounding_client_rect();
-                            let css_x = event.client_x() as f64 - rect.left();
-                            let css_y = event.client_y() as f64 - rect.top();
-
-                            // Scale from CSS pixels to canvas pixels
-                            let scale_x = canvas_clone.width() as f64 / rect.width();
-                            let scale_y = canvas_clone.height() as f64 / rect.height();
-                            let x = css_x * scale_x;
-                            let y = css_y * scale_y;
-
+                            let (x, y) = canvas_point(&canvas_clone, &event);
                             pending.borrow_mut().push(WindowEvent::CursorPos(
                                 x,
                                 y,
@@ -760,12 +750,18 @@ impl WgpuCanvas {
                 // Pointer down
                 {
                     let pending = pending_events.clone();
+                    let canvas_clone = canvas.clone();
                     let closure =
                         Closure::<dyn FnMut(_)>::new(move |event: web_sys::PointerEvent| {
                             // Only handle mouse pointer type (not touch - that's handled separately)
                             if event.pointer_type() == "mouse" {
                                 let button = translate_web_mouse_button(event.button());
-                                pending.borrow_mut().push(WindowEvent::MouseButton(
+                                let (x, y) = canvas_point(&canvas_clone, &event);
+                                let mut pending = pending.borrow_mut();
+                                // Where the press happened, which no move may
+                                // have reported: a tap that never moved.
+                                pending.push(WindowEvent::CursorPos(x, y, event.modifiers()));
+                                pending.push(WindowEvent::MouseButton(
                                     button,
                                     Action::Press,
                                     event.modifiers(),
@@ -782,12 +778,16 @@ impl WgpuCanvas {
                 // Pointer up
                 {
                     let pending = pending_events.clone();
+                    let canvas_clone = canvas.clone();
                     let closure =
                         Closure::<dyn FnMut(_)>::new(move |event: web_sys::PointerEvent| {
                             // Only handle mouse pointer type (not touch - that's handled separately)
                             if event.pointer_type() == "mouse" {
                                 let button = translate_web_mouse_button(event.button());
-                                pending.borrow_mut().push(WindowEvent::MouseButton(
+                                let (x, y) = canvas_point(&canvas_clone, &event);
+                                let mut pending = pending.borrow_mut();
+                                pending.push(WindowEvent::CursorPos(x, y, event.modifiers()));
+                                pending.push(WindowEvent::MouseButton(
                                     button,
                                     Action::Release,
                                     event.modifiers(),
@@ -1414,9 +1414,9 @@ impl WgpuCanvas {
         })
     }
 
-    /// Polls events from the window system.
-    pub fn poll_events(&mut self) {
-        self.pump_events(Some(std::time::Duration::ZERO));
+    /// Polls events from the window system. Answers whether any arrived.
+    pub fn poll_events(&mut self) -> bool {
+        self.pump_events(Some(std::time::Duration::ZERO))
     }
 
     /// Blocks until the window system has an event, a [`Waker`] wakes it, or
@@ -2569,6 +2569,18 @@ impl WebModifiers for web_sys::TouchEvent {
             _ => self.meta_key(),
         })
     }
+}
+
+/// Where a pointer event landed on the canvas, in canvas pixels: the CSS
+/// offset from its corner, scaled by how much the canvas is stretched.
+#[cfg(target_arch = "wasm32")]
+fn canvas_point(canvas: &web_sys::HtmlCanvasElement, event: &web_sys::MouseEvent) -> (f64, f64) {
+    let rect = canvas.get_bounding_client_rect();
+    let css_x = event.client_x() as f64 - rect.left();
+    let css_y = event.client_y() as f64 - rect.top();
+    let scale_x = canvas.width() as f64 / rect.width();
+    let scale_y = canvas.height() as f64 / rect.height();
+    (css_x * scale_x, css_y * scale_y)
 }
 
 #[cfg(target_arch = "wasm32")]

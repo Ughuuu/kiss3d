@@ -49,6 +49,12 @@ impl Window {
     ///
     /// [`Waker`]: crate::window::Waker
     pub fn wait_events(&mut self, timeout: Option<std::time::Duration>) -> bool {
+        // Events the last frame's poll queued are already here to read; a
+        // wait would sleep until something newer, leaving them unread.
+        if std::mem::take(&mut self.events_queued) {
+            self.canvas.poll_events();
+            return true;
+        }
         self.canvas.wait_events(timeout)
     }
 
@@ -100,16 +106,21 @@ impl Window {
         let unhandled_events = self.unhandled_events.clone(); // TODO: could we avoid the clone?
         let events = self.events.clone(); // TODO: could we avoid the clone?
 
-        for event in unhandled_events.borrow().iter() {
-            self.handle_event(camera, camera_2d, event)
+        // The first `fed` were handed to the pass `draw_ui` opened this frame.
+        #[cfg(feature = "egui")]
+        let fed = std::mem::take(&mut self.egui_context.fed);
+        #[cfg(not(feature = "egui"))]
+        let fed = 0;
+        for (n, event) in unhandled_events.borrow().iter().enumerate() {
+            self.handle_event(camera, camera_2d, event, n >= fed)
         }
 
         for event in events.try_iter() {
-            self.handle_event(camera, camera_2d, &event)
+            self.handle_event(camera, camera_2d, &event, true)
         }
 
         unhandled_events.borrow_mut().clear();
-        self.canvas.poll_events();
+        self.events_queued = self.canvas.poll_events();
         let ime = self.canvas.take_ime_events();
         #[cfg(feature = "egui")]
         for event in &ime {
@@ -144,6 +155,7 @@ impl Window {
         camera: &mut dyn Camera3d,
         camera_2d: &mut dyn Camera2d,
         event: &WindowEvent,
+        feed_ui: bool,
     ) {
         if let Some(binding_key) = self.close_key {
             if let WindowEvent::Key(key, Action::Release, modifiers) = event {
@@ -180,9 +192,13 @@ impl Window {
         }
 
         // Feed events to egui and check if it wants to capture input
+        #[cfg(not(feature = "egui"))]
+        let _ = feed_ui;
         #[cfg(feature = "egui")]
         {
-            self.feed_egui_event(event);
+            if feed_ui {
+                self.feed_egui_event(event);
+            }
 
             if event.is_keyboard_event() && self.is_egui_capturing_keyboard() {
                 return;
