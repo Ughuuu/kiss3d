@@ -649,7 +649,10 @@ impl WgpuCanvas {
         let surface_caps = surface.get_capabilities(&ctxt.adapter);
 
         // Get the actual window size
+        #[cfg(not(target_arch = "wasm32"))]
         let size = window.inner_size();
+        #[cfg(target_arch = "wasm32")]
+        let size = measured_size(&window);
         let width = size.width.max(1);
         let height = size.height.max(1);
 
@@ -1648,7 +1651,7 @@ impl WgpuCanvas {
         #[cfg(target_arch = "wasm32")]
         {
             // Check for resize - compare current window size to surface config
-            let current_size = self.window.as_ref().unwrap().inner_size();
+            let current_size = measured_size(self.window.as_ref().unwrap());
             if current_size.width > 0
                 && current_size.height > 0
                 && (current_size.width != self.surface_config.width
@@ -2153,15 +2156,16 @@ impl WgpuCanvas {
         }
     }
 
-    /// Let the platform compose text through its input method. Not on Android,
-    /// where winit's switch is the on-screen keyboard itself, which
+    /// Let the platform compose text through its input method. Not on Android
+    /// or iOS, where winit's switch is the on-screen keyboard itself (on iOS
+    /// it makes winit's `UIKeyInput` view first responder), which
     /// [`set_keyboard_visible`](Self::set_keyboard_visible) shows with focus.
     pub fn set_ime_allowed(&self, allowed: bool) {
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(window) = &self.window {
             window.set_ime_allowed(allowed);
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let _ = allowed;
     }
 
@@ -2900,5 +2904,36 @@ mod tests {
         let logical = WinitKey::Character(SmolStr::new("z"));
         let press = translate_keyboard_input(Key::Z, Action::Press, &logical, None);
         assert_eq!(char_events(&press), vec!['z']);
+    }
+}
+
+/// The canvas's size in device pixels from its own layout. Winit learns the
+/// size from a `ResizeObserver`, which the browser delivers only when it next
+/// paints the page, and `inner_size` is zero until then; a page it has not
+/// painted yet has laid the canvas out all the same. The first frames went
+/// to a 1 by 1 surface before this, and a browser given a 1 by 1 present had
+/// nothing to paint again, so a page nothing touched stayed on the clear
+/// colour until the pointer moved (2026-10-20).
+#[cfg(target_arch = "wasm32")]
+fn canvas_layout_size(window: &winit::window::Window) -> Option<winit::dpi::PhysicalSize<u32>> {
+    use winit::platform::web::WindowExtWebSys;
+    let canvas = window.canvas()?;
+    let scale = window.scale_factor();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let width = (f64::from(canvas.client_width()) * scale).round() as u32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let height = (f64::from(canvas.client_height()) * scale).round() as u32;
+    (width > 0 && height > 0).then_some(winit::dpi::PhysicalSize::new(width, height))
+}
+
+/// What winit says the window is, or what the canvas measures while winit has
+/// not heard from its observer yet.
+#[cfg(target_arch = "wasm32")]
+fn measured_size(window: &winit::window::Window) -> winit::dpi::PhysicalSize<u32> {
+    let size = window.inner_size();
+    if size.width > 0 && size.height > 0 {
+        size
+    } else {
+        canvas_layout_size(window).unwrap_or(size)
     }
 }

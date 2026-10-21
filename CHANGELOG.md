@@ -56,6 +56,14 @@
 
 ## Bug Fixes
 
+- Window: the first frame's wait for a presentable surface waits for the window's events (up to 16 ms a turn) instead of sleeping and polling between attempts.
+- Web: the first frame no longer goes to a 1×1 surface. Winit reports the canvas 0×0 until its
+  `ResizeObserver` runs, which a browser does only when it next paints the page, so the surface was
+  configured at 1×1 and the first frame drawn there; `measured_size` reads the canvas's own layout
+  (`client_width` × scale factor) while winit still says 0×0, at open and in the event pump.
+- Web: a pass that egui discards and reruns within a frame is given the screen rect again. egui's
+  `RawInput::take` leaves none for the rerun, and that pass laid out on egui's 10000 by 10000
+  placeholder viewport, so the frame after a font install drew nothing it could show.
 - On the web, the surface is presented opaque wherever the platform offers it: a WebGPU canvas
   lists premultiplied alpha first, and the page showed through every pixel left at alpha 0.
 - A canvas the page supplies keeps the layout and the scrolling the page gave it; only a canvas

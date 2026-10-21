@@ -24,7 +24,9 @@ use super::Window;
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 const STARTUP_SURFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Delay between surface acquisition attempts while waiting for the first frame.
+/// How long one wait for the window's events lasts between surface
+/// acquisition attempts while waiting for the first frame: the events say
+/// when the window is ready, and this bounds a wait that none arrive in.
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 const SURFACE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
@@ -1612,22 +1614,7 @@ impl Window {
         });
 
         #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::JsCast;
-            use web_sys::wasm_bindgen::closure::Closure;
-
-            if let Some(window) = web_sys::window() {
-                let (s, r) = oneshot::channel();
-
-                let closure = Closure::once(move || s.send(()).unwrap());
-
-                window
-                    .request_animation_frame(closure.as_ref().unchecked_ref())
-                    .unwrap();
-
-                r.await.unwrap();
-            }
-        }
+        next_animation_frame().await;
 
         // iOS's analogue of the requestAnimationFrame wait above: the app
         // future is polled once per winit loop turn (see `window::ios`), so
@@ -1848,19 +1835,7 @@ impl Window {
         });
 
         #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::JsCast;
-            use web_sys::wasm_bindgen::closure::Closure;
-
-            if let Some(window) = web_sys::window() {
-                let (s, r) = oneshot::channel();
-                let closure = Closure::once(move || s.send(()).unwrap());
-                window
-                    .request_animation_frame(closure.as_ref().unchecked_ref())
-                    .unwrap();
-                r.await.unwrap();
-            }
-        }
+        next_animation_frame().await;
 
         // Same pacing as the rasterizer path: one frame per winit loop turn.
         #[cfg(target_os = "ios")]
@@ -1873,11 +1848,11 @@ impl Window {
     ///
     /// Returns `None` when no frame is available and the caller should skip
     /// rendering. Until the first frame has been rendered, this retries —
-    /// pumping window events between attempts — for up to a couple of seconds,
-    /// because a freshly created window may need the event loop to run a few
-    /// times before its surface becomes presentable. Once a frame has been
-    /// acquired, a later failure (e.g. a minimized window) skips the frame
-    /// immediately instead of stalling.
+    /// waiting for window events between attempts, never sleeping — for up
+    /// to a couple of seconds, because a freshly created window may need the
+    /// event loop to run a few times before its surface becomes presentable.
+    /// Once a frame has been acquired, a later failure (e.g. a minimized
+    /// window) skips the frame immediately instead of stalling.
     fn acquire_next_frame(&mut self) -> Option<wgpu::SurfaceTexture> {
         if let Some(frame) = self.canvas.get_current_texture() {
             self.first_frame = false;
@@ -1900,8 +1875,7 @@ impl Window {
         {
             let deadline = std::time::Instant::now() + STARTUP_SURFACE_TIMEOUT;
             loop {
-                std::thread::sleep(SURFACE_RETRY_INTERVAL);
-                self.events_queued |= self.canvas.poll_events();
+                self.events_queued |= self.canvas.wait_events(Some(SURFACE_RETRY_INTERVAL));
 
                 if let Some(frame) = self.canvas.get_current_texture() {
                     self.first_frame = false;
@@ -2293,3 +2267,29 @@ impl Window {
             .clone()
     }
 }
+
+/// Wait for the browser's next animation frame: the one pace a page has.
+/// A browser hands a visible page a frame for every one it paints, and
+/// paints the page for every present the loop makes, so the chain sustains
+/// itself from the first frame; it broke only while that first frame went
+/// to a 1 by 1 surface (`measured_size` in `wgpu_canvas.rs`, 2026-10-20).
+#[cfg(target_arch = "wasm32")]
+async fn next_animation_frame() {
+    use wasm_bindgen::JsCast;
+    use web_sys::wasm_bindgen::closure::Closure;
+
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let (sender, receiver) = oneshot::channel();
+    let on_frame = Closure::once(move || {
+        let _ = sender.send(());
+    });
+    if window
+        .request_animation_frame(on_frame.as_ref().unchecked_ref())
+        .is_ok()
+    {
+        let _ = receiver.await;
+    }
+}
+

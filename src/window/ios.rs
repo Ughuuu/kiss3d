@@ -45,10 +45,15 @@ thread_local! {
 
 /// Creates a winit window from inside the running app future.
 ///
+/// The window is the screen, whatever size was asked for: winit takes a
+/// requested size as the `UIWindow`'s frame, so a desktop-sized one would make
+/// a window larger than the display, shown from its top-left corner.
+///
 /// # Panics
 /// Outside a `run_ios` poll — on iOS a window can only be created while
 /// winit's loop is on the stack, which `#[kiss3d::main]` guarantees.
-pub(crate) fn create_window(attrs: WindowAttributes) -> Window {
+pub(crate) fn create_window(mut attrs: WindowAttributes) -> Window {
+    attrs.inner_size = None;
     ACTIVE.with(|active| {
         let ptr = active.get();
         assert!(

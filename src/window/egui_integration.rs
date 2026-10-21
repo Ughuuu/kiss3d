@@ -592,6 +592,10 @@ impl Window {
         // `take` leaves what `Context::run` hands a later pass of the same
         // frame: the time, and none of the events.
         let first = raw_input.take();
+        // A rerun of this frame's pass is given the screen again: egui's
+        // `take` leaves none, and a pass begun with none on this context
+        // laid out on egui's 10000 by 10000 placeholder (2026-10-20).
+        raw_input.screen_rect = first.screen_rect;
         self.egui_context.rerun_input = raw_input;
         self.egui_context.renderer.begin_frame(first);
         self.egui_context.pass_active = true;
