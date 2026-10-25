@@ -44,12 +44,12 @@ pub struct OffscreenSurface {
 }
 
 impl OffscreenSurface {
-    /// Creates a new single-sampled off-screen surface of the given size, in
-    /// pixels. [`with_setup`](Self::with_setup) takes a sample count.
+    /// Creates a new off-screen surface of the given size, in pixels, without
+    /// antialiasing (see [`Self::set_samples`] or [`Self::with_setup`] for MSAA).
     pub async fn new(width: u32, height: u32) -> OffscreenSurface {
         let setup = CanvasSetup {
             samples: NumSamples::One,
-            ..CanvasSetup::default()
+            ..Default::default()
         };
         OffscreenSurface {
             window: Window::do_new_headless(width, height, Some(setup)).await,
@@ -376,6 +376,72 @@ impl OffscreenSurface {
         self.window.set_shadow_resolution(resolution);
     }
 
+    /// Sets how many shadow atlas layers are allocated. See
+    /// [`Window::set_shadow_atlas_layers`].
+    pub fn set_shadow_atlas_layers(&mut self, layers: u32) {
+        self.window.set_shadow_atlas_layers(layers);
+    }
+
+    /// The number of shadow atlas layers allocated. See [`Window::shadow_atlas_layers`].
+    pub fn shadow_atlas_layers(&self) -> u32 {
+        self.window.shadow_atlas_layers()
+    }
+
+    /// Sets the shadow-edge softness (PCF blur): `1.0` is the default penumbra,
+    /// `0.0` hard edges. See [`Window::set_shadow_softness`].
+    pub fn set_shadow_softness(&mut self, softness: f32) {
+        self.window.set_shadow_softness(softness);
+    }
+
+    /// The current shadow-edge softness. See [`Window::shadow_softness`].
+    pub fn shadow_softness(&self) -> f32 {
+        self.window.shadow_softness()
+    }
+
+    /// Caps how far directional shadows reach. See [`Window::set_shadow_distance`].
+    pub fn set_shadow_distance(&mut self, distance: f32) {
+        self.window.set_shadow_distance(distance);
+    }
+
+    /// The directional-shadow distance cap. See [`Window::shadow_distance`].
+    pub fn shadow_distance(&self) -> f32 {
+        self.window.shadow_distance()
+    }
+
+    /// Far view distance of the highest-resolution directional cascade. See
+    /// [`Window::set_first_cascade_far_bound`].
+    pub fn set_first_cascade_far_bound(&mut self, bound: f32) {
+        self.window.set_first_cascade_far_bound(bound);
+    }
+
+    /// The far view distance of the highest-resolution directional cascade. See
+    /// [`Window::first_cascade_far_bound`].
+    pub fn first_cascade_far_bound(&self) -> f32 {
+        self.window.first_cascade_far_bound()
+    }
+
+    /// Enables or disables shadow mapping. See [`Window::set_shadows_enabled`].
+    pub fn set_shadows_enabled(&mut self, enabled: bool) {
+        self.window.set_shadows_enabled(enabled);
+    }
+
+    /// Whether shadow mapping is enabled. See [`Window::shadows_enabled`].
+    pub fn shadows_enabled(&self) -> bool {
+        self.window.shadows_enabled()
+    }
+
+    /// Sets the number of MSAA samples of the rendered image (the default is
+    /// one, i.e. no antialiasing). Takes effect on the next rendered frame. See
+    /// [`Window::set_samples`].
+    pub fn set_samples(&mut self, samples: NumSamples) {
+        self.window.set_samples(samples);
+    }
+
+    /// The current number of MSAA samples (`1` = no antialiasing).
+    pub fn samples(&self) -> u32 {
+        self.window.samples()
+    }
+
     /// Selects the tonemapping operator used by the HDR resolve pass.
     /// See [`Window::set_tonemap`].
     pub fn set_tonemap(&mut self, tonemap: Tonemap) {
@@ -518,7 +584,7 @@ mod tests {
     fn a_click_read_before_the_pass_is_answered_by_that_pass() {
         use crate::event::{Action, Modifiers, MouseButton, WindowEvent};
         let button = |ctx: &egui::Context| {
-            egui::Area::new(egui::Id::new("go"))
+            egui::Area::new(egui::Id::unique("go"))
                 .fixed_pos(egui::pos2(20.0, 20.0))
                 .show(ctx, |ui| ui.button("go"))
                 .inner

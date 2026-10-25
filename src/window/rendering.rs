@@ -336,7 +336,10 @@ impl Window {
         } else {
             match self.acquire_next_frame() {
                 Some(frame) => Some(frame),
-                None => return !self.should_close(),
+                None => {
+                    self.discard_queued_draws();
+                    return !self.should_close();
+                }
             }
         };
 
@@ -353,8 +356,10 @@ impl Window {
         // No need to update the light position here - it's computed per-frame
         // in the material's prepare() based on the camera position
 
-        // A hidden window draws at the canvas's sample count too: the HDR film is
-        // multisampled and resolved before the single-sample offscreen output.
+        // The scene is rasterized into the HDR film, whose sample count follows
+        // the canvas (a headless canvas included: `OffscreenSurface::set_samples`
+        // and `CanvasSetup::samples`); the film is resolved before tonemapping,
+        // so the single-sample offscreen output target is unaffected.
         let sample_count = self.canvas.sample_count();
 
         let ctxt = Context::get();
@@ -1655,7 +1660,10 @@ impl Window {
         } else {
             match self.acquire_next_frame() {
                 Some(frame) => Some(frame),
-                None => return !self.should_close(),
+                None => {
+                    self.discard_queued_draws();
+                    return !self.should_close();
+                }
             }
         };
 
@@ -1842,6 +1850,17 @@ impl Window {
         super::ios::next_frame().await;
 
         !self.should_close()
+    }
+
+    /// Drops the lines, points and text queued for a frame that is skipped.
+    /// Otherwise they pile up while no frame is drawn (e.g. a window on another macOS Space).
+    fn discard_queued_draws(&mut self) {
+        self.polyline_renderer.clear();
+        self.polyline_renderer_2d.clear();
+        self.point_renderer.clear();
+        self.point_renderer_2d.clear();
+        #[cfg(feature = "text")]
+        self.text_renderer.clear();
     }
 
     /// Acquires the surface texture for the next frame.

@@ -10,7 +10,7 @@
 //! # Texture / atlas layout
 //!
 //! All shadow maps are packed into a single `Depth32Float` **2D texture array**
-//! (`resolution × resolution × max_views`, see [`ShadowMapper::set_max_views`]). Using one array texture keeps
+//! (`resolution × resolution × atlas_layers`, see [`ShadowMapper::set_atlas_layers`]). Using one array texture keeps
 //! the material's bind group small — a single depth texture binding plus one
 //! comparison sampler — regardless of how many lights are active, so we never run
 //! into per-stage texture-binding limits even with the full `MAX_LIGHTS` budget.
@@ -25,7 +25,7 @@
 //!
 //! Point lights select the relevant cube face in the shader from the dominant
 //! axis of the light→fragment vector. The total number of views is capped at
-//! [`ShadowMapper::max_views`]; lights that do not fit keep lighting without shadows.
+//! [`ShadowMapper::atlas_layers`]; lights that do not fit keep lighting without shadows.
 
 use crate::camera::Camera3d;
 use crate::context::Context;
@@ -36,7 +36,7 @@ use glamx::glam::camera::rh::{proj::directx, view::look_at_mat4};
 use glamx::{Mat4, Vec3};
 
 /// The largest shadow view budget (atlas layers across all lights)
-/// [`ShadowMapper::set_max_views`] accepts.
+/// [`ShadowMapper::set_atlas_layers`] accepts.
 ///
 /// A spot light uses one view, a directional light one per cascade, a point light
 /// six. This sizes the per-frame shadow uniform (and its WGSL mirror in
@@ -48,7 +48,7 @@ pub const MAX_SHADOW_VIEWS: usize = 64;
 /// texture's target at creation, and a one-layer one is no array.
 const MIN_ATLAS_LAYERS: u32 = 2;
 
-/// The shadow view budget a [`ShadowMapper`] starts with.
+/// The atlas layers a [`ShadowMapper`] starts with.
 pub const DEFAULT_SHADOW_VIEWS: u32 = 16;
 
 /// The comparison depth bias a [`ShadowMapper`] starts with.
@@ -267,12 +267,13 @@ pub struct ShadowMapper {
     enabled: bool,
     /// Atlas resolution (per layer, square).
     resolution: u32,
+    /// Atlas layers allocated (`1..=MAX_SHADOW_VIEWS`); lights whose views do not
+    /// fit keep lighting without shadows.
+    atlas_layers: u32,
     /// Slope-scaled-ish constant depth bias used by the PCF comparison.
     depth_bias: f32,
     /// Rasterizer depth bias `(constant, slope_scale)` baked into the depth pipelines.
     raster_bias: (i32, f32),
-    /// Atlas layers: the shadow view budget across all lights.
-    max_views: u32,
     /// Shadow-edge softness: scales the PCF tap spacing (`1.0` = default ~5x5
     /// penumbra, larger = blurrier, `0.0` = hard edges).
     softness: f32,
@@ -356,12 +357,12 @@ impl ShadowMapper {
     pub fn new(resolution: u32) -> Self {
         let ctxt = Context::get();
         let resolution = resolution.max(1);
+        let atlas_layers = DEFAULT_SHADOW_VIEWS;
 
-        let max_views = DEFAULT_SHADOW_VIEWS;
         let raster_bias = DEFAULT_SHADOW_RASTER_BIAS;
-        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution, max_views);
+        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution, atlas_layers);
         let (transmittance_atlas, transmittance_layer_views, transmittance_array_view) =
-            Self::create_transmittance_atlas(&ctxt, resolution, max_views);
+            Self::create_transmittance_atlas(&ctxt, resolution, atlas_layers);
 
         // Comparison sampler: hardware does the depth test and (with linear
         // filtering) bilinear PCF across the 2x2 neighborhood per tap.
@@ -568,9 +569,9 @@ impl ShadowMapper {
         Self {
             enabled: true,
             resolution,
+            atlas_layers,
             depth_bias: DEFAULT_SHADOW_DEPTH_BIAS,
             raster_bias,
-            max_views,
             softness: 1.0,
             num_cascades: 4,
             shadow_distance: f32::INFINITY,
@@ -1496,25 +1497,6 @@ impl ShadowMapper {
         self.cutout_pipelines = Some((plain, deformed));
     }
 
-    /// The shadow view budget: atlas layers shared by every shadow-casting light.
-    /// Default [`DEFAULT_SHADOW_VIEWS`] (16).
-    pub fn max_views(&self) -> u32 {
-        self.max_views
-    }
-
-    /// Sets the shadow view budget (clamped to `1..=MAX_SHADOW_VIEWS`), reallocating
-    /// the atlas. A spot light takes one view, a directional light one per cascade,
-    /// a point light six; lights past the budget light without shadows. The atlas
-    /// holds `resolution² × views` depth texels plus as many RGBA8 transmittance texels.
-    pub fn set_max_views(&mut self, views: u32) {
-        let views = views.clamp(1, MAX_SHADOW_VIEWS as u32);
-        if views == self.max_views {
-            return;
-        }
-        self.max_views = views;
-        self.reallocate_atlas();
-    }
-
     /// Sets the shadow atlas per-layer resolution, reallocating the atlas.
     pub fn set_resolution(&mut self, resolution: u32) {
         let resolution = resolution.max(1);
@@ -1522,18 +1504,37 @@ impl ShadowMapper {
             return;
         }
         self.resolution = resolution;
-        self.reallocate_atlas();
+        self.reallocate_atlases();
     }
 
-    fn reallocate_atlas(&mut self) {
+    /// Number of atlas layers allocated (the default is [`DEFAULT_SHADOW_VIEWS`]).
+    pub fn atlas_layers(&self) -> u32 {
+        self.atlas_layers
+    }
+
+    /// Sets how many atlas layers are allocated (`1..=MAX_SHADOW_VIEWS`),
+    /// reallocating the atlas. A directional light needs one layer per cascade,
+    /// a spot light one, a point light six; lights that do not fit keep lighting
+    /// without shadows. Fewer layers make a higher `resolution` affordable: the
+    /// atlas costs `resolution² × layers × 8` bytes (depth plus transmittance).
+    pub fn set_atlas_layers(&mut self, layers: u32) {
+        let layers = layers.clamp(1, MAX_SHADOW_VIEWS as u32);
+        if layers == self.atlas_layers {
+            return;
+        }
+        self.atlas_layers = layers;
+        self.reallocate_atlases();
+    }
+
+    fn reallocate_atlases(&mut self) {
         let ctxt = Context::get();
-        let (resolution, layers) = (self.resolution, self.max_views);
-        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution, layers);
+        let (atlas, layer_views, array_view) =
+            Self::create_atlas(&ctxt, self.resolution, self.atlas_layers);
         self.atlas = atlas;
         self.layer_views = layer_views;
         self.array_view = array_view;
         let (t_atlas, t_layer_views, t_array_view) =
-            Self::create_transmittance_atlas(&ctxt, resolution, layers);
+            Self::create_transmittance_atlas(&ctxt, self.resolution, self.atlas_layers);
         self.transmittance_atlas = t_atlas;
         self.transmittance_layer_views = t_layer_views;
         self.transmittance_array_view = t_array_view;
@@ -1635,7 +1636,7 @@ impl ShadowMapper {
                 continue;
             }
             let needed = self.shadow_view_count(light);
-            if next_layer as usize + needed > self.max_views as usize {
+            if next_layer + needed as u32 > self.atlas_layers {
                 // Out of atlas space: this light lights without shadows.
                 continue;
             }
@@ -1663,7 +1664,7 @@ impl ShadowMapper {
                 continue;
             }
             let needed = self.shadow_view_count(light);
-            if next_layer as usize + needed > self.max_views as usize {
+            if next_layer + needed as u32 > self.atlas_layers {
                 // Out of atlas space; a smaller later light might still fit.
                 continue;
             }
@@ -2175,10 +2176,10 @@ mod tests {
             assert_eq!(window.shadow_resolution(), 2048);
             assert_eq!(window.shadow_cascades(), 4);
             assert_eq!(window.shadow_distance(), f32::INFINITY);
-            assert_eq!(window.shadow_first_cascade_distance(), 12.0);
+            assert_eq!(window.first_cascade_far_bound(), 12.0);
             assert_eq!(window.shadow_depth_bias(), 0.0012);
             assert_eq!(window.shadow_raster_bias(), (1, 1.75));
-            assert_eq!(window.max_shadow_views(), 16);
+            assert_eq!(window.shadow_atlas_layers(), 16);
         });
     }
 
@@ -2193,14 +2194,14 @@ mod tests {
             let slots = surface.window().shadow_mapper().shadow_slots().to_vec();
             assert!(slots.iter().all(|&s| s != u32::MAX), "{:?}", slots);
 
-            surface.window_mut().set_max_shadow_views(6);
-            assert_eq!(surface.window().max_shadow_views(), 6);
+            surface.window_mut().set_shadow_atlas_layers(6);
+            assert_eq!(surface.window().shadow_atlas_layers(), 6);
             surface.render_3d(&mut scene, &mut camera).await;
             let slots = surface.window().shadow_mapper().shadow_slots().to_vec();
             assert_eq!(slots.iter().filter(|&&s| s != u32::MAX).count(), 1);
 
-            surface.window_mut().set_max_shadow_views(1000);
-            assert_eq!(surface.window().max_shadow_views(), 64);
+            surface.window_mut().set_shadow_atlas_layers(1000);
+            assert_eq!(surface.window().shadow_atlas_layers(), 64);
         });
     }
 
@@ -2296,10 +2297,10 @@ mod tests {
             let window = surface.window_mut();
             window.set_shadow_cascades(9);
             window.set_shadow_distance(40.0);
-            window.set_shadow_first_cascade_distance(0.0);
+            window.set_first_cascade_far_bound(0.0);
             assert_eq!(window.shadow_cascades(), 4);
             assert_eq!(window.shadow_distance(), 40.0);
-            assert_eq!(window.shadow_first_cascade_distance(), 0.01);
+            assert_eq!(window.first_cascade_far_bound(), 0.01);
             window.set_shadow_cascades(0);
             assert_eq!(window.shadow_cascades(), 1);
         });

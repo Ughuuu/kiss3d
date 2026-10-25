@@ -354,6 +354,7 @@ impl Window {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::Vec2::new(x as f32, y as f32),
                         phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                         modifiers: egui_modifiers(modifiers),
                     });
             }

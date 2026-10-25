@@ -43,7 +43,7 @@ pub(super) static DEFAULT_HEIGHT: u32 = 600u32;
 /// shadow sharpness against the per-frame cost of clearing/rasterizing the atlas
 /// (a point light alone uses six faces); raise it with
 /// [`Window::set_shadow_resolution`] for crisper shadows, lower it to save memory
-/// and fill (the atlas is `resolution² × views`, see [`Window::set_max_shadow_views`]).
+/// and fill (the atlas is `resolution² × views`, see [`Window::set_shadow_atlas_layers`]).
 pub(super) static DEFAULT_SHADOW_RESOLUTION: u32 = 2048u32;
 
 /// Structure representing a window and a 3D scene.
@@ -880,6 +880,19 @@ impl Window {
         self.shadow_mapper.resolution()
     }
 
+    /// Sets how many shadow atlas layers are allocated (`1..=MAX_SHADOW_VIEWS`,
+    /// default 16). A directional light needs one layer per cascade, a spot
+    /// light one, a point light six; lights that do not fit cast no shadow.
+    /// Fewer layers make a higher [`Self::set_shadow_resolution`] affordable.
+    pub fn set_shadow_atlas_layers(&mut self, layers: u32) {
+        self.shadow_mapper.set_atlas_layers(layers);
+    }
+
+    /// Returns the number of shadow atlas layers allocated.
+    pub fn shadow_atlas_layers(&self) -> u32 {
+        self.shadow_mapper.atlas_layers()
+    }
+
     /// Sets the rasterizer shadow-edge softness (PCF blur).
     ///
     /// `1.0` (the default) is the standard penumbra; larger values blur the
@@ -894,14 +907,15 @@ impl Window {
         self.shadow_mapper.softness()
     }
 
-    /// Caps how far directional shadows reach, in world units along the view:
-    /// the cascades cover the camera's near plane to `min(far plane, distance)`.
-    /// The default, `f32::INFINITY`, uses the camera's far plane.
+    /// Caps how far from the camera directional shadows reach (world units along
+    /// the view; `INFINITY`, the default, uses the camera far plane). The
+    /// cascades are fit to the camera frustum up to this distance, so a tighter
+    /// cap spends the shadow atlas on nearer geometry.
     pub fn set_shadow_distance(&mut self, distance: f32) {
         self.shadow_mapper.set_shadow_distance(distance);
     }
 
-    /// Returns how far directional shadows reach. The default is `f32::INFINITY`.
+    /// Returns the directional-shadow distance cap.
     pub fn shadow_distance(&self) -> f32 {
         self.shadow_mapper.shadow_distance()
     }
@@ -917,14 +931,16 @@ impl Window {
         self.shadow_mapper.num_cascades()
     }
 
-    /// Sets the far view distance of the first, sharpest directional cascade: it
-    /// covers the camera's near plane to `distance` (at least 0.01). The default is 12.
-    pub fn set_shadow_first_cascade_distance(&mut self, distance: f32) {
-        self.shadow_mapper.set_first_cascade_far_bound(distance);
+    /// Sets the far view distance of the highest-resolution directional cascade
+    /// (it covers `[near, bound]`; the default is 12). Lower it for crisper
+    /// shadows on a small scene close to the camera, raise it so crisp shadows
+    /// reach further away.
+    pub fn set_first_cascade_far_bound(&mut self, bound: f32) {
+        self.shadow_mapper.set_first_cascade_far_bound(bound);
     }
 
-    /// Returns the far view distance of the first directional cascade. The default is 12.
-    pub fn shadow_first_cascade_distance(&self) -> f32 {
+    /// Returns the far view distance of the highest-resolution directional cascade.
+    pub fn first_cascade_far_bound(&self) -> f32 {
         self.shadow_mapper.first_cascade_far_bound()
     }
 
@@ -951,21 +967,6 @@ impl Window {
     /// default is `(1, 1.75)`.
     pub fn shadow_raster_bias(&self) -> (i32, f32) {
         self.shadow_mapper.raster_bias()
-    }
-
-    /// Sets the shadow view budget: atlas layers shared by every shadow-casting
-    /// light, clamped to `1..=MAX_SHADOW_VIEWS` (64), reallocating the atlas. A
-    /// spot light takes one view, a directional light one per cascade, a point
-    /// light six; lights past the budget light without shadows. Memory is
-    /// `resolution² × views × 8` bytes (depth plus colored transmittance). The
-    /// default is 16.
-    pub fn set_max_shadow_views(&mut self, views: u32) {
-        self.shadow_mapper.set_max_views(views);
-    }
-
-    /// Returns the shadow view budget. The default is 16.
-    pub fn max_shadow_views(&self) -> u32 {
-        self.shadow_mapper.max_views()
     }
 
     /// Sets the clustered-lighting grid: clusters along screen X, screen Y and
@@ -1335,6 +1336,7 @@ impl Window {
         let canvas = Canvas::open_headless(width, height, setup, event_send).await;
         let (width, height) = canvas.size();
         let canvas_surface_format = canvas.surface_format();
+        let sample_count = canvas.sample_count();
 
         Context::increment_window_count();
         WindowCache::populate();
@@ -1366,8 +1368,7 @@ impl Window {
             text_renderer: TextRenderer::new(),
             #[cfg(feature = "egui")]
             egui_context: EguiContext::new(),
-            // Offscreen rendering is single-sampled (see `render_single_frame`).
-            hdr: HdrPipeline::new(width, height, 1, canvas_surface_format),
+            hdr: HdrPipeline::new(width, height, sample_count, canvas_surface_format),
             skybox: crate::renderer::Skybox::new(),
             ssao: None,
             ssao_enabled: false,
