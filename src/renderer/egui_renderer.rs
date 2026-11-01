@@ -64,7 +64,9 @@ impl EguiRenderer {
 
         let ctxt = Context::get();
 
-        // Create the egui-wgpu renderer
+        // Create the egui-wgpu renderer: one shader module and one pipeline, on the
+        // device directly, so they are counted here.
+        let started = web_time::Instant::now();
         let mut renderer = egui_wgpu::Renderer::new(
             &ctxt.device,
             ctxt.surface_format,
@@ -74,6 +76,7 @@ impl EguiRenderer {
                 ..Default::default()
             },
         );
+        Context::note_shader_build(1, 1, started.elapsed());
 
         // Apply textures from the dummy pass (font textures, etc.)
         for (id, image_deltas) in &dummy_output.textures_delta.set {

@@ -111,16 +111,14 @@ impl PathTracePipeline {
             immediate_size: 0,
         });
 
-        let pipeline = ctxt
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("rt_path_tracer_pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+        let pipeline = ctxt.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rt_path_tracer_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         let frame_uniform = ctxt.create_buffer_simple(
             Some("rt_frame_uniform"),

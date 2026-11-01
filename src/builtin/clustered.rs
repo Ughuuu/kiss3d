@@ -57,7 +57,7 @@ struct ClusterUniforms {
     depth: [f32; 4],
 }
 
-/// Owns the GPU buffers and (later) compute pipelines for clustered lighting.
+/// Owns the GPU buffers and compute pipelines for clustered lighting.
 pub(crate) struct Clustered {
     /// Number of `GpuLight`s the `clustered_lights` buffer can currently hold.
     light_capacity: u32,
@@ -81,11 +81,11 @@ pub(crate) struct Clustered {
     /// Last viewport the grid was sized for.
     width: u32,
     height: u32,
-    /// AABB-build compute pipeline + its bind group layout.
-    build_pipeline: wgpu::ComputePipeline,
+    /// The AABB-build and cull compute pipelines, built when a light first overflows.
+    pipelines: Option<(wgpu::ComputePipeline, wgpu::ComputePipeline)>,
+    /// The AABB-build pass's bind group layout.
     build_layout: wgpu::BindGroupLayout,
-    /// Light-cull compute pipeline + its bind group layout.
-    cull_pipeline: wgpu::ComputePipeline,
+    /// The cull pass's bind group layout.
     cull_layout: wgpu::BindGroupLayout,
 }
 
@@ -109,13 +109,6 @@ impl Clustered {
             label: Some("clustered_build_layout"),
             entries: &[uniform_entry(0), storage_entry(1, false)],
         });
-        let build_pipeline = make_pipeline(
-            &ctxt,
-            "clustered_build",
-            BUILD_SRC,
-            "build_aabbs",
-            &build_layout,
-        );
 
         // Cull pass: uniform + aabbs(ro) + lights(ro) + grid(rw) + index(rw).
         let cull_layout = ctxt.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -128,13 +121,6 @@ impl Clustered {
                 storage_entry(4, false),
             ],
         });
-        let cull_pipeline = make_pipeline(
-            &ctxt,
-            "clustered_cull",
-            CULL_SRC,
-            "cull_lights",
-            &cull_layout,
-        );
 
         Clustered {
             light_capacity: 1,
@@ -148,9 +134,8 @@ impl Clustered {
             aabb_key: None,
             width: width.max(1),
             height: height.max(1),
-            build_pipeline,
+            pipelines: None,
             build_layout,
-            cull_pipeline,
             cull_layout,
         }
     }
@@ -279,6 +264,33 @@ impl Clustered {
         };
         ctxt.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
+        // No clustered lights → leave the clusters as they are; the fragment shader
+        // gates the clustered loop on `num_clustered_lights == 0`, so stale data is
+        // unused. A scene that never overflows compiles neither pipeline, and `aabb_key`
+        // stays behind, so the first overflow builds the AABBs it needs.
+        if num == 0 {
+            return realloc;
+        }
+        if self.pipelines.is_none() {
+            self.pipelines = Some((
+                make_pipeline(
+                    &ctxt,
+                    "clustered_build",
+                    BUILD_SRC,
+                    "build_aabbs",
+                    &self.build_layout,
+                ),
+                make_pipeline(
+                    &ctxt,
+                    "clustered_cull",
+                    CULL_SRC,
+                    "cull_lights",
+                    &self.cull_layout,
+                ),
+            ));
+        }
+        let (build_pipeline, cull_pipeline) = self.pipelines.as_ref().expect("built above");
+
         // Rebuild cluster AABBs only when the projection or viewport changed.
         let key = (proj_hash(&proj), self.width, self.height);
         if self.aabb_key != Some(key) {
@@ -302,15 +314,9 @@ impl Clustered {
                 label: Some("clustered_build_pass"),
                 timestamp_writes: build_ts,
             });
-            pass.set_pipeline(&self.build_pipeline);
+            pass.set_pipeline(build_pipeline);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(grid_x.div_ceil(4), grid_y.div_ceil(4), grid_z.div_ceil(4));
-        }
-
-        // No clustered lights → leave the grid as-is; the fragment shader gates the
-        // clustered loop on `num_clustered_lights == 0`, so stale grid data is unused.
-        if num == 0 {
-            return realloc;
         }
 
         // Cull lights into clusters (each cluster writes its own fixed slice).
@@ -345,7 +351,7 @@ impl Clustered {
             label: Some("clustered_cull_pass"),
             timestamp_writes: cull_ts,
         });
-        pass.set_pipeline(&self.cull_pipeline);
+        pass.set_pipeline(cull_pipeline);
         pass.set_bind_group(0, &group, &[]);
         pass.dispatch_workgroups((grid_x * grid_y * grid_z).div_ceil(64), 1, 1);
 
@@ -377,15 +383,14 @@ fn make_pipeline(
         bind_group_layouts: &[Some(layout)],
         immediate_size: 0,
     });
-    ctxt.device
-        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(label),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some(entry),
-            compilation_options: Default::default(),
-            cache: None,
-        })
+    ctxt.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pipeline_layout),
+        module: &shader,
+        entry_point: Some(entry),
+        compilation_options: Default::default(),
+        cache: None,
+    })
 }
 
 fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -468,6 +473,37 @@ mod tests {
     use crate::scene::SceneNode3d;
     use crate::test_gpu::{mean_luma, on_gpu};
     use glamx::Vec3;
+
+    #[test]
+    fn only_a_light_past_the_primary_tier_compiles_the_cluster_pipelines() {
+        on_gpu(32, 32, async |surface| {
+            if !Context::get().supports_clustered_lighting() {
+                return;
+            }
+            let compiled = || -> Vec<String> {
+                Context::take_built_pipelines()
+                    .into_iter()
+                    .filter(|label| label.starts_with("clustered_"))
+                    .collect()
+            };
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 8.0), Vec3::ZERO);
+            let mut scene = SceneNode3d::empty();
+            scene.add_cube(1.0, 1.0, 1.0);
+            scene
+                .add_light(Light::point(40.0).with_intensity(2.0))
+                .set_position(Vec3::new(3.0, 3.0, 1.0));
+            compiled();
+            surface.render_3d(&mut scene, &mut camera).await;
+            assert_eq!(compiled(), Vec::<String>::new());
+            for i in 0..crate::light::MAX_LIGHTS {
+                scene
+                    .add_light(Light::point(40.0).with_intensity(2.0))
+                    .set_position(Vec3::new(i as f32, 3.0, 1.0));
+            }
+            surface.render_3d(&mut scene, &mut camera).await;
+            assert_eq!(compiled(), ["clustered_build", "clustered_cull"]);
+        });
+    }
 
     #[test]
     fn a_cluster_drops_the_lights_past_its_cap() {

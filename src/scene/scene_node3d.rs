@@ -288,7 +288,7 @@ impl SceneNodeData3d {
     ///
     /// The last argument is the alpha cutoff of a `Mask` caster, `None` otherwise.
     #[doc(hidden)]
-    pub fn collect_shadow_models(&self, f: &mut dyn FnMut(Pose3, Vec3, Color, Option<f32>)) {
+    pub fn collect_shadow_models(&self, f: &mut dyn FnMut(Pose3, Vec3, Color, Option<f32>, bool)) {
         if self.visible {
             if let Some(ref o) = self.object {
                 if o.casts_shadows() {
@@ -301,6 +301,7 @@ impl SceneNodeData3d {
                         self.world_scale,
                         o.data().color(),
                         cutoff,
+                        o.data().deform_bind_group().is_some(),
                     );
                 }
             }

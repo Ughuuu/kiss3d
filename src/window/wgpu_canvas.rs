@@ -568,6 +568,7 @@ impl WgpuCanvas {
             // connected to another API". Separate instances mean the failed
             // candidate's surface is dropped — and the window disconnected —
             // before the next backend touches it.
+            let asked = web_time::Instant::now();
             let request = |backends| {
                 let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                     backends,
@@ -623,6 +624,7 @@ impl WgpuCanvas {
                 })
                 .await
                 .expect("Failed to create device");
+            Context::note_device_wait(asked.elapsed());
 
             // Get surface capabilities
             // We explicitly prefer non-sRGB formats for consistent behavior across platforms.
@@ -1068,6 +1070,7 @@ impl WgpuCanvas {
         let surface_format = if Context::is_initialized() {
             Context::get().surface_format
         } else {
+            let asked = web_time::Instant::now();
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::all(),
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -1109,6 +1112,7 @@ impl WgpuCanvas {
                 })
                 .await
                 .expect("Failed to create device");
+            Context::note_device_wait(asked.elapsed());
 
             // No surface to query for a preferred format; pick a widely
             // supported non-sRGB format (gamma is handled in shaders).

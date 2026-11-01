@@ -104,16 +104,14 @@ impl Denoise {
             &crate::builtin::linked("package::denoise", &[]),
         );
 
-        let pipeline = ctxt
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("rt_denoise_pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+        let pipeline = ctxt.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rt_denoise_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         Denoise {
             pipeline,

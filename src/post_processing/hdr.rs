@@ -428,7 +428,7 @@ pub struct HdrPipeline {
     oit_layout: wgpu::BindGroupLayout,
     // Rebuilt whenever the sample count changes, since its `MultisampleState.count`
     // must match the (MSAA) HDR scene attachment it composites into.
-    oit_composite_pipeline: wgpu::RenderPipeline,
+    oit_composite_pipeline: Option<wgpu::RenderPipeline>,
 
     sampler: wgpu::Sampler,
 
@@ -707,7 +707,6 @@ impl HdrPipeline {
                 },
             ],
         });
-        let oit_composite_pipeline = Self::create_oit_composite_pipeline(&oit_layout, sample_count);
 
         let vertices = [
             QuadVertex {
@@ -857,7 +856,7 @@ impl HdrPipeline {
             _oit_reveal_msaa_texture: targets.oit_reveal_msaa_texture,
             oit_reveal_msaa_view: targets.oit_reveal_msaa_view,
             oit_layout,
-            oit_composite_pipeline,
+            oit_composite_pipeline: None,
             sampler,
             bloom_layout,
             bloom: std::cell::OnceCell::new(),
@@ -1164,11 +1163,10 @@ impl HdrPipeline {
         if self.width == width && self.height == height && self.sample_count == sample_count {
             return;
         }
-        // The composite pipeline's sample count is baked in, so rebuild it when the
-        // sample count changes (cheap, and only happens on MSAA toggle / first frame).
+        // The composite pipeline's sample count is baked in, so the next composite
+        // rebuilds it when the sample count changes.
         if self.sample_count != sample_count {
-            self.oit_composite_pipeline =
-                Self::create_oit_composite_pipeline(&self.oit_layout, sample_count);
+            self.oit_composite_pipeline = None;
         }
         let targets = Self::create_targets(width, height, sample_count, self.settings.bloom_mips);
         self.scene_texture = targets.scene_texture;
@@ -1255,11 +1253,19 @@ impl HdrPipeline {
     /// Composites the transparent OIT result over the opaque HDR scene. Run after
     /// the transparent geometry pass and before [`resolve`](Self::resolve).
     pub(crate) fn composite_oit(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         gpu: &mut crate::renderer::timings::GpuTimer,
     ) {
         let ctxt = Context::get();
+        // Built here rather than up front: a scene with nothing transparent never
+        // composites, and a driver takes hundreds of milliseconds over a new pipeline.
+        if self.oit_composite_pipeline.is_none() {
+            self.oit_composite_pipeline = Some(Self::create_oit_composite_pipeline(
+                &self.oit_layout,
+                self.sample_count,
+            ));
+        }
         // Sample the single-sample (resolved, under MSAA) OIT targets.
         let bind_group = ctxt.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("hdr_oit_composite_bind_group"),
@@ -1296,7 +1302,7 @@ impl HdrPipeline {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.oit_composite_pipeline);
+        pass.set_pipeline(self.oit_composite_pipeline.as_ref().expect("built above"));
         pass.set_bind_group(0, &bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.draw(0..4, 0..1);
@@ -1751,6 +1757,28 @@ mod tests {
     use crate::scene::SceneNode3d;
     use crate::test_gpu::{luma_at, on_gpu};
     use glamx::Vec3;
+
+    #[test]
+    fn only_something_transparent_compiles_the_oit_composite() {
+        on_gpu(32, 32, async |surface| {
+            let composite_built = || {
+                crate::context::Context::take_built_pipelines()
+                    .iter()
+                    .any(|label| label == "hdr_oit_composite_pipeline")
+            };
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+            let mut scene = SceneNode3d::empty();
+            scene.add_cube(1.0, 1.0, 1.0);
+            composite_built();
+            surface.render_3d(&mut scene, &mut camera).await;
+            assert!(!composite_built());
+            scene
+                .add_cube(1.0, 1.0, 1.0)
+                .set_color(Color::new(0.2, 0.4, 0.9, 0.5));
+            surface.render_3d(&mut scene, &mut camera).await;
+            assert!(composite_built());
+        });
+    }
 
     #[test]
     fn more_bloom_levels_spread_the_glow_further() {

@@ -5,6 +5,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
+use std::time::Duration;
 
 // The global wgpu context singleton.
 // We use RefCell<Option<>> instead of OnceLock to allow resetting the context
@@ -13,6 +14,33 @@ thread_local! {
     static CONTEXT_SINGLETON: RefCell<Option<Context>> = const { RefCell::new(None) };
     // Track number of active windows to know when to reset the context
     static WINDOW_COUNT: Cell<usize> = const { Cell::new(0) };
+    // What building shaders has cost this thread since `take_shader_builds` last looked.
+    static SHADER_BUILDS: Cell<ShaderBuilds> = const { Cell::new(ShaderBuilds::NONE) };
+    // How long asking for the adapter and the device took.
+    static DEVICE_WAIT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    // The pipelines built since a test last looked, by label.
+    #[cfg(test)]
+    static BUILT_PIPELINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// What building shaders cost: a driver compiling a pipeline it has not seen takes
+/// hundreds of milliseconds, on the thread that asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShaderBuilds {
+    /// Shader modules parsed.
+    pub modules: u32,
+    /// Render and compute pipelines built.
+    pub pipelines: u32,
+    /// Time spent on both.
+    pub time: Duration,
+}
+
+impl ShaderBuilds {
+    const NONE: Self = Self {
+        modules: 0,
+        pipelines: 0,
+        time: Duration::ZERO,
+    };
 }
 
 /// The wgpu rendering context containing all GPU resources needed for rendering.
@@ -74,6 +102,48 @@ impl Context {
                 .expect("wgpu context not initialized. Call Context::init() first.")
                 .clone()
         })
+    }
+
+    /// What building shaders has cost this thread since the last call, or since
+    /// it started. Pipelines egui builds count too.
+    pub fn take_shader_builds() -> ShaderBuilds {
+        SHADER_BUILDS.with(|builds| builds.replace(ShaderBuilds::NONE))
+    }
+
+    /// [`take_shader_builds`](Self::take_shader_builds) without resetting it.
+    pub fn shader_builds() -> ShaderBuilds {
+        SHADER_BUILDS.with(Cell::get)
+    }
+
+    /// How long asking for the adapter and the device took, the part of opening a
+    /// window that is the driver's. On a first launch it is seconds.
+    pub fn device_wait() -> Duration {
+        DEVICE_WAIT.with(Cell::get)
+    }
+
+    pub(crate) fn note_shader_build(modules: u32, pipelines: u32, time: Duration) {
+        SHADER_BUILDS.with(|builds| {
+            let so_far = builds.get();
+            builds.set(ShaderBuilds {
+                modules: so_far.modules + modules,
+                pipelines: so_far.pipelines + pipelines,
+                time: so_far.time + time,
+            });
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_built_pipelines() -> Vec<String> {
+        BUILT_PIPELINES.with(|built| std::mem::take(&mut *built.borrow_mut()))
+    }
+
+    #[cfg(test)]
+    fn note_built_pipeline(label: Option<&str>) {
+        BUILT_PIPELINES.with(|built| built.borrow_mut().push(label.unwrap_or("").to_string()));
+    }
+
+    pub(crate) fn note_device_wait(time: Duration) {
+        DEVICE_WAIT.with(|wait| wait.set(time));
     }
 
     /// Checks if the context has been initialized.
@@ -245,7 +315,25 @@ impl Context {
         &self,
         desc: &wgpu::RenderPipelineDescriptor,
     ) -> wgpu::RenderPipeline {
-        self.device.create_render_pipeline(desc)
+        let started = web_time::Instant::now();
+        let pipeline = self.device.create_render_pipeline(desc);
+        Self::note_shader_build(0, 1, started.elapsed());
+        #[cfg(test)]
+        Self::note_built_pipeline(desc.label);
+        pipeline
+    }
+
+    /// Creates a new compute pipeline.
+    pub fn create_compute_pipeline(
+        &self,
+        desc: &wgpu::ComputePipelineDescriptor,
+    ) -> wgpu::ComputePipeline {
+        let started = web_time::Instant::now();
+        let pipeline = self.device.create_compute_pipeline(desc);
+        Self::note_shader_build(0, 1, started.elapsed());
+        #[cfg(test)]
+        Self::note_built_pipeline(desc.label);
+        pipeline
     }
 
     /// Creates a new shader module from WGSL source.
@@ -254,11 +342,15 @@ impl Context {
     /// * `label` - Debug label for the shader
     /// * `source` - WGSL shader source code
     pub fn create_shader_module(&self, label: Option<&str>, source: &str) -> wgpu::ShaderModule {
-        self.device
+        let started = web_time::Instant::now();
+        let module = self
+            .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label,
                 source: wgpu::ShaderSource::Wgsl(source.into()),
-            })
+            });
+        Self::note_shader_build(1, 0, started.elapsed());
+        module
     }
 
     /// Creates a new command encoder.

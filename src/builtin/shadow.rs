@@ -306,8 +306,9 @@ pub struct ShadowMapper {
     transmittance_array_view: wgpu::TextureView,
     /// Filtering sampler for the transmittance atlas (bilinear).
     transmittance_sampler: wgpu::Sampler,
-    /// Pipeline that rasterizes translucent casters into the transmittance atlas.
-    transmittance_pipeline: wgpu::RenderPipeline,
+    /// Pipeline that rasterizes translucent casters into the transmittance atlas,
+    /// built when the first one casts.
+    transmittance_pipeline: Option<wgpu::RenderPipeline>,
     /// Layout for the per-object albedo-texture bind group sampled by the
     /// transmittance pass (so colored shadows follow the occluder's texture).
     transmittance_tex_bgl: wgpu::BindGroupLayout,
@@ -317,8 +318,8 @@ pub struct ShadowMapper {
     bind_group_layout: wgpu::BindGroupLayout,
     /// Bind group bound by `ObjectMaterial` (group 4).
     bind_group: wgpu::BindGroup,
-    /// Depth-only pipeline used by the pre-pass.
-    depth_pipeline: wgpu::RenderPipeline,
+    /// Depth-only pipeline used by the pre-pass, built when the first caster casts.
+    depth_pipeline: Option<wgpu::RenderPipeline>,
     /// Deformed depth pipeline (GPU skinning + morph). `None` on web (and any adapter
     /// without a free bind group), where deformable casters fall back to the rest
     /// shape.
@@ -472,54 +473,6 @@ impl ShadowMapper {
                 ],
             });
 
-        let depth_pipeline = Self::create_depth_pipeline(
-            &ctxt,
-            &view_bind_group_layout,
-            &model_bind_group_layout,
-            raster_bias,
-        );
-        let transmittance_pipeline = Self::create_transmittance_pipeline(
-            &ctxt,
-            &view_bind_group_layout,
-            &model_bind_group_layout,
-            &transmittance_tex_bgl,
-            None,
-        );
-
-        // Deformed depth/transmittance pipelines: the deform data is bound as a 3rd
-        // bind group (4th for transmittance, which also needs the albedo texture), so
-        // these stay within WebGPU's 4-bind-group cap and run on every target where
-        // deform runs at all — including WebGPU browsers, where the color pass
-        // deforms skinned/morphed meshes. Gating these off where the color pass
-        // deforms would leave the shadow map in the rest pose while the lit geometry
-        // is animated, self-shadowing the moved surfaces (acne). The deform
-        // bind-group layout is the shared one from `builtin::deform`, so each
-        // object's deform bind group works in both the color and shadow passes.
-        // Where the device cannot bind the deform group (WebGL2, Android GLES; see
-        // `Context::supports_deform`) the color pass draws rest poses too, so a
-        // rest-pose shadow map is consistent rather than acne-prone.
-        let (deform_depth_pipeline, deform_transmittance_pipeline) = if ctxt.supports_deform() {
-            let deform_layout = crate::builtin::deform::deform_bind_group_layout();
-            let depth = Self::create_depth_pipeline_deform(
-                &ctxt,
-                &view_bind_group_layout,
-                &model_bind_group_layout,
-                &deform_layout,
-                raster_bias,
-            );
-            let transmittance = Self::create_transmittance_pipeline_deform(
-                &ctxt,
-                &view_bind_group_layout,
-                &model_bind_group_layout,
-                &deform_layout,
-                &transmittance_tex_bgl,
-                None,
-            );
-            (Some(depth), Some(transmittance))
-        } else {
-            (None, None)
-        };
-
         let view_capacity = DEFAULT_SHADOW_VIEWS as u64;
         let view_uniform_buffer = ctxt.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow_view_uniform_buffer"),
@@ -584,14 +537,14 @@ impl ShadowMapper {
             transmittance_layer_views,
             transmittance_array_view,
             transmittance_sampler,
-            transmittance_pipeline,
+            transmittance_pipeline: None,
             transmittance_tex_bgl,
             uniform_buffer,
             bind_group_layout,
             bind_group,
-            depth_pipeline,
-            deform_depth_pipeline,
-            deform_transmittance_pipeline,
+            depth_pipeline: None,
+            deform_depth_pipeline: None,
+            deform_transmittance_pipeline: None,
             cutout_pipelines: None,
             view_bind_group_layout,
             view_uniform_buffer,
@@ -1451,23 +1404,71 @@ impl ShadowMapper {
             return;
         }
         self.raster_bias = bias;
+        self.depth_pipeline = None;
+        self.deform_depth_pipeline = None;
+        self.cutout_pipelines = None;
+    }
+
+    /// Builds what this frame's casters draw with, if it is not built yet. A driver
+    /// takes hundreds of milliseconds over a pipeline it has not seen, so a scene
+    /// that casts no shadow compiles none of these.
+    ///
+    /// The deformed pipelines bind the deform data as a 3rd bind group (4th for
+    /// transmittance, which also needs the albedo texture), so they stay within
+    /// WebGPU's 4-bind-group cap and run on every target where deform runs at all,
+    /// WebGPU browsers included. Gating them off where the color pass deforms would
+    /// leave the shadow map in the rest pose while the lit geometry is animated,
+    /// self-shadowing the moved surfaces (acne). The deform bind-group layout is the
+    /// shared one from `builtin::deform`, so each object's deform bind group works in
+    /// both the color and shadow passes. Where the device cannot bind the deform group
+    /// (WebGL2, Android GLES; see `Context::supports_deform`) the color pass draws rest
+    /// poses too, so a rest-pose shadow map is consistent rather than acne-prone.
+    fn ensure_caster_pipelines(
+        &mut self,
+        has_transparent: bool,
+        has_cutout: bool,
+        has_deformed: bool,
+    ) {
         let ctxt = Context::get();
-        self.depth_pipeline = Self::create_depth_pipeline(
-            &ctxt,
-            &self.view_bind_group_layout,
-            &self.model_bind_group_layout,
-            bias,
-        );
-        if self.deform_depth_pipeline.is_some() {
+        if self.depth_pipeline.is_none() {
+            self.depth_pipeline = Some(Self::create_depth_pipeline(
+                &ctxt,
+                &self.view_bind_group_layout,
+                &self.model_bind_group_layout,
+                self.raster_bias,
+            ));
+        }
+        if has_transparent && self.transmittance_pipeline.is_none() {
+            self.transmittance_pipeline = Some(Self::create_transmittance_pipeline(
+                &ctxt,
+                &self.view_bind_group_layout,
+                &self.model_bind_group_layout,
+                &self.transmittance_tex_bgl,
+                None,
+            ));
+        }
+        if has_deformed && self.deform_depth_pipeline.is_none() {
             self.deform_depth_pipeline = Some(Self::create_depth_pipeline_deform(
                 &ctxt,
                 &self.view_bind_group_layout,
                 &self.model_bind_group_layout,
                 &crate::builtin::deform::deform_bind_group_layout(),
-                bias,
+                self.raster_bias,
             ));
         }
-        self.cutout_pipelines = None;
+        if has_deformed && has_transparent && self.deform_transmittance_pipeline.is_none() {
+            self.deform_transmittance_pipeline = Some(Self::create_transmittance_pipeline_deform(
+                &ctxt,
+                &self.view_bind_group_layout,
+                &self.model_bind_group_layout,
+                &crate::builtin::deform::deform_bind_group_layout(),
+                &self.transmittance_tex_bgl,
+                None,
+            ));
+        }
+        if has_cutout {
+            self.ensure_cutout_pipelines();
+        }
     }
 
     /// Builds the cutout depth pipelines if they are not built yet.
@@ -1484,7 +1485,7 @@ impl ShadowMapper {
             &self.transmittance_tex_bgl,
             bias,
         );
-        let deformed = self.deform_depth_pipeline.as_ref().map(|_| {
+        let deformed = ctxt.supports_deform().then(|| {
             Self::create_transmittance_pipeline_deform(
                 &ctxt,
                 &self.view_bind_group_layout,
@@ -1699,11 +1700,13 @@ impl ShadowMapper {
         let mut models: Vec<ShadowModelUniforms> = Vec::new();
         let mut has_transparent = false;
         let mut has_cutout = false;
+        let mut has_deformed = false;
         scene
             .data()
-            .collect_shadow_models(&mut |transform, scale, color, cutoff| {
+            .collect_shadow_models(&mut |transform, scale, color, cutoff, deformed| {
                 has_transparent |= cutoff.is_none() && color.a < OPAQUE_ALPHA_THRESHOLD;
                 has_cutout |= cutoff.is_some();
+                has_deformed |= deformed;
                 let scale_mat = glamx::Mat3::from_diagonal(scale).to_cols_array_2d();
                 models.push(ShadowModelUniforms {
                     transform: transform.to_mat4().to_cols_array_2d(),
@@ -1716,9 +1719,6 @@ impl ShadowMapper {
                     params: [cutoff.unwrap_or(0.0), 0.0, 0.0, 0.0],
                 });
             });
-        if has_cutout {
-            self.ensure_cutout_pipelines();
-        }
 
         if models.is_empty() {
             // No surface geometry to occlude: nothing to render, behave as off.
@@ -1726,6 +1726,8 @@ impl ShadowMapper {
             ctxt.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
             return;
         }
+
+        self.ensure_caster_pipelines(has_transparent, has_cutout, has_deformed);
 
         // Upload per-view matrices into the dynamic buffer (one aligned slot each).
         self.ensure_view_capacity(views.len() as u64);
@@ -1774,7 +1776,8 @@ impl ShadowMapper {
                     multiview_mask: None,
                 });
 
-                pass.set_pipeline(&self.depth_pipeline);
+                let depth_pipeline = self.depth_pipeline.as_ref().expect("built above");
+                pass.set_pipeline(depth_pipeline);
                 pass.set_bind_group(0, &self.view_bind_group, &[offset]);
 
                 // Deformable casters use the deformed depth pipeline so their shadow
@@ -1785,7 +1788,7 @@ impl ShadowMapper {
                 let mut object_index = 0u32;
                 scene.data_mut().render_shadow_casters(
                     &mut pass,
-                    &self.depth_pipeline,
+                    depth_pipeline,
                     deform,
                     None, // depth pass: no albedo texture / UVs
                     &self.model_bind_group,
@@ -1832,7 +1835,9 @@ impl ShadowMapper {
                     multiview_mask: None,
                 });
 
-                pass.set_pipeline(&self.transmittance_pipeline);
+                let transmittance_pipeline =
+                    self.transmittance_pipeline.as_ref().expect("built above");
+                pass.set_pipeline(transmittance_pipeline);
                 pass.set_bind_group(0, &self.view_bind_group, &[offset]);
 
                 // Deformable translucent casters use the deformed transmittance
@@ -1842,7 +1847,7 @@ impl ShadowMapper {
                 let mut object_index = 0u32;
                 scene.data_mut().render_shadow_casters(
                     &mut pass,
-                    &self.transmittance_pipeline,
+                    transmittance_pipeline,
                     deform,
                     Some(&self.transmittance_tex_bgl), // tints the shadow by the albedo texture
                     &self.model_bind_group,
@@ -2167,6 +2172,132 @@ mod tests {
         ground.set_position(Vec3::new(0.0, -1.1, 0.0));
         scene.add_cube(2.0, 2.0, 2.0);
         scene
+    }
+
+    /// What rendering `scene` once built, among the pipelines this file owns.
+    async fn caster_pipelines_built_by(
+        surface: &mut crate::window::OffscreenSurface,
+        scene: &mut SceneNode3d,
+    ) -> Vec<String> {
+        crate::context::Context::take_built_pipelines();
+        let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 3.0, 8.0), Vec3::ZERO);
+        surface.render_3d(scene, &mut camera).await;
+        crate::context::Context::take_built_pipelines()
+            .into_iter()
+            .filter(|label| label.starts_with("shadow_"))
+            .collect()
+    }
+
+    #[test]
+    fn a_new_mapper_compiles_nothing() {
+        on_gpu(32, 32, async |_surface| {
+            crate::context::Context::take_built_pipelines();
+            let _mapper = super::ShadowMapper::new(16);
+            assert_eq!(
+                crate::context::Context::take_built_pipelines(),
+                Vec::<String>::new()
+            );
+        });
+    }
+
+    #[test]
+    fn a_scene_with_no_caster_compiles_no_shadow_pipeline() {
+        on_gpu(32, 32, async |surface| {
+            let mut scene = SceneNode3d::empty();
+            scene
+                .add_light(Light::point(40.0).with_intensity(2.0))
+                .set_position(Vec3::new(3.0, 3.0, 1.0));
+            assert_eq!(
+                caster_pipelines_built_by(surface, &mut scene).await,
+                Vec::<String>::new()
+            );
+        });
+    }
+
+    #[test]
+    fn opaque_casters_compile_the_depth_pipeline_alone_and_once() {
+        on_gpu(32, 32, async |surface| {
+            let mut scene = lit_cube_on_ground(1);
+            assert_eq!(
+                caster_pipelines_built_by(surface, &mut scene).await,
+                ["shadow_depth_pipeline"]
+            );
+            assert_eq!(
+                caster_pipelines_built_by(surface, &mut scene).await,
+                Vec::<String>::new()
+            );
+        });
+    }
+
+    #[test]
+    fn a_translucent_caster_adds_the_transmittance_pipeline_when_it_appears() {
+        on_gpu(32, 32, async |surface| {
+            let mut scene = lit_cube_on_ground(1);
+            caster_pipelines_built_by(surface, &mut scene).await;
+            let mut glass = scene.add_cube(1.0, 1.0, 1.0);
+            glass.set_color(Color::new(0.2, 0.4, 0.9, 0.5));
+            glass.set_position(Vec3::new(0.0, 2.0, 0.0));
+            assert_eq!(
+                caster_pipelines_built_by(surface, &mut scene).await,
+                ["shadow_transmittance_pipeline"]
+            );
+        });
+    }
+
+    #[test]
+    fn a_morphed_caster_compiles_the_deformed_pipelines_it_draws_with() {
+        use crate::resource::{GpuMesh3d, MorphTargets};
+        use glamx::Vec2;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        on_gpu(32, 32, async |surface| {
+            if !crate::context::Context::get().supports_deform() {
+                return;
+            }
+            let coords = vec![
+                Vec3::new(-0.5, 0.0, -0.5),
+                Vec3::new(0.5, 0.0, -0.5),
+                Vec3::new(0.5, 0.0, 0.5),
+                Vec3::new(-0.5, 0.0, 0.5),
+            ];
+            let mut mesh = GpuMesh3d::new(
+                coords,
+                vec![[0, 1, 2], [0, 2, 3]],
+                None,
+                Some(vec![Vec2::ZERO; 4]),
+                false,
+            );
+            mesh.set_morph_targets(MorphTargets::new(1, 4, vec![[1.5, 0.0, 0.0, 0.0]; 4], None));
+            let mut scene = lit_cube_on_ground(1);
+            let mut morphed = scene.add_mesh(Rc::new(RefCell::new(mesh)), Vec3::ONE);
+            morphed.set_morph_weights(&[1.0]);
+
+            // Twice: the object's deform group is built as it is first drawn.
+            let mut built = caster_pipelines_built_by(surface, &mut scene).await;
+            built.extend(caster_pipelines_built_by(surface, &mut scene).await);
+            assert!(
+                built.iter().any(|l| l == "shadow_depth_deform_pipeline"),
+                "{:?}",
+                built
+            );
+            assert!(
+                !built
+                    .iter()
+                    .any(|l| l == "shadow_transmittance_skinned_pipeline"),
+                "{:?}",
+                built
+            );
+
+            morphed.set_color(Color::new(0.2, 0.4, 0.9, 0.5));
+            let built = caster_pipelines_built_by(surface, &mut scene).await;
+            assert!(
+                built
+                    .iter()
+                    .any(|l| l == "shadow_transmittance_skinned_pipeline"),
+                "{:?}",
+                built
+            );
+        });
     }
 
     #[test]
