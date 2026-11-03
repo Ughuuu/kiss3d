@@ -13,9 +13,14 @@ pub struct EguiRenderer {
     /// a frame that ran no pass draws these again rather than tessellating the
     /// same shapes. `None` once the shapes change.
     primitives: Option<(f32, Vec<egui::ClippedPrimitive>)>,
+    /// The size the renderer's buffers were last filled for; `None` once
+    /// `primitives` changed, so a frame drawing the same ones uploads nothing.
+    uploaded_for: Option<[u32; 2]>,
     textures_delta: egui::TexturesDelta,
     cursor: egui::CursorIcon,
     retain_shapes: bool,
+    #[cfg(test)]
+    uploads: u32,
 }
 
 impl EguiRenderer {
@@ -92,9 +97,12 @@ impl EguiRenderer {
             renderer,
             shapes: Vec::new(),
             primitives: None,
+            uploaded_for: None,
             textures_delta: Default::default(),
             cursor: egui::CursorIcon::Default,
             retain_shapes: false,
+            #[cfg(test)]
+            uploads: 0,
         }
     }
 
@@ -246,6 +254,7 @@ impl EguiRenderer {
             };
             let tessellated = self.egui_ctx.tessellate(shapes, scale_factor);
             self.primitives = Some((scale_factor, tessellated));
+            self.uploaded_for = None;
         }
         let Some((_, clipped_primitives)) = &self.primitives else {
             return;
@@ -260,14 +269,23 @@ impl EguiRenderer {
         // Create our own encoder for egui rendering to avoid lifetime issues
         let mut encoder = ctxt.create_command_encoder(Some("egui_command_encoder"));
 
-        // Update buffers
-        self.renderer.update_buffers(
-            &ctxt.device,
-            &ctxt.queue,
-            &mut encoder,
-            clipped_primitives,
-            &screen_descriptor,
-        );
+        // A frame drawing the last pass again draws from what the buffers
+        // already hold: an upload is a staging buffer each for the vertices and
+        // the indices, made afresh inside wgpu.
+        if self.uploaded_for != Some([width, height]) {
+            self.renderer.update_buffers(
+                &ctxt.device,
+                &ctxt.queue,
+                &mut encoder,
+                clipped_primitives,
+                &screen_descriptor,
+            );
+            self.uploaded_for = Some([width, height]);
+            #[cfg(test)]
+            {
+                self.uploads += 1;
+            }
+        }
 
         // Render
         {
@@ -353,6 +371,7 @@ fn egui_captures_pointer(ctx: &EguiContext) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_gpu::on_gpu;
 
     const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
     const WINDOW_POS: egui::Pos2 = egui::pos2(10.0, 10.0);
@@ -411,5 +430,69 @@ mod tests {
     fn pointer_over_a_widget_goes_to_egui() {
         assert!(captures_at(OVER_WINDOW, false));
         assert!(captures_at(OVER_WINDOW, true));
+    }
+
+    fn target(width: u32, height: u32) -> wgpu::TextureView {
+        Context::get()
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("egui_test_target"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: Context::get().surface_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&Default::default())
+    }
+
+    fn pass(renderer: &mut EguiRenderer, text: &str) {
+        renderer.begin_frame(RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+            ..Default::default()
+        });
+        egui::Window::new("panel").show(renderer.context(), |ui| ui.label(text));
+        renderer.end_frame();
+    }
+
+    #[test]
+    fn a_frame_drawing_the_last_pass_again_uploads_nothing() {
+        on_gpu(64, 64, async |_surface| {
+            let mut renderer = EguiRenderer::new();
+            renderer.set_retain_shapes(true);
+            let small = target(800, 600);
+            let large = target(1000, 600);
+            pass(&mut renderer, "first");
+            renderer.render(&small, &small, 800, 600, 1.0);
+            assert_eq!(renderer.uploads, 1, "a pass is uploaded");
+            renderer.render(&small, &small, 800, 600, 1.0);
+            assert_eq!(renderer.uploads, 1, "nothing changed");
+            renderer.render(&large, &large, 1000, 600, 1.0);
+            assert_eq!(renderer.uploads, 2, "the screen size is in the upload");
+            renderer.render(&large, &large, 1000, 600, 2.0);
+            assert_eq!(renderer.uploads, 3, "tessellated again for the new scale");
+            pass(&mut renderer, "second");
+            renderer.render(&large, &large, 1000, 600, 2.0);
+            assert_eq!(renderer.uploads, 4, "a new pass is uploaded");
+        });
+    }
+
+    #[test]
+    fn a_renderer_that_keeps_nothing_uploads_every_pass() {
+        on_gpu(64, 64, async |_surface| {
+            let mut renderer = EguiRenderer::new();
+            let view = target(800, 600);
+            for frame in 1..=3 {
+                pass(&mut renderer, "text");
+                renderer.render(&view, &view, 800, 600, 1.0);
+                assert_eq!(renderer.uploads, frame);
+            }
+        });
     }
 }

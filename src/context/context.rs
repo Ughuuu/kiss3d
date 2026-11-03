@@ -4,8 +4,10 @@
 //! across window recreations.
 
 use std::cell::{Cell, RefCell};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use super::uploads::Uploads;
 
 // The global wgpu context singleton.
 // We use RefCell<Option<>> instead of OnceLock to allow resetting the context
@@ -59,6 +61,8 @@ pub struct Context {
     pub adapter: Arc<wgpu::Adapter>,
     /// The preferred texture format for the surface.
     pub surface_format: wgpu::TextureFormat,
+    /// What [`Self::write_buffer`] crosses to the GPU through.
+    uploads: Arc<Mutex<Uploads>>,
 }
 
 impl Context {
@@ -80,8 +84,10 @@ impl Context {
         adapter: wgpu::Adapter,
         surface_format: wgpu::TextureFormat,
     ) {
+        let uploads = Uploads::new(&device, adapter.get_info().backend);
         CONTEXT_SINGLETON.with(|cell| {
             *cell.borrow_mut() = Some(Context {
+                uploads: Arc::new(Mutex::new(uploads)),
                 instance: Arc::new(instance),
                 device: Arc::new(device),
                 queue: Arc::new(queue),
@@ -258,7 +264,13 @@ impl Context {
     /// * `offset` - Byte offset into the buffer
     /// * `data` - The data to write
     pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
-        self.queue.write_buffer(buffer, offset, data);
+        self.uploads().write(&self.queue, buffer, offset, data);
+    }
+
+    pub(super) fn uploads(&self) -> std::sync::MutexGuard<'_, Uploads> {
+        self.uploads
+            .lock()
+            .expect("a write panicking is a validation error, and that ends the program")
     }
 
     /// Creates a new texture on the GPU.
@@ -367,7 +379,7 @@ impl Context {
     /// # Arguments
     /// * `command_buffers` - Iterator of command buffers to submit
     pub fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(&self, command_buffers: I) {
-        self.queue.submit(command_buffers);
+        self.submit_indexed(command_buffers);
     }
 
     /// Submits command buffers to the GPU queue, returning the submission
@@ -377,7 +389,8 @@ impl Context {
         &self,
         command_buffers: I,
     ) -> wgpu::SubmissionIndex {
-        self.queue.submit(command_buffers)
+        let copies = self.uploads().take_copies();
+        self.queue.submit(copies.into_iter().chain(command_buffers))
     }
 
     /// Writes texture data to the GPU.
