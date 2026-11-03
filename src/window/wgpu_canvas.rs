@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::context::Context;
 use crate::event::{Action, Key, Modifiers, MouseButton, TouchAction, WindowEvent};
+use crate::window::access::{self, Access};
 use crate::window::canvas::CanvasSetup;
 use image::{GenericImage, Pixel};
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
@@ -102,6 +103,69 @@ impl Waker {
         #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
         let _ = self.0.send_event(());
     }
+}
+
+/// What ends a wait on the loop kiss3d pumps, if it pumps one here.
+pub(crate) fn loop_waker() -> Option<Waker> {
+    #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
+    {
+        EVENT_LOOP.with(|cell| cell.borrow().as_ref().map(|el| Waker(el.create_proxy())))
+    }
+    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
+    {
+        None
+    }
+}
+
+/// Runs `with` on the loop's `ActiveEventLoop`, which exists only inside a
+/// callback: one pump, whose window events go where every other pump's do.
+#[cfg(all(
+    feature = "egui",
+    not(any(target_arch = "wasm32", target_os = "ios", target_os = "android"))
+))]
+pub(crate) fn with_active_loop<T>(with: impl FnOnce(&ActiveEventLoop) -> T) -> T {
+    use winit::platform::pump_events::EventLoopExtPumpEvents;
+
+    struct OneTurn<Asked, T> {
+        asked: Option<Asked>,
+        answer: Option<T>,
+    }
+
+    impl<Asked: FnOnce(&ActiveEventLoop) -> T, T> ApplicationHandler for OneTurn<Asked, T> {
+        fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+            if let Some(asked) = self.asked.take() {
+                self.answer = Some(asked(event_loop));
+            }
+        }
+
+        fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+
+        fn window_event(
+            &mut self,
+            _event_loop: &ActiveEventLoop,
+            window_id: winit::window::WindowId,
+            event: WinitWindowEvent,
+        ) {
+            collect_window_event(window_id, event);
+        }
+    }
+
+    EVENT_LOOP.with(|cell| {
+        let mut event_loop = cell.borrow_mut();
+        let event_loop = event_loop
+            .as_mut()
+            .expect("a window has just been made on this loop");
+        let mut turn = OneTurn {
+            asked: Some(with),
+            answer: None,
+        };
+        loop {
+            let _ = event_loop.pump_app_events(Some(std::time::Duration::ZERO), &mut turn);
+            if let Some(answer) = turn.answer.take() {
+                return answer;
+            }
+        }
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -211,6 +275,7 @@ enum PendingEvent {
 /// when the batch is drained.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn collect_window_event(window_id: winit::window::WindowId, event: WinitWindowEvent) {
+    access::window_event(window_id, &event);
     let pending_events: Vec<PendingEvent> = match event {
         WinitWindowEvent::CloseRequested => {
             vec![PendingEvent::WindowEvent(WindowEvent::Close)]
@@ -367,6 +432,8 @@ pub struct WgpuCanvas {
     /// Keep closures alive (WASM only)
     #[cfg(target_arch = "wasm32")]
     _event_closures: Vec<wasm_bindgen::JsValue>,
+    /// A screen reader's way in, for a window opened with `accessible`.
+    access: Option<Access>,
 }
 
 impl WgpuCanvas {
@@ -377,6 +444,11 @@ impl WgpuCanvas {
         out_events: Sender<WindowEvent>,
     ) -> Self {
         let canvas_setup = canvas_setup.unwrap_or_default();
+
+        // An adapter has to exist before the window is first shown.
+        let accessible = canvas_setup.accessible && access::AVAILABLE;
+        let shown = window_attrs.visible;
+        let window_attrs = window_attrs.with_visible(shown && !accessible);
 
         // Create the window.
         //
@@ -533,6 +605,10 @@ impl WgpuCanvas {
         };
 
         let window = Arc::new(window);
+        let access = accessible.then(|| Access::attach(&window));
+        if accessible {
+            window.set_visible(shown);
+        }
 
         // Check if we already have a context initialized (multi-window case)
         let (surface, surface_format) = if Context::is_initialized() {
@@ -1027,6 +1103,7 @@ impl WgpuCanvas {
         let window_id = window.id();
 
         WgpuCanvas {
+            access,
             window: Some(window),
             #[cfg(not(target_arch = "wasm32"))]
             window_id: Some(window_id),
@@ -1154,6 +1231,7 @@ impl WgpuCanvas {
         let readback_texture = std::cell::RefCell::new(None);
 
         WgpuCanvas {
+            access: None,
             window: None,
             #[cfg(not(target_arch = "wasm32"))]
             window_id: None,
@@ -1437,13 +1515,26 @@ impl WgpuCanvas {
     /// Something that ends a [`Self::wait_events`] from another thread.
     /// `None` where the loop is not kiss3d's to pump.
     pub fn waker(&self) -> Option<Waker> {
-        #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
-        {
-            EVENT_LOOP.with(|cell| cell.borrow().as_ref().map(|el| Waker(el.create_proxy())))
-        }
-        #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
-        {
-            None
+        loop_waker()
+    }
+
+    /// What a screen reader asked since the last call.
+    #[cfg(feature = "egui")]
+    pub fn take_access_events(&self) -> Vec<crate::window::AccessEvent> {
+        self.access
+            .as_ref()
+            .map_or_else(Vec::new, Access::take_events)
+    }
+
+    /// Hand a screen reader what changed. The platform drops it while none has
+    /// asked; the first update after [`AccessEvent::Activated`] has to be the
+    /// whole tree.
+    ///
+    /// [`AccessEvent::Activated`]: crate::window::AccessEvent::Activated
+    #[cfg(feature = "egui")]
+    pub fn update_access(&self, update: egui::accesskit::TreeUpdate) {
+        if let Some(access) = &self.access {
+            access.update(update);
         }
     }
 

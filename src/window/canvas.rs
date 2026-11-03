@@ -53,6 +53,14 @@ pub struct CanvasSetup {
     /// the ones kiss3d enables by default.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub required_features: wgpu::Features,
+    /// Whether a screen reader can reach this window, through AccessKit's adapter
+    /// for the platform. Off by default. On, the adapter answers the platform by
+    /// itself and a frame pays nothing until a reader asks: see
+    /// [`Window::take_access_events`](super::Window::take_access_events). Needs the
+    /// `egui` feature, and does nothing on the web or Android, or on a headless
+    /// window.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub accessible: bool,
 }
 
 impl Default for CanvasSetup {
@@ -62,6 +70,7 @@ impl Default for CanvasSetup {
             samples: NumSamples::Four,
             canvas_id: "canvas".to_string(),
             required_features: wgpu::Features::empty(),
+            accessible: false,
         }
     }
 }
@@ -110,6 +119,19 @@ impl Canvas {
     /// What ends a [`Self::wait_events`] from another thread.
     pub fn waker(&self) -> Option<super::Waker> {
         self.canvas.waker()
+    }
+
+    /// What a screen reader asked since the last call; see
+    /// [`CanvasSetup::accessible`].
+    #[cfg(feature = "egui")]
+    pub fn take_access_events(&self) -> Vec<super::AccessEvent> {
+        self.canvas.take_access_events()
+    }
+
+    /// Hand a screen reader what changed; see [`CanvasSetup::accessible`].
+    #[cfg(feature = "egui")]
+    pub fn update_access(&self, update: egui::accesskit::TreeUpdate) {
+        self.canvas.update_access(update);
     }
 
     /// Resizes the canvas render targets.

@@ -58,6 +58,24 @@ impl Window {
         self.canvas.wait_events(timeout)
     }
 
+    /// What a screen reader asked since the last call: a reader arriving or
+    /// leaving, or asking something of a node. Read between frames; an empty answer
+    /// is all a window pays until one asks, and only one opened with
+    /// [`CanvasSetup::accessible`](crate::window::CanvasSetup::accessible) hears
+    /// anything. A request wakes [`Self::wait_events`].
+    #[cfg(feature = "egui")]
+    pub fn take_access_events(&self) -> Vec<crate::window::AccessEvent> {
+        self.canvas.take_access_events()
+    }
+
+    /// Hand a screen reader what changed: the whole tree first, after
+    /// [`AccessEvent::Activated`](crate::window::AccessEvent::Activated), then
+    /// only what moved. Goes nowhere while no reader has asked.
+    #[cfg(feature = "egui")]
+    pub fn update_access(&self, update: egui::accesskit::TreeUpdate) {
+        self.canvas.update_access(update);
+    }
+
     /// What ends a [`Self::wait_events`] from another thread; `None` where
     /// the platform owns the loop.
     pub fn waker(&self) -> Option<crate::window::Waker> {

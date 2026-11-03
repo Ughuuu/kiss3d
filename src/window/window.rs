@@ -1137,6 +1137,16 @@ impl Window {
         Window::do_new(title, true, width, height, None).await
     }
 
+    /// As [`Self::new_hidden_with_size`], with `setup` in place of the defaults.
+    pub async fn new_hidden_with_setup(
+        title: &str,
+        width: u32,
+        height: u32,
+        setup: CanvasSetup,
+    ) -> Window {
+        Window::do_new(title, true, width, height, Some(setup)).await
+    }
+
     /// Creates a new visible window with default settings.
     ///
     /// The window is created and immediately visible with a default size of 800x600 pixels.
