@@ -105,10 +105,7 @@ impl Waves {
         // Load shader
         let shader = ctxt.create_shader_module(
             Some("waves_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::waves",
-                include_str!("../builtin/waves.wgsl"),
-            ),
+            &crate::builtin::linked("package::waves", &[]),
         );
 
         // Vertex buffer layout

@@ -88,10 +88,7 @@ impl PointRenderer2d {
         // Load shader
         let shader = ctxt.create_shader_module(
             Some("planar_point_renderer_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::points2d",
-                include_str!("../builtin/points2d.wgsl"),
-            ),
+            &crate::builtin::linked("package::points2d", &[]),
         );
 
         // No vertex buffers - using storage buffer and vertex_index. Built lazily per
@@ -164,6 +161,11 @@ impl PointRenderer2d {
     /// Indicates whether some points have to be drawn.
     pub fn needs_rendering(&self) -> bool {
         !self.points.is_empty()
+    }
+
+    /// Drops the points queued for the next frame.
+    pub(crate) fn clear(&mut self) {
+        self.points.clear();
     }
 
     /// Adds a 2D point to be drawn during the next frame. Points are not persistent between frames.

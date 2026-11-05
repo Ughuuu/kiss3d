@@ -343,6 +343,9 @@ pub struct WgpuCanvas {
     modifiers_state: ModifiersState,
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    /// Whether an effect reads the depth, which a multisampled one must then be
+    /// a texture for.
+    depth_readable: bool,
     /// Multisampling texture for MSAA (if enabled)
     msaa_texture: Option<wgpu::Texture>,
     msaa_view: Option<wgpu::TextureView>,
@@ -565,6 +568,7 @@ impl WgpuCanvas {
             // connected to another API". Separate instances mean the failed
             // candidate's surface is dropped — and the window disconnected —
             // before the next backend touches it.
+            let asked = web_time::Instant::now();
             let request = |backends| {
                 let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                     backends,
@@ -620,6 +624,7 @@ impl WgpuCanvas {
                 })
                 .await
                 .expect("Failed to create device");
+            Context::note_device_wait(asked.elapsed());
 
             // Get surface capabilities
             // We explicitly prefer non-sRGB formats for consistent behavior across platforms.
@@ -646,7 +651,10 @@ impl WgpuCanvas {
         let surface_caps = surface.get_capabilities(&ctxt.adapter);
 
         // Get the actual window size
+        #[cfg(not(target_arch = "wasm32"))]
         let size = window.inner_size();
+        #[cfg(target_arch = "wasm32")]
+        let size = measured_size(&window);
         let width = size.width.max(1);
         let height = size.height.max(1);
 
@@ -689,8 +697,13 @@ impl WgpuCanvas {
         surface.configure(&ctxt.device, &surface_config);
 
         // Create depth texture
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, canvas_setup.samples as u32);
+        let (depth_texture, depth_view) = Self::create_depth_texture(
+            &ctxt.device,
+            width,
+            height,
+            canvas_setup.samples as u32,
+            false,
+        );
 
         // Create MSAA texture if needed
         let sample_count = canvas_setup.samples as u32;
@@ -725,17 +738,7 @@ impl WgpuCanvas {
                     let canvas_clone = canvas.clone();
                     let closure =
                         Closure::<dyn FnMut(_)>::new(move |event: web_sys::PointerEvent| {
-                            // Get coordinates relative to canvas, accounting for CSS scaling
-                            let rect = canvas_clone.get_bounding_client_rect();
-                            let css_x = event.client_x() as f64 - rect.left();
-                            let css_y = event.client_y() as f64 - rect.top();
-
-                            // Scale from CSS pixels to canvas pixels
-                            let scale_x = canvas_clone.width() as f64 / rect.width();
-                            let scale_y = canvas_clone.height() as f64 / rect.height();
-                            let x = css_x * scale_x;
-                            let y = css_y * scale_y;
-
+                            let (x, y) = canvas_point(&canvas_clone, &event);
                             pending.borrow_mut().push(WindowEvent::CursorPos(
                                 x,
                                 y,
@@ -752,12 +755,18 @@ impl WgpuCanvas {
                 // Pointer down
                 {
                     let pending = pending_events.clone();
+                    let canvas_clone = canvas.clone();
                     let closure =
                         Closure::<dyn FnMut(_)>::new(move |event: web_sys::PointerEvent| {
                             // Only handle mouse pointer type (not touch - that's handled separately)
                             if event.pointer_type() == "mouse" {
                                 let button = translate_web_mouse_button(event.button());
-                                pending.borrow_mut().push(WindowEvent::MouseButton(
+                                let (x, y) = canvas_point(&canvas_clone, &event);
+                                let mut pending = pending.borrow_mut();
+                                // Where the press happened, which no move may
+                                // have reported: a tap that never moved.
+                                pending.push(WindowEvent::CursorPos(x, y, event.modifiers()));
+                                pending.push(WindowEvent::MouseButton(
                                     button,
                                     Action::Press,
                                     event.modifiers(),
@@ -774,12 +783,16 @@ impl WgpuCanvas {
                 // Pointer up
                 {
                     let pending = pending_events.clone();
+                    let canvas_clone = canvas.clone();
                     let closure =
                         Closure::<dyn FnMut(_)>::new(move |event: web_sys::PointerEvent| {
                             // Only handle mouse pointer type (not touch - that's handled separately)
                             if event.pointer_type() == "mouse" {
                                 let button = translate_web_mouse_button(event.button());
-                                pending.borrow_mut().push(WindowEvent::MouseButton(
+                                let (x, y) = canvas_point(&canvas_clone, &event);
+                                let mut pending = pending.borrow_mut();
+                                pending.push(WindowEvent::CursorPos(x, y, event.modifiers()));
+                                pending.push(WindowEvent::MouseButton(
                                     button,
                                     Action::Release,
                                     event.modifiers(),
@@ -1026,6 +1039,7 @@ impl WgpuCanvas {
             modifiers_state: ModifiersState::default(),
             depth_texture,
             depth_view,
+            depth_readable: false,
             msaa_texture,
             msaa_view,
             sample_count,
@@ -1056,6 +1070,7 @@ impl WgpuCanvas {
         let surface_format = if Context::is_initialized() {
             Context::get().surface_format
         } else {
+            let asked = web_time::Instant::now();
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::all(),
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -1097,6 +1112,7 @@ impl WgpuCanvas {
                 })
                 .await
                 .expect("Failed to create device");
+            Context::note_device_wait(asked.elapsed());
 
             // No surface to query for a preferred format; pick a widely
             // supported non-sRGB format (gamma is handled in shaders).
@@ -1122,7 +1138,7 @@ impl WgpuCanvas {
         };
 
         let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, sample_count);
+            Self::create_depth_texture(&ctxt.device, width, height, sample_count, false);
         let (msaa_texture, msaa_view) = if sample_count > 1 {
             let (tex, view) = Self::create_msaa_texture(
                 &ctxt.device,
@@ -1150,6 +1166,7 @@ impl WgpuCanvas {
             modifiers_state: ModifiersState::default(),
             depth_texture,
             depth_view,
+            depth_readable: false,
             msaa_texture,
             msaa_view,
             sample_count,
@@ -1207,8 +1224,13 @@ impl WgpuCanvas {
             surface.configure(&ctxt.device, &self.surface_config);
         }
 
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, self.sample_count);
+        let (depth_texture, depth_view) = Self::create_depth_texture(
+            &ctxt.device,
+            width,
+            height,
+            self.sample_count,
+            self.depth_readable,
+        );
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
 
@@ -1226,6 +1248,27 @@ impl WgpuCanvas {
 
         // Dropped, not rebuilt: the next capture makes one at the new size.
         self.readback_texture.replace(None);
+    }
+
+    /// Make the depth buffer one an effect can read, or stop; a multisampled
+    /// one is rebuilt to match.
+    pub(crate) fn set_depth_readable(&mut self, readable: bool) {
+        if self.depth_readable == readable {
+            return;
+        }
+        self.depth_readable = readable;
+        if self.sample_count > 1 {
+            let ctxt = Context::get();
+            let (depth_texture, depth_view) = Self::create_depth_texture(
+                &ctxt.device,
+                self.surface_config.width.max(1),
+                self.surface_config.height.max(1),
+                self.sample_count,
+                readable,
+            );
+            self.depth_texture = depth_texture;
+            self.depth_view = depth_view;
+        }
     }
 
     /// Changes the MSAA sample count, recreating the size-dependent attachments
@@ -1246,8 +1289,13 @@ impl WgpuCanvas {
         let width = self.surface_config.width.max(1);
         let height = self.surface_config.height.max(1);
 
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, sample_count);
+        let (depth_texture, depth_view) = Self::create_depth_texture(
+            &ctxt.device,
+            width,
+            height,
+            sample_count,
+            self.depth_readable,
+        );
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
 
@@ -1273,8 +1321,16 @@ impl WgpuCanvas {
         width: u32,
         height: u32,
         sample_count: u32,
+        readable: bool,
     ) -> (wgpu::Texture, wgpu::TextureView) {
         let sample_count = sample_count.max(1);
+        // A multisampled depth is a texture only while an effect reads it: GLES
+        // makes it a multisampled texture then, which some drivers cannot attach.
+        let usage = if sample_count == 1 || readable {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        };
         // Ensure minimum dimensions of 1x1 to avoid wgpu validation errors
         let width = width.max(1);
         let height = height.max(1);
@@ -1289,7 +1345,7 @@ impl WgpuCanvas {
             sample_count,
             dimension: wgpu::TextureDimension::D2,
             format: Context::depth_format(),
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1365,9 +1421,9 @@ impl WgpuCanvas {
         })
     }
 
-    /// Polls events from the window system.
-    pub fn poll_events(&mut self) {
-        self.pump_events(Some(std::time::Duration::ZERO));
+    /// Polls events from the window system. Answers whether any arrived.
+    pub fn poll_events(&mut self) -> bool {
+        self.pump_events(Some(std::time::Duration::ZERO))
     }
 
     /// Blocks until the window system has an event, a [`Waker`] wakes it, or
@@ -1570,6 +1626,7 @@ impl WgpuCanvas {
                             width,
                             height,
                             self.sample_count,
+                            self.depth_readable,
                         );
                         self.depth_texture = new_depth;
                         self.depth_view = new_depth_view;
@@ -1598,7 +1655,7 @@ impl WgpuCanvas {
         #[cfg(target_arch = "wasm32")]
         {
             // Check for resize - compare current window size to surface config
-            let current_size = self.window.as_ref().unwrap().inner_size();
+            let current_size = measured_size(self.window.as_ref().unwrap());
             if current_size.width > 0
                 && current_size.height > 0
                 && (current_size.width != self.surface_config.width
@@ -1619,6 +1676,7 @@ impl WgpuCanvas {
                     current_size.width,
                     current_size.height,
                     self.sample_count,
+                    self.depth_readable,
                 );
                 self.depth_texture = new_depth;
                 self.depth_view = new_depth_view;
@@ -2102,11 +2160,17 @@ impl WgpuCanvas {
         }
     }
 
-    /// Let the platform compose text through its input method.
+    /// Let the platform compose text through its input method. Not on Android
+    /// or iOS, where winit's switch is the on-screen keyboard itself (on iOS
+    /// it makes winit's `UIKeyInput` view first responder), which
+    /// [`set_keyboard_visible`](Self::set_keyboard_visible) shows with focus.
     pub fn set_ime_allowed(&self, allowed: bool) {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(window) = &self.window {
             window.set_ime_allowed(allowed);
         }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let _ = allowed;
     }
 
     /// How many pixels of the window the on-screen keyboard covers, from the
@@ -2515,6 +2579,18 @@ impl WebModifiers for web_sys::TouchEvent {
     }
 }
 
+/// Where a pointer event landed on the canvas, in canvas pixels: the CSS
+/// offset from its corner, scaled by how much the canvas is stretched.
+#[cfg(target_arch = "wasm32")]
+fn canvas_point(canvas: &web_sys::HtmlCanvasElement, event: &web_sys::MouseEvent) -> (f64, f64) {
+    let rect = canvas.get_bounding_client_rect();
+    let css_x = event.client_x() as f64 - rect.left();
+    let css_y = event.client_y() as f64 - rect.top();
+    let scale_x = canvas.width() as f64 / rect.width();
+    let scale_y = canvas.height() as f64 / rect.height();
+    (css_x * scale_x, css_y * scale_y)
+}
+
 #[cfg(target_arch = "wasm32")]
 fn translate_web_mouse_button(button: i16) -> MouseButton {
     match button {
@@ -2832,5 +2908,36 @@ mod tests {
         let logical = WinitKey::Character(SmolStr::new("z"));
         let press = translate_keyboard_input(Key::Z, Action::Press, &logical, None);
         assert_eq!(char_events(&press), vec!['z']);
+    }
+}
+
+/// The canvas's size in device pixels from its own layout. Winit learns the
+/// size from a `ResizeObserver`, which the browser delivers only when it next
+/// paints the page, and `inner_size` is zero until then; a page it has not
+/// painted yet has laid the canvas out all the same. The first frames went
+/// to a 1 by 1 surface before this, and a browser given a 1 by 1 present had
+/// nothing to paint again, so a page nothing touched stayed on the clear
+/// colour until the pointer moved (2026-10-20).
+#[cfg(target_arch = "wasm32")]
+fn canvas_layout_size(window: &winit::window::Window) -> Option<winit::dpi::PhysicalSize<u32>> {
+    use winit::platform::web::WindowExtWebSys;
+    let canvas = window.canvas()?;
+    let scale = window.scale_factor();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let width = (f64::from(canvas.client_width()) * scale).round() as u32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let height = (f64::from(canvas.client_height()) * scale).round() as u32;
+    (width > 0 && height > 0).then_some(winit::dpi::PhysicalSize::new(width, height))
+}
+
+/// What winit says the window is, or what the canvas measures while winit has
+/// not heard from its observer yet.
+#[cfg(target_arch = "wasm32")]
+fn measured_size(window: &winit::window::Window) -> winit::dpi::PhysicalSize<u32> {
+    let size = window.inner_size();
+    if size.width > 0 && size.height > 0 {
+        size
+    } else {
+        canvas_layout_size(window).unwrap_or(size)
     }
 }

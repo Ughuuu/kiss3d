@@ -191,10 +191,7 @@ impl Ssr {
         // The downsample shader uses only a texture + sampler (no uniform).
         let downsample_shader = ctxt.create_shader_module(
             Some("ssr_downsample"),
-            &crate::builtin::compile_shader_with_common(
-                "package::env_downsample",
-                crate::builtin::ENV_DOWNSAMPLE_WESL,
-            ),
+            &crate::builtin::linked("package::env_downsample", &[]),
         );
         let downsample_layout = ctxt.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ssr_downsample_layout"),
@@ -219,18 +216,8 @@ impl Ssr {
         // SSR additive pass: viewpos, normal, material, refl-chain, env, per-object
         // SSR params + sampler + uniform. `ssr` imports the shared equirect mapping
         // + analytic env-BRDF from the `pbr_env` WESL module.
-        let ssr_shader = ctxt.create_shader_module(
-            Some("ssr"),
-            &crate::builtin::compile_wesl(
-                &[
-                    ("package::ssr", include_str!("../builtin/ssr.wgsl")),
-                    ("package::pbr_env", crate::builtin::PBR_ENV_WESL),
-                    ("package::common", crate::builtin::COMMON_WESL),
-                ],
-                "package::ssr",
-                &[],
-            ),
-        );
+        let ssr_shader =
+            ctxt.create_shader_module(Some("ssr"), &crate::builtin::linked("package::ssr", &[]));
         let ssr_layout = make_layout("ssr_layout", 6);
         // Additive blend so the SSR delta adds onto the resolved scene; the COLOR
         // write mask leaves alpha untouched.

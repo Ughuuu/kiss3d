@@ -134,10 +134,7 @@ impl EnvironmentMap {
         });
         let shader = ctxt.create_shader_module(
             Some("ibl_downsample"),
-            &crate::builtin::compile_shader_with_common(
-                "package::env_downsample",
-                crate::builtin::ENV_DOWNSAMPLE_WESL,
-            ),
+            &crate::builtin::linked("package::env_downsample", &[]),
         );
         let pipeline = ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("ibl_downsample_pipeline"),

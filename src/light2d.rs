@@ -14,9 +14,10 @@ use crate::color::Color;
 use glamx::Vec2;
 use std::cell::RefCell;
 
-/// Maximum number of simultaneous 2D lights (the lit shader stores them in a
-/// fixed-size uniform array, so this is a hard cap).
-pub const MAX_LIGHTS_2D: usize = 16;
+/// Maximum number of simultaneous 2D lights. The lit shader stores them in a
+/// fixed-size uniform array of 64-byte records, so this is a hard cap: 64 lights
+/// make a 4.2 KiB uniform, within the 16 KiB a WebGL2 uniform binding may hold.
+pub const MAX_LIGHTS_2D: usize = 64;
 
 /// The kind of 2D light source.
 #[derive(Copy, Clone, Debug, PartialEq, Default)]
@@ -27,6 +28,10 @@ pub enum Light2dKind {
     /// Emits a cone of light along [`Light2d::direction`], fading between the inner
     /// and outer cone angles.
     Spot,
+    /// Lights every point alike from far away, travelling along
+    /// [`Light2d::direction`]; its position and radius are ignored, and its
+    /// [`height`](Light2d::height) is the elevation as rise over run.
+    Directional,
 }
 
 /// A dynamic 2D light. Build one with [`Light2d::point`] or [`Light2d::spot`] and add
@@ -36,7 +41,8 @@ pub struct Light2d {
     /// World-space position in the 2D plane.
     pub position: Vec2,
     /// Height above the plane. Larger values flatten the incidence angle (softer
-    /// normal-map shading); 0 puts the light in the plane.
+    /// normal-map shading); 0 puts the light in the plane. For a directional light
+    /// it is a ratio: 0 grazes the plane, 1 comes in at 45°.
     pub height: f32,
     /// Light color.
     pub color: Color,
@@ -44,9 +50,10 @@ pub struct Light2d {
     pub intensity: f32,
     /// Distance beyond which the light contributes nothing.
     pub radius: f32,
-    /// Point vs. spot.
+    /// Point, spot or directional.
     pub kind: Light2dKind,
-    /// Spot direction in the plane (normalized internally); ignored for point lights.
+    /// Spot or directional direction in the plane (normalized internally);
+    /// ignored for point lights.
     pub direction: Vec2,
     /// Spot inner cone half-angle (radians): full intensity within it.
     pub inner_angle: f32,
@@ -103,6 +110,19 @@ impl Light2d {
             kind: Light2dKind::Spot,
             inner_angle: inner,
             outer_angle: outer,
+            ..Default::default()
+        }
+    }
+
+    /// A directional light travelling along `direction` in the plane, coming in at
+    /// 45° (a [`height`](Self::height) of 1).
+    pub fn directional(direction: Vec2, color: Color, intensity: f32) -> Self {
+        Light2d {
+            direction,
+            color,
+            intensity,
+            height: 1.0,
+            kind: Light2dKind::Directional,
             ..Default::default()
         }
     }

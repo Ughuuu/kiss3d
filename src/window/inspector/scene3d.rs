@@ -425,7 +425,7 @@ fn tree_ui(
 
     // Collect child handles before recursing so no scene-node borrow is held.
     let children: Vec<SceneNode3d> = node.data().children().to_vec();
-    let id = egui::Id::new(node.ptr_id());
+    let id = egui::Id::unique(node.ptr_id());
     let mut state =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, is_root);
 

@@ -33,7 +33,9 @@ impl TexArray {
     /// layer so the binding stays valid.
     pub fn build(sources: &[Arc<Texture>]) -> TexArray {
         let ctxt = Context::get();
-        let layers = (sources.len() as u32) + 1; // +1 fallback white layer
+        // +1 fallback white layer, and never one layer in all: GLES picks a
+        // texture's target at creation, and a one-layer one is no array.
+        let layers = (sources.len() as u32 + 1).max(2);
 
         let texture = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("rt_tex_array"),

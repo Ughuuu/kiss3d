@@ -84,18 +84,17 @@ async fn main() {
         spheres.push((s, radius, base_angle));
     }
 
-    // The runtime probe captures only render layer 0 (the floor + skybox), not the
-    // dynamic spheres on layer 1.
-    window.set_reflection_capture_layers(0b01);
-
     // Probe 0: runtime-captured, covering the whole scene (reflects real geometry).
+    // It captures only render layer 0 (the floor + skybox), not the dynamic spheres
+    // on layer 1.
     let captured = window
         .add_reflection_probe(ReflectionProbe {
             center: Vec3::new(0.0, 0.5, 0.0),
             half_extents: Vec3::new(12.0, 5.0, 12.0),
             falloff: 2.0,
             intensity: 1.0,
-            rotation: 0.0,
+            capture_layers: 0b01,
+            ..Default::default()
         })
         .expect("probe slot 0");
 

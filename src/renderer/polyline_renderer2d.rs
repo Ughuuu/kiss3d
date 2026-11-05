@@ -130,10 +130,7 @@ impl PolylineRenderer2d {
         // Load shader
         let shader = ctxt.create_shader_module(
             Some("planar_polyline_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::polyline2d",
-                include_str!("../builtin/polyline2d.wgsl"),
-            ),
+            &crate::builtin::linked("package::polyline2d", &[]),
         );
 
         // Built lazily per MSAA sample count: 2D polylines render into the
@@ -237,6 +234,11 @@ impl PolylineRenderer2d {
     /// Indicates whether some polylines need to be rendered.
     pub fn needs_rendering(&self) -> bool {
         !self.segments.is_empty()
+    }
+
+    /// Drops the segments queued for the next frame.
+    pub(crate) fn clear(&mut self) {
+        self.segments.clear();
     }
 
     /// Adds a 2D polyline to be drawn during the next frame.

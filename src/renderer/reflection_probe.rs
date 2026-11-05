@@ -25,21 +25,22 @@ use crate::context::Context;
 /// `builtin/default.wgsl` and `builtin/object_material.rs`.
 pub const MAX_PROBES: usize = 8;
 
-/// Equirectangular resolution of each probe layer. A 2:1 map; all layers share
-/// this size and mip count (a `texture_2d_array` requires uniform dimensions).
-pub const PROBE_WIDTH: u32 = 256;
-/// See [`PROBE_WIDTH`].
-pub const PROBE_HEIGHT: u32 = 128;
+/// The capture size a window starts with: each cube face of a runtime capture is
+/// this many pixels square, and each probe's equirectangular map is this wide and
+/// half as tall. All layers share one size (a `texture_2d_array` requires it).
+pub const DEFAULT_PROBE_SIZE: u32 = 256;
 
 /// A single reflection probe's placement and influence.
 #[derive(Copy, Clone, Debug)]
 pub struct ReflectionProbe {
     /// World-space center of the probe (the capture viewpoint).
     pub center: glamx::Vec3,
-    /// Half-extents of the parallax/influence box (world axis-aligned), centered
-    /// on `center`. The mirror ray is intersected with this box for parallax
+    /// Half-extents of the parallax/influence box, centered on `center` and turned
+    /// by `orientation`. The mirror ray is intersected with this box for parallax
     /// correction, and a fragment is influenced when inside it.
     pub half_extents: glamx::Vec3,
+    /// Orientation of the parallax/influence box. Default identity: axis-aligned.
+    pub orientation: glamx::Quat,
     /// Width (in world units) of the soft edge over which the probe fades out at
     /// the box boundary, blending back to the global environment.
     pub falloff: f32,
@@ -48,6 +49,14 @@ pub struct ReflectionProbe {
     /// Y-axis rotation (radians) applied when sampling, matching the skybox/IBL
     /// convention. Baked maps that share the skybox orientation use `0.0`.
     pub rotation: f32,
+    /// Near and far planes of a runtime capture. `None`, the default, takes the
+    /// camera's.
+    pub clip_planes: Option<(f32, f32)>,
+    /// Render layers a runtime capture draws: an object is captured when its own
+    /// render-layer mask shares a bit with this. Default `u32::MAX`, every layer.
+    /// A probe captures from one point, so nearby dynamic objects come out
+    /// magnified; leave them off this mask and let SSR reflect them instead.
+    pub capture_layers: u32,
 }
 
 impl Default for ReflectionProbe {
@@ -58,6 +67,9 @@ impl Default for ReflectionProbe {
             falloff: 0.5,
             intensity: 1.0,
             rotation: 0.0,
+            orientation: glamx::Quat::IDENTITY,
+            clip_planes: None,
+            capture_layers: u32::MAX,
         }
     }
 }
@@ -83,20 +95,73 @@ pub struct ReflectionProbes {
     /// Trilinear sampler (repeat U / clamp V), matching the equirect convention.
     sampler: wgpu::Sampler,
     mip_count: u32,
+    /// Equirectangular width of every layer; the height is half of it.
+    size: u32,
     /// Active probes, in layer order (index == array layer).
     probes: Vec<ReflectionProbe>,
 }
 
 impl ReflectionProbes {
-    /// Creates an empty probe set (no probes; the array is allocated up front).
+    /// Creates an empty probe set of [`DEFAULT_PROBE_SIZE`] (no probes; the array
+    /// is allocated up front).
     pub fn new() -> ReflectionProbes {
+        Self::with_size(DEFAULT_PROBE_SIZE)
+    }
+
+    /// Creates an empty probe set whose maps are `size` wide and half as tall
+    /// (`size` is clamped to `2..=4096`).
+    pub fn with_size(size: u32) -> ReflectionProbes {
         let ctxt = Context::get();
-        let mip_count = (32 - PROBE_WIDTH.max(PROBE_HEIGHT).leading_zeros()).max(1);
+        let size = size.clamp(2, 4096);
+        let (texture, array_view, mip_count) = Self::create_array(&ctxt, size);
+        let sampler = ctxt.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("reflection_probe_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        ReflectionProbes {
+            texture,
+            array_view,
+            sampler,
+            mip_count,
+            size,
+            probes: Vec::new(),
+        }
+    }
+
+    /// The equirectangular width of every probe map; the height is half of it.
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    /// Reallocates the probe array at a new map width (clamped to `2..=4096`). The
+    /// probes keep their placement, but every map turns black: set the baked
+    /// images again and re-capture the live ones.
+    pub fn set_size(&mut self, size: u32) {
+        let size = size.clamp(2, 4096);
+        if size == self.size {
+            return;
+        }
+        let (texture, array_view, mip_count) = Self::create_array(&Context::get(), size);
+        self.texture = texture;
+        self.array_view = array_view;
+        self.mip_count = mip_count;
+        self.size = size;
+    }
+
+    fn create_array(ctxt: &Context, size: u32) -> (wgpu::Texture, wgpu::TextureView, u32) {
+        let (width, height) = (size, size / 2);
+        let mip_count = (32 - width.max(height).leading_zeros()).max(1);
         let texture = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("reflection_probe_array"),
             size: wgpu::Extent3d {
-                width: PROBE_WIDTH,
-                height: PROBE_HEIGHT,
+                width,
+                height,
                 depth_or_array_layers: MAX_PROBES as u32,
             },
             mip_level_count: mip_count,
@@ -113,23 +178,7 @@ impl ReflectionProbes {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        let sampler = ctxt.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("reflection_probe_sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        });
-        ReflectionProbes {
-            texture,
-            array_view,
-            sampler,
-            mip_count,
-            probes: Vec::new(),
-        }
+        (texture, array_view, mip_count)
     }
 
     /// Number of active probes.
@@ -211,11 +260,8 @@ impl ReflectionProbes {
             return;
         }
         // Resize to the shared probe resolution (array layers must match).
-        let resized = img.resize_exact(
-            PROBE_WIDTH,
-            PROBE_HEIGHT,
-            image::imageops::FilterType::Triangle,
-        );
+        let (width, height) = (self.size, self.size / 2);
+        let resized = img.resize_exact(width, height, image::imageops::FilterType::Triangle);
         let rgba = resized.to_rgba32f();
         let halves: Vec<u16> = rgba.as_raw().iter().map(|&v| f32_to_f16(v)).collect();
 
@@ -234,12 +280,12 @@ impl ReflectionProbes {
             bytemuck::cast_slice(&halves),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(PROBE_WIDTH * 8),
-                rows_per_image: Some(PROBE_HEIGHT),
+                bytes_per_row: Some(width * 8),
+                rows_per_image: Some(height),
             },
             wgpu::Extent3d {
-                width: PROBE_WIDTH,
-                height: PROBE_HEIGHT,
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
         );
@@ -327,10 +373,7 @@ impl ReflectionProbes {
         let ctxt = Context::get();
         let shader = ctxt.create_shader_module(
             Some("reflection_probe_downsample"),
-            &crate::builtin::compile_shader_with_common(
-                "package::env_downsample",
-                crate::builtin::ENV_DOWNSAMPLE_WESL,
-            ),
+            &crate::builtin::linked("package::env_downsample", &[]),
         );
         let layout = ctxt.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("reflection_probe_downsample_layout"),
@@ -556,10 +599,7 @@ impl ProbeCapture {
 
         let shader = ctxt.create_shader_module(
             Some("cube_to_equirect"),
-            &crate::builtin::compile_shader_with_common(
-                "package::cube_to_equirect",
-                include_str!("../builtin/cube_to_equirect.wgsl"),
-            ),
+            &crate::builtin::linked("package::cube_to_equirect", &[]),
         );
         let reproject_layout = ctxt.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("probe_reproject_layout"),
@@ -711,5 +751,105 @@ fn f32_to_f16(value: f32) -> u16 {
         sign | 0x7c00
     } else {
         sign | ((exp as u16) << 10) | (mant as u16)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReflectionProbe;
+    use crate::camera::OrbitCamera3d;
+    use crate::color::Color;
+    use crate::scene::SceneNode3d;
+    use crate::test_gpu::{luma_at, on_gpu};
+    use crate::window::OffscreenSurface;
+    use glamx::{Quat, Vec3};
+
+    /// A chrome ball on layer 1 facing the camera, and a glowing slab behind the
+    /// camera on layer 0 that only the ball's reflection shows.
+    fn chrome_ball_scene() -> SceneNode3d {
+        let mut scene = SceneNode3d::empty();
+        scene
+            .add_sphere(1.0)
+            .set_color(Color::new(1.0, 1.0, 1.0, 1.0))
+            .set_metallic(1.0)
+            .set_roughness(0.0)
+            .set_render_layers(0b10);
+        scene
+            .add_cube(30.0, 30.0, 1.0)
+            .set_emissive(Color::new(4.0, 4.0, 4.0, 1.0))
+            .set_position(Vec3::new(0.0, 0.0, 9.0));
+        scene
+    }
+
+    async fn reflected_luma(
+        surface: &mut OffscreenSurface,
+        scene: &mut SceneNode3d,
+        probe: ReflectionProbe,
+    ) -> f32 {
+        let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO);
+        *surface.window_mut().reflection_probe_mut(0).unwrap() = probe;
+        surface.window_mut().capture_reflection_probe(0);
+        surface.render_3d(scene, &mut camera).await;
+        luma_at(surface, 32, 32)
+    }
+
+    #[test]
+    fn a_probe_captures_its_own_layers_within_its_own_planes() {
+        on_gpu(64, 64, async |surface| {
+            surface.window_mut().set_ambient(0.0);
+            let mut scene = chrome_ball_scene();
+            let base = ReflectionProbe {
+                half_extents: Vec3::splat(20.0),
+                capture_layers: 0b01,
+                ..Default::default()
+            };
+            assert_eq!(ReflectionProbe::default().capture_layers, u32::MAX);
+            assert_eq!(ReflectionProbe::default().clip_planes, None);
+            surface.window_mut().add_reflection_probe(base).unwrap();
+
+            let lit = reflected_luma(surface, &mut scene, base).await;
+            let masked = ReflectionProbe {
+                capture_layers: 0b100,
+                ..base
+            };
+            let unlit = reflected_luma(surface, &mut scene, masked).await;
+            assert!(lit > unlit + 0.1, "{} {}", lit, unlit);
+
+            let short = ReflectionProbe {
+                clip_planes: Some((0.1, 4.0)),
+                ..base
+            };
+            let clipped = reflected_luma(surface, &mut scene, short).await;
+            assert!(lit > clipped + 0.1, "{} {}", lit, clipped);
+
+            assert_eq!(surface.window().reflection_probe_size(), 256);
+            surface.window_mut().set_reflection_probe_size(64);
+            let small = reflected_luma(surface, &mut scene, base).await;
+            assert!(small > unlit + 0.1, "{} {}", small, unlit);
+        });
+    }
+
+    #[test]
+    fn a_turned_probe_box_covers_what_its_axes_cover() {
+        on_gpu(64, 64, async |surface| {
+            surface.window_mut().set_ambient(0.0);
+            let mut scene = chrome_ball_scene();
+            // A slab thin along its local z: the ball's front, one unit out along
+            // world z, lies outside it until the slab turns its thin axis to x.
+            let slab = ReflectionProbe {
+                half_extents: Vec3::new(20.0, 20.0, 0.3),
+                falloff: 0.1,
+                capture_layers: 0b01,
+                ..Default::default()
+            };
+            surface.window_mut().add_reflection_probe(slab).unwrap();
+            let outside = reflected_luma(surface, &mut scene, slab).await;
+            let turned = ReflectionProbe {
+                orientation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+                ..slab
+            };
+            let inside = reflected_luma(surface, &mut scene, turned).await;
+            assert!(inside > outside + 0.1, "{} {}", inside, outside);
+        });
     }
 }

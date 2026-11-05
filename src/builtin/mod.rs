@@ -1,70 +1,116 @@
 //! Built-in geometries, shaders and effects.
 
-// Shared WESL modules that are composed into several shaders. Each is a single
-// `static` (one fixed address) referenced everywhere, so the source bytes are
-// embedded in the binary exactly ONCE — unlike repeating `include_str!(...)` per
-// site (or a `const`, which is inlined at each use), where the compiler/linker
-// only *sometimes* merges the duplicates.
+/// Every built-in shader, linked by `build.rs` when kiss3d compiled: the root
+/// module, the `@if` flags it was linked with, and the WGSL.
+static LINKED: &[(&str, &[(&str, bool)], &str)] = include!(concat!(env!("OUT_DIR"), "/linked.rs"));
 
-/// The shared small-utility WESL module (`common.wgsl`): `luminance`,
-/// `unpack_mat2/3`, and the full-screen-vertex helpers. Mounted as `package::common`.
-pub(crate) static COMMON_WESL: &str = include_str!("common.wgsl");
-/// Shared equirectangular mapping + analytic env-BRDF (`package::pbr_env`).
-pub(crate) static PBR_ENV_WESL: &str = include_str!("pbr_env.wgsl");
-/// Box-downsample full-screen pass, reused by IBL/probe/SSR/DoF mip chains.
-pub(crate) static ENV_DOWNSAMPLE_WESL: &str = include_str!("env_downsample.wgsl");
-/// Shared tonemap operators (`package::tonemap_ops`), used by both HDR resolves.
-pub(crate) static TONEMAP_OPS_WESL: &str = include_str!("tonemap_ops.wgsl");
-/// Shadow-map depth pre-pass (plain + `@if(skinned)` deform variants).
-pub(crate) static SHADOW_DEPTH_WESL: &str = include_str!("shadow_depth.wgsl");
-/// Colored-transmittance shadow pass (plain + `@if(skinned)` deform variants).
-pub(crate) static SHADOW_TRANSMITTANCE_WESL: &str = include_str!("shadow_transmittance.wgsl");
-
-/// Compiles a single shader that imports `package::common`, composing it with the
-/// shared [`COMMON_WESL`] module. `modpath` is the shader's own module path (any
-/// unique `package::...` name except `package::common`).
-pub(crate) fn compile_shader_with_common(modpath: &str, src: &str) -> String {
-    compile_wesl(
-        &[(modpath, src), ("package::common", COMMON_WESL)],
-        modpath,
-        &[],
-    )
+/// The WGSL `build.rs` linked for `root` with `features`, in any order. A
+/// combination it did not link is a missing line in `build.rs`.
+pub(crate) fn linked(root: &str, features: &[(&str, bool)]) -> &'static str {
+    LINKED
+        .iter()
+        .find(|(r, f, _)| {
+            *r == root && f.len() == features.len() && f.iter().all(|x| features.contains(x))
+        })
+        .map(|(_, _, wgsl)| *wgsl)
+        .unwrap_or_else(|| panic!("{} {:?} is not linked; add it to build.rs", root, features))
 }
 
-/// Composes a set of in-memory WESL modules into a single WGSL string via the
-/// `wesl` compiler, resolving `import`s and conditional-compilation `@if` features.
-///
-/// `modules` is `(module path, source)` pairs (e.g. `("package::tonemap_ops", src)`);
-/// `root` is the module path to compile (its entry points + everything they reach).
-/// `features` toggles `@if(name)` flags. Dead-code elimination (WESL "strip") removes
-/// unreferenced declarations and their bindings, so the output only contains what the
-/// root actually uses — replacing brittle source concatenation with real module
-/// imports. naga validates the result at `create_shader_module`.
-pub(crate) fn compile_wesl(
-    modules: &[(&str, &str)],
-    root: &str,
-    features: &[(&str, bool)],
-) -> String {
-    let mut resolver = wesl::resolver::VirtualResolver::new();
-    for (path, src) in modules {
-        resolver.add_module(
-            path.parse().expect("invalid WESL module path"),
-            (*src).into(),
-        );
+#[cfg(test)]
+mod tests {
+    use naga::back::glsl;
+
+    /// How many times `module` samples a depth texture without a comparison. GLSL
+    /// reads one only through a shadow sampler, so naga writes such a sample and
+    /// the device's compiler then rejects it.
+    fn plain_depth_samples(module: &naga::Module) -> usize {
+        let is_depth = |expressions: &naga::Arena<naga::Expression>, image| match expressions[image]
+        {
+            naga::Expression::GlobalVariable(var) => matches!(
+                module.types[module.global_variables[var].ty].inner,
+                naga::TypeInner::Image {
+                    class: naga::ImageClass::Depth { .. },
+                    ..
+                }
+            ),
+            _ => false,
+        };
+        module
+            .functions
+            .iter()
+            .map(|(_, function)| function)
+            .chain(module.entry_points.iter().map(|entry| &entry.function))
+            .map(|function| {
+                function
+                    .expressions
+                    .iter()
+                    .filter(|(_, expression)| match expression {
+                        naga::Expression::ImageSample {
+                            image,
+                            depth_ref: None,
+                            ..
+                        } => is_depth(&function.expressions, *image),
+                        _ => false,
+                    })
+                    .count()
+            })
+            .sum()
     }
-    let mut options = wesl::CompileOptions {
-        // wesl's own validation needs the `eval` crate feature (off); naga validates
-        // at `create_shader_module` regardless.
-        validate: false,
-        ..Default::default()
-    };
-    for (name, on) in features {
-        options.features.set(name, *on);
+
+    /// Every built-in shader written the way wgpu's GLES backend writes it on an
+    /// Android device without Vulkan: GLSL ES 3.10, which lacks what only desktop
+    /// GL has, such as asking a texture how many mips it holds.
+    #[test]
+    fn every_built_in_shader_is_glsl_es() {
+        let mut options = glsl::Options::default();
+        options.writer_flags |= glsl::WriterFlags::FORCE_POINT_SIZE;
+        // Ray queries need a ray-tracing adapter, which no GLES device is.
+        let gles_shaders = super::LINKED
+            .iter()
+            .filter(|(_, features, _)| !features.contains(&("hardware", true)));
+        for (root, features, wgsl) in gles_shaders {
+            let what = format!("{} {:?}", root, features);
+            let module = naga::front::wgsl::parse_str(wgsl)
+                .unwrap_or_else(|e| panic!("{}: {}", what, e.emit_to_string(wgsl)));
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{}: {}", what, e.emit_to_string(wgsl)));
+            assert_eq!(
+                plain_depth_samples(&module),
+                0,
+                "{} samples a depth texture without a comparison, which GLSL cannot",
+                what
+            );
+            let (module, info) = naga::back::pipeline_constants::process_overrides(
+                &module,
+                &info,
+                None,
+                &Default::default(),
+            )
+            .unwrap_or_else(|e| panic!("{}: {}", what, e));
+            for entry in &module.entry_points {
+                let pipeline = glsl::PipelineOptions {
+                    shader_stage: entry.stage,
+                    entry_point: entry.name.clone(),
+                    multiview: None,
+                };
+                let mut out = String::new();
+                glsl::Writer::new(
+                    &mut out,
+                    &module,
+                    &info,
+                    &options,
+                    &pipeline,
+                    naga::proc::BoundsCheckPolicies::default(),
+                )
+                .and_then(|mut writer| writer.write())
+                .unwrap_or_else(|e| panic!("{} `{}` is no GLSL ES 3.10: {}", what, entry.name, e));
+            }
+        }
     }
-    wesl::Compiler::new_with_resolver(options, resolver)
-        .compile_module(&root.parse().expect("invalid WESL root module path"))
-        .unwrap_or_else(|e| panic!("WESL compilation of {} failed: {}", root, e))
-        .to_string()
 }
 
 pub use self::aov::{
@@ -76,7 +122,10 @@ pub use self::uvs_material::{UvsMaterial, UVS_FRAGMENT_SRC, UVS_VERTEX_SRC};
 
 pub use self::lit_material2d::{LitMaterial2d, LitMaterial2dGpuData, LitParams};
 pub use self::object_material2d::ObjectMaterial2d;
-pub use self::shadow::{ShadowMapper, MAX_SHADOW_VIEWS};
+pub use self::shadow::{
+    ShadowMapper, DEFAULT_SHADOW_DEPTH_BIAS, DEFAULT_SHADOW_RASTER_BIAS, DEFAULT_SHADOW_VIEWS,
+    MAX_SHADOW_VIEWS,
+};
 pub use self::skinned_material2d::{Bone2d, SkinVertex2d, SkinnedMesh2d, MAX_JOINTS_2D};
 
 mod aov;

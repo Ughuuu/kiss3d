@@ -96,7 +96,8 @@ impl Canvas {
     }
 
     /// Poll all events that occurred since the last call to this method.
-    pub fn poll_events(&mut self) {
+    /// Answers whether any arrived.
+    pub fn poll_events(&mut self) -> bool {
         self.canvas.poll_events()
     }
 
@@ -129,6 +130,11 @@ impl Canvas {
     /// Gets the depth texture view for rendering.
     pub fn depth_view(&self) -> &wgpu::TextureView {
         self.canvas.depth_view()
+    }
+
+    /// Make the depth buffer one an effect can read, or stop.
+    pub(crate) fn set_depth_readable(&mut self, readable: bool) {
+        self.canvas.set_depth_readable(readable)
     }
 
     /// Gets the MSAA texture view if MSAA is enabled.

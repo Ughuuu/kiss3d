@@ -27,7 +27,10 @@ use std::cell::RefCell;
 
 /// Maximum number of morph targets blended per mesh. Targets beyond
 /// this are dropped at load time (with a warning).
-pub const MAX_MORPH_TARGETS: usize = 64;
+///
+/// The weights ride in the per-object deform uniform, sized by this in WGSL, so it
+/// stays a constant: 256 weights take 1 KiB of the 16 KiB a uniform binding may hold.
+pub const MAX_MORPH_TARGETS: usize = 256;
 
 /// Per-object control uniform for the deform vertex shader. Bound as the last entry
 /// of the deform bind group (group 4 in the color/prepass pipelines, group 2 in the
@@ -162,6 +165,12 @@ fn with_globals<R>(f: impl FnOnce(&DeformGlobals) -> R) -> R {
         }
         f(cell.borrow().as_ref().unwrap())
     })
+}
+
+/// Drops the shared layout and buffers, which belong to the device that made
+/// them; the next use builds them on the device then current.
+pub(crate) fn reset() {
+    GLOBALS.with(|cell| *cell.borrow_mut() = None);
 }
 
 /// The shared deform bind-group layout, used as group 4 of the color/prepass
@@ -300,4 +309,73 @@ pub fn build_deform_bind_group(
             ],
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeformControl, MAX_MORPH_TARGETS};
+
+    #[test]
+    fn a_mesh_blends_up_to_256_morph_targets() {
+        let mut control = DeformControl::default();
+        control.set_weights(&[0.5; 300]);
+        assert_eq!(MAX_MORPH_TARGETS, 256);
+        assert_eq!(control.num_targets, 256);
+        assert_eq!(control.weights[63][3], 0.5);
+    }
+
+    /// Luma at the quad's rest centre and where its morph target moves it.
+    async fn rest_and_moved(
+        surface: &mut crate::window::OffscreenSurface,
+        weight: f32,
+    ) -> (f32, f32) {
+        use crate::camera::OrbitCamera3d;
+        use crate::color::{Color, BLACK};
+        use crate::resource::{GpuMesh3d, MorphTargets};
+        use crate::scene::SceneNode3d;
+        use glamx::{Vec2, Vec3};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let coords = vec![
+            Vec3::new(-0.5, -0.5, 0.0),
+            Vec3::new(0.5, -0.5, 0.0),
+            Vec3::new(0.5, 0.5, 0.0),
+            Vec3::new(-0.5, 0.5, 0.0),
+        ];
+        let mut mesh = GpuMesh3d::new(
+            coords,
+            vec![[0, 1, 2], [0, 2, 3]],
+            None,
+            Some(vec![Vec2::ZERO; 4]),
+            false,
+        );
+        mesh.set_morph_targets(MorphTargets::new(1, 4, vec![[1.5, 0.0, 0.0, 0.0]; 4], None));
+        let mut scene = SceneNode3d::empty();
+        let mut node = scene.add_mesh(Rc::new(RefCell::new(mesh)), Vec3::ONE);
+        node.set_emissive(Color::new(4.0, 4.0, 4.0, 1.0))
+            .enable_backface_culling(false)
+            .set_morph_weights(&[weight]);
+        let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 4.0), Vec3::ZERO);
+        surface.set_background_color(BLACK);
+        surface
+            .render(Some(&mut scene), None, Some(&mut camera), None, None, None)
+            .await;
+        surface
+            .render(Some(&mut scene), None, Some(&mut camera), None, None, None)
+            .await;
+        (
+            crate::test_gpu::luma_at(surface, 32, 32),
+            crate::test_gpu::luma_at(surface, 52, 32),
+        )
+    }
+
+    #[test]
+    fn a_morph_target_moves_the_mesh_by_its_weight() {
+        crate::test_gpu::on_gpu(64, 64, async |surface| {
+            let rest = rest_and_moved(surface, 0.0).await;
+            let moved = rest_and_moved(surface, 1.0).await;
+            assert!(rest.0 > 0.5 && rest.1 < 0.1, "at rest: {:?}", rest);
+            assert!(moved.0 < 0.1 && moved.1 > 0.5, "morphed: {:?}", moved);
+        });
+    }
 }

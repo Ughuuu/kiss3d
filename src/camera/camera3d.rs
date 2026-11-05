@@ -128,6 +128,18 @@ pub trait Camera3d {
         u32::MAX
     }
 
+    /// The pixel rectangle `[x, y, width, height]` that `pass` draws into on a
+    /// `width × height` target, `(0, 0)` at the top left. The default is the
+    /// whole target; [`FirstPersonCamera3dStereo`](crate::camera::FirstPersonCamera3dStereo)
+    /// gives each eye half.
+    ///
+    /// Screen-space effects (SSAO, SSR, depth of field, refractive glass) read a
+    /// G-buffer drawn by pass 0 only.
+    #[inline]
+    fn pass_viewport(&self, _pass: usize, width: u32, height: u32) -> [f32; 4] {
+        [0.0, 0.0, width as f32, height as f32]
+    }
+
     /// Called at the start of each rendering pass.
     ///
     /// Override this to perform per-pass setup (e.g., setting viewport for stereo rendering).

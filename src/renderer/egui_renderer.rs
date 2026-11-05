@@ -9,6 +9,10 @@ pub struct EguiRenderer {
     egui_ctx: EguiContext,
     renderer: egui_wgpu::Renderer,
     shapes: Vec<egui::epaint::ClippedShape>,
+    /// `shapes` tessellated, at the points-per-pixel they were tessellated at:
+    /// a frame that ran no pass draws these again rather than tessellating the
+    /// same shapes. `None` once the shapes change.
+    primitives: Option<(f32, Vec<egui::ClippedPrimitive>)>,
     textures_delta: egui::TexturesDelta,
     cursor: egui::CursorIcon,
     retain_shapes: bool,
@@ -19,30 +23,33 @@ impl EguiRenderer {
     pub fn new() -> EguiRenderer {
         let egui_ctx = EguiContext::default();
 
-        // Load fonts manually - use kiss3d's embedded font
-        let mut fonts = egui::FontDefinitions::default();
+        #[cfg(feature = "text")]
+        {
+            // Load fonts manually - use kiss3d's embedded font
+            let mut fonts = egui::FontDefinitions::default();
 
-        // Add WorkSans font from kiss3d
-        fonts.font_data.insert(
-            "WorkSans".to_owned(),
-            egui::FontData::from_static(include_bytes!("../text/WorkSans-Regular.ttf")).into(),
-        );
+            // Add WorkSans font from kiss3d
+            fonts.font_data.insert(
+                "WorkSans".to_owned(),
+                egui::FontData::from_static(include_bytes!("../text/WorkSans-Regular.ttf")).into(),
+            );
 
-        // Set it as the proportional font
-        fonts
-            .families
-            .get_mut(&egui::FontFamily::Proportional)
-            .unwrap()
-            .insert(0, "WorkSans".to_owned());
+            // Set it as the proportional font
+            fonts
+                .families
+                .get_mut(&egui::FontFamily::Proportional)
+                .unwrap()
+                .insert(0, "WorkSans".to_owned());
 
-        // Set it as the monospace font too
-        fonts
-            .families
-            .get_mut(&egui::FontFamily::Monospace)
-            .unwrap()
-            .insert(0, "WorkSans".to_owned());
+            // Set it as the monospace font too
+            fonts
+                .families
+                .get_mut(&egui::FontFamily::Monospace)
+                .unwrap()
+                .insert(0, "WorkSans".to_owned());
 
-        egui_ctx.set_fonts(fonts);
+            egui_ctx.set_fonts(fonts);
+        }
 
         // Set default pixels_per_point to avoid DPI warnings.
         // Not using 1.0 exactly so that draw_ui() gets a chance
@@ -57,7 +64,9 @@ impl EguiRenderer {
 
         let ctxt = Context::get();
 
-        // Create the egui-wgpu renderer
+        // Create the egui-wgpu renderer: one shader module and one pipeline, on the
+        // device directly, so they are counted here.
+        let started = web_time::Instant::now();
         let mut renderer = egui_wgpu::Renderer::new(
             &ctxt.device,
             ctxt.surface_format,
@@ -67,6 +76,7 @@ impl EguiRenderer {
                 ..Default::default()
             },
         );
+        Context::note_shader_build(1, 1, started.elapsed());
 
         // Apply textures from the dummy pass (font textures, etc.)
         for (id, image_deltas) in &dummy_output.textures_delta.set {
@@ -81,6 +91,7 @@ impl EguiRenderer {
             egui_ctx,
             renderer,
             shapes: Vec::new(),
+            primitives: None,
             textures_delta: Default::default(),
             cursor: egui::CursorIcon::Default,
             retain_shapes: false,
@@ -103,6 +114,7 @@ impl EguiRenderer {
         // they are dropped once they have been rendered too (see
         // `set_retain_shapes`).
         self.shapes.clear();
+        self.primitives = None;
         self.egui_ctx.begin_pass(raw_input);
     }
 
@@ -127,6 +139,7 @@ impl EguiRenderer {
     /// since otherwise rendering them already dropped them.
     pub fn clear_shapes(&mut self) {
         self.shapes.clear();
+        self.primitives = None;
     }
 
     /// What the last pass asked the pointer to look like over the widget it
@@ -140,6 +153,7 @@ impl EguiRenderer {
         let output = self.egui_ctx.end_pass();
         self.cursor = output.platform_output.cursor_icon;
         self.shapes = output.shapes;
+        self.primitives = None;
         // Append rather than replace: if a previous frame's render was skipped
         // (e.g. failed to acquire surface texture), we must not lose its texture
         // deltas (such as the font atlas glyph upload).
@@ -219,8 +233,23 @@ impl EguiRenderer {
             }
         }
 
-        // Prepare clipped primitives
-        let clipped_primitives = self.egui_ctx.tessellate(self.shapes.clone(), scale_factor);
+        let stale = match &self.primitives {
+            Some((ppp, _)) => *ppp != scale_factor,
+            None => true,
+        };
+        if stale {
+            // Kept only while a later frame may tessellate them again.
+            let shapes = if self.retain_shapes {
+                self.shapes.clone()
+            } else {
+                std::mem::take(&mut self.shapes)
+            };
+            let tessellated = self.egui_ctx.tessellate(shapes, scale_factor);
+            self.primitives = Some((scale_factor, tessellated));
+        }
+        let Some((_, clipped_primitives)) = &self.primitives else {
+            return;
+        };
 
         // Create screen descriptor
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -236,7 +265,7 @@ impl EguiRenderer {
             &ctxt.device,
             &ctxt.queue,
             &mut encoder,
-            &clipped_primitives,
+            clipped_primitives,
             &screen_descriptor,
         );
 
@@ -266,7 +295,7 @@ impl EguiRenderer {
             let mut render_pass = render_pass.forget_lifetime();
 
             self.renderer
-                .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+                .render(&mut render_pass, clipped_primitives, &screen_descriptor);
         }
 
         // Submit the egui commands
@@ -280,6 +309,7 @@ impl EguiRenderer {
         self.textures_delta.clear();
         if !self.retain_shapes {
             self.shapes.clear();
+            self.primitives = None;
         }
     }
 }

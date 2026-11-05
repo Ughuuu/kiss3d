@@ -115,13 +115,8 @@ impl Dof {
 
         let (chain_texture, chain_view, chain_mips) = Self::make_chain(w, h);
 
-        let shader = ctxt.create_shader_module(
-            Some("dof"),
-            &crate::builtin::compile_shader_with_common(
-                "package::dof",
-                include_str!("../builtin/dof.wgsl"),
-            ),
-        );
+        let shader =
+            ctxt.create_shader_module(Some("dof"), &crate::builtin::linked("package::dof", &[]));
 
         // CoC + gather share the same two-texture + sampler + uniform layout.
         let coc_layout = make_layout("dof_coc_layout");
@@ -134,10 +129,7 @@ impl Dof {
         // Mip-chain downsample reuses the env box-downsample shader (texture+sampler).
         let downsample_shader = ctxt.create_shader_module(
             Some("dof_downsample"),
-            &crate::builtin::compile_shader_with_common(
-                "package::env_downsample",
-                crate::builtin::ENV_DOWNSAMPLE_WESL,
-            ),
+            &crate::builtin::linked("package::env_downsample", &[]),
         );
         let downsample_layout = ctxt.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("dof_downsample_layout"),

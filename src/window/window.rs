@@ -21,6 +21,7 @@ use crate::resource::{
     FramebufferManager, MaterialManager2d, MeshManager2d, RenderTarget, Texture, TextureManager,
 };
 use crate::scene::SceneNode3d;
+#[cfg(feature = "text")]
 use crate::text::TextRenderer;
 use crate::window::canvas::CanvasSetup;
 use crate::window::{Canvas, NumSamples};
@@ -42,7 +43,7 @@ pub(super) static DEFAULT_HEIGHT: u32 = 600u32;
 /// shadow sharpness against the per-frame cost of clearing/rasterizing the atlas
 /// (a point light alone uses six faces); raise it with
 /// [`Window::set_shadow_resolution`] for crisper shadows, lower it to save memory
-/// and fill (the atlas is `resolution² × MAX_SHADOW_VIEWS`).
+/// and fill (the atlas is `resolution² × views`, see [`Window::set_shadow_atlas_layers`]).
 pub(super) static DEFAULT_SHADOW_RESOLUTION: u32 = 2048u32;
 
 /// Structure representing a window and a 3D scene.
@@ -59,6 +60,10 @@ pub(super) struct ScreenCopy2d {
 pub struct Window {
     pub(super) events: Rc<Receiver<WindowEvent>>,
     pub(super) unhandled_events: Rc<RefCell<Vec<WindowEvent>>>,
+    /// Whether the poll that closes `handle_events` queued events `events()`
+    /// has not read yet. `wait_events` answers at once while it is set: the
+    /// window system only reports what arrives after them.
+    pub(super) events_queued: bool,
     pub(super) ime_events: Rc<RefCell<Vec<crate::event::ImeEvent>>>,
     /// Made on the first frame a material asks; remade when the film resizes.
     pub(super) screen_2d: Option<ScreenCopy2d>,
@@ -70,6 +75,7 @@ pub struct Window {
     pub(super) point_renderer_2d: PointRenderer2d,
     pub(super) point_renderer: PointRenderer3d,
     pub(super) polyline_renderer: PolylineRenderer3d,
+    #[cfg(feature = "text")]
     pub(super) text_renderer: TextRenderer,
     pub(super) framebuffer_manager: FramebufferManager,
     /// Real-time shadow mapper for the rasterization pipeline.
@@ -87,6 +93,10 @@ pub struct Window {
     /// supports compute + fragment storage buffers; otherwise stays `None` and the
     /// object material falls back to the fixed 8-light path).
     pub(super) clustered: Option<crate::builtin::clustered::Clustered>,
+    /// Clusters along screen X, screen Y and view depth for clustered lighting.
+    pub(super) cluster_grid: [u32; 3],
+    /// Lights one cluster records.
+    pub(super) max_lights_per_cluster: u32,
     /// Reflection probes (localized parallax-corrected environment maps). Created
     /// on first probe registration; `None` means no probes.
     pub(super) reflection_probes: Option<crate::renderer::ReflectionProbes>,
@@ -94,10 +104,8 @@ pub struct Window {
     pub(super) probe_capture: Option<crate::renderer::ProbeCapture>,
     /// Probe indices queued for a runtime scene capture next frame.
     pub(super) pending_probe_captures: Vec<usize>,
-    /// Render-layer mask used when capturing reflection probes. Defaults to all
-    /// layers; set it to exclude dynamic objects (which SSR reflects more
-    /// accurately) so a single-point probe doesn't distort nearby geometry.
-    pub(super) reflection_capture_layers: u32,
+    /// Cube-face size of a probe capture and width of every probe map.
+    pub(super) reflection_probe_size: u32,
     /// Screen-space reflections (created on first enable when the backend supports
     /// it; stays `None` / inactive on WebGL2).
     pub(super) ssr: Option<crate::renderer::Ssr>,
@@ -113,6 +121,8 @@ pub struct Window {
     /// Single-sample OIT targets for the planar-reflector capture pass, so
     /// transparent surfaces appear in mirrors. Created on first use.
     pub(super) reflector_oit: Option<crate::renderer::ReflectorOit>,
+    /// The refraction snapshot of a reflector whose target is not viewport-sized.
+    pub(super) reflector_transmission: Option<crate::renderer::Transmission>,
     pub(super) post_process_render_target: RenderTarget,
     /// Second LDR target, paired with `post_process_render_target` as ping-pong
     /// buffers when chaining more than one post-processing effect: each effect reads
@@ -123,6 +133,9 @@ pub struct Window {
     /// LDR image after them. Made the first frame such a chain is passed, so a run
     /// that never passes one allocates neither.
     pub(super) film_render_targets: Option<(RenderTarget, RenderTarget)>,
+    /// The multisampled scene depth resolved for a chain whose effect reads it.
+    /// Made the first frame one asks.
+    pub(super) scene_depth: Option<crate::post_processing::SceneDepth>,
     /// Offscreen render target used when the window is hidden, so `snap` and
     /// recording work without a presentable surface. Created on first use.
     pub(super) offscreen_output_target: Option<RenderTarget>,
@@ -403,7 +416,8 @@ impl Window {
         self.ime_events.borrow().clone()
     }
 
-    /// Let the platform compose text through its input method.
+    /// Let the platform compose text through its input method. On Android and
+    /// iOS this never raises the on-screen keyboard; [`Self::set_keyboard_visible`] does.
     pub fn set_ime_allowed(&self, allowed: bool) {
         self.canvas.set_ime_allowed(allowed);
     }
@@ -635,6 +649,32 @@ impl Window {
         self.skybox.set_orientation(rotation_radians, intensity);
     }
 
+    /// Lights the rasterized scene with `image` (an equirectangular map) instead of
+    /// the drawn skybox, which stays the background; it turns with the skybox's
+    /// rotation and lights even with no skybox drawn. `None`, the default, lights
+    /// with the drawn skybox. The path tracer keeps the skybox for both.
+    pub fn set_sky_lighting_image(&mut self, image: Option<&image::DynamicImage>) {
+        self.skybox.set_lighting_image(image);
+    }
+
+    /// Whether a lighting image apart from the drawn skybox is set.
+    pub fn has_sky_lighting_image(&self) -> bool {
+        self.skybox.has_lighting_image()
+    }
+
+    /// Sets the image-based-lighting multiplier apart from the drawn skybox's
+    /// (clamped to `>= 0`). `None`, the default, follows the intensity given to
+    /// [`set_skybox_orientation`](Self::set_skybox_orientation).
+    pub fn set_sky_lighting_intensity(&mut self, intensity: Option<f32>) {
+        self.skybox.set_lighting_intensity(intensity);
+    }
+
+    /// Returns the image-based-lighting multiplier in use: the one set apart, else
+    /// the skybox's.
+    pub fn sky_lighting_intensity(&self) -> f32 {
+        self.skybox.lighting_intensity()
+    }
+
     /// Removes the skybox, so subsequent frames render the plain background color.
     pub fn clear_skybox(&mut self) {
         self.skybox.clear();
@@ -681,9 +721,27 @@ impl Window {
         &mut self,
         probe: crate::renderer::ReflectionProbe,
     ) -> Option<usize> {
+        let size = self.reflection_probe_size;
         self.reflection_probes
-            .get_or_insert_with(crate::renderer::ReflectionProbes::new)
+            .get_or_insert_with(|| crate::renderer::ReflectionProbes::with_size(size))
             .add(probe)
+    }
+
+    /// Sets the reflection-probe resolution, shared by every probe: a runtime
+    /// capture renders cube faces `size` pixels square, and each probe map is `size`
+    /// wide and half as tall. Clamped to `2..=4096`. A change reallocates the probe
+    /// maps black: set the baked images again and re-capture the live probes. The
+    /// default is 256.
+    pub fn set_reflection_probe_size(&mut self, size: u32) {
+        self.reflection_probe_size = size.clamp(2, 4096);
+        if let Some(probes) = self.reflection_probes.as_mut() {
+            probes.set_size(self.reflection_probe_size);
+        }
+    }
+
+    /// Returns the reflection-probe resolution. The default is 256.
+    pub fn reflection_probe_size(&self) -> u32 {
+        self.reflection_probe_size
     }
 
     /// Fills reflection probe `idx` from a baked equirectangular HDR image.
@@ -702,16 +760,6 @@ impl Window {
         self.reflection_probes
             .as_mut()
             .and_then(|p| p.probe_mut(idx))
-    }
-
-    /// Sets the render-layer mask used when capturing reflection probes (default:
-    /// all layers). A reflection probe captures from a single point, so nearby
-    /// dynamic objects come out distorted/magnified; put such objects on a layer
-    /// excluded here (and let SSR reflect them instead) so the probe captures only
-    /// the static surroundings. An object is captured when its own render-layer
-    /// mask shares a bit with `mask`.
-    pub fn set_reflection_capture_layers(&mut self, mask: u32) {
-        self.reflection_capture_layers = mask;
     }
 
     /// Queues a runtime scene capture of reflection probe `idx`: next frame the
@@ -822,7 +870,7 @@ impl Window {
     /// Sets the per-layer resolution of the shadow atlas (square), reallocating it.
     ///
     /// Higher values yield crisper shadows at the cost of memory and fill rate.
-    /// The default is 1024.
+    /// The default is 2048.
     pub fn set_shadow_resolution(&mut self, resolution: u32) {
         self.shadow_mapper.set_resolution(resolution);
     }
@@ -830,6 +878,19 @@ impl Window {
     /// Returns the current per-layer shadow atlas resolution.
     pub fn shadow_resolution(&self) -> u32 {
         self.shadow_mapper.resolution()
+    }
+
+    /// Sets how many shadow atlas layers are allocated (`1..=MAX_SHADOW_VIEWS`,
+    /// default 16). A directional light needs one layer per cascade, a spot
+    /// light one, a point light six; lights that do not fit cast no shadow.
+    /// Fewer layers make a higher [`Self::set_shadow_resolution`] affordable.
+    pub fn set_shadow_atlas_layers(&mut self, layers: u32) {
+        self.shadow_mapper.set_atlas_layers(layers);
+    }
+
+    /// Returns the number of shadow atlas layers allocated.
+    pub fn shadow_atlas_layers(&self) -> u32 {
+        self.shadow_mapper.atlas_layers()
     }
 
     /// Sets the rasterizer shadow-edge softness (PCF blur).
@@ -844,6 +905,99 @@ impl Window {
     /// Returns the current rasterizer shadow-edge softness (PCF blur).
     pub fn shadow_softness(&self) -> f32 {
         self.shadow_mapper.softness()
+    }
+
+    /// Caps how far from the camera directional shadows reach (world units along
+    /// the view; `INFINITY`, the default, uses the camera far plane). The
+    /// cascades are fit to the camera frustum up to this distance, so a tighter
+    /// cap spends the shadow atlas on nearer geometry.
+    pub fn set_shadow_distance(&mut self, distance: f32) {
+        self.shadow_mapper.set_shadow_distance(distance);
+    }
+
+    /// Returns the directional-shadow distance cap.
+    pub fn shadow_distance(&self) -> f32 {
+        self.shadow_mapper.shadow_distance()
+    }
+
+    /// Sets how many cascades a directional light splits its shadow range into,
+    /// clamped to `1..=4`. Each cascade takes one atlas view. The default is 4.
+    pub fn set_shadow_cascades(&mut self, cascades: u32) {
+        self.shadow_mapper.set_num_cascades(cascades);
+    }
+
+    /// Returns the number of directional shadow cascades. The default is 4.
+    pub fn shadow_cascades(&self) -> u32 {
+        self.shadow_mapper.num_cascades()
+    }
+
+    /// Sets the far view distance of the highest-resolution directional cascade
+    /// (it covers `[near, bound]`; the default is 12). Lower it for crisper
+    /// shadows on a small scene close to the camera, raise it so crisp shadows
+    /// reach further away.
+    pub fn set_first_cascade_far_bound(&mut self, bound: f32) {
+        self.shadow_mapper.set_first_cascade_far_bound(bound);
+    }
+
+    /// Returns the far view distance of the highest-resolution directional cascade.
+    pub fn first_cascade_far_bound(&self) -> f32 {
+        self.shadow_mapper.first_cascade_far_bound()
+    }
+
+    /// Sets the depth bias the lighting shader applies when comparing against the
+    /// shadow map (at least 0). Raise it to cure acne, lower it to keep contact
+    /// shadows attached. The default is 0.0012.
+    pub fn set_shadow_depth_bias(&mut self, bias: f32) {
+        self.shadow_mapper.set_depth_bias(bias);
+    }
+
+    /// Returns the shadow comparison depth bias. The default is 0.0012.
+    pub fn shadow_depth_bias(&self) -> f32 {
+        self.shadow_mapper.depth_bias()
+    }
+
+    /// Sets the rasterizer depth bias of the shadow depth pass: `constant` in
+    /// depth-buffer units plus `slope_scale` times the polygon's depth slope. A
+    /// change rebuilds the shadow depth pipelines. The default is `(1, 1.75)`.
+    pub fn set_shadow_raster_bias(&mut self, constant: i32, slope_scale: f32) {
+        self.shadow_mapper.set_raster_bias(constant, slope_scale);
+    }
+
+    /// Returns the shadow rasterizer depth bias `(constant, slope_scale)`. The
+    /// default is `(1, 1.75)`.
+    pub fn shadow_raster_bias(&self) -> (i32, f32) {
+        self.shadow_mapper.raster_bias()
+    }
+
+    /// Sets the clustered-lighting grid: clusters along screen X, screen Y and
+    /// view depth, each clamped to `1..=128`. Finer grids cull the many-light tier
+    /// tighter at the cost of memory and culling work. The default is `[16, 9, 24]`.
+    /// Clustered lighting runs where compute shaders do (not WebGL2).
+    pub fn set_cluster_grid(&mut self, grid: [u32; 3]) {
+        self.cluster_grid = grid.map(|n| n.clamp(1, crate::builtin::clustered::MAX_GRID_AXIS));
+    }
+
+    /// Returns the clustered-lighting grid. The default is `[16, 9, 24]`.
+    pub fn cluster_grid(&self) -> [u32; 3] {
+        self.cluster_grid
+    }
+
+    /// Sets how many lights one cluster records (at least 1); lights past it in a
+    /// dense cluster are dropped. The light-index list holds `clusters × this`
+    /// entries, so the renderer lowers it to fit the device's largest storage
+    /// binding. The default is 256.
+    pub fn set_max_lights_per_cluster(&mut self, lights: u32) {
+        self.max_lights_per_cluster = lights.max(1);
+    }
+
+    /// Returns how many lights one cluster records. The default is 256.
+    pub fn max_lights_per_cluster(&self) -> u32 {
+        self.max_lights_per_cluster
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shadow_mapper(&self) -> &ShadowMapper {
+        &self.shadow_mapper
     }
 
     /// The current HDR finishing settings (exposure, tonemap operator, bloom).
@@ -1104,6 +1258,7 @@ impl Window {
             canvas,
             events: Rc::new(event_receive),
             unhandled_events: Rc::new(RefCell::new(Vec::new())),
+            events_queued: false,
             ime_events: Rc::new(RefCell::new(Vec::new())),
             screen_2d: None,
             ambient_intensity: 0.2,
@@ -1114,6 +1269,7 @@ impl Window {
             point_renderer_2d: PointRenderer2d::new(),
             point_renderer: PointRenderer3d::new(),
             polyline_renderer: PolylineRenderer3d::new(),
+            #[cfg(feature = "text")]
             text_renderer: TextRenderer::new(),
             #[cfg(feature = "egui")]
             egui_context: EguiContext::new(),
@@ -1122,10 +1278,12 @@ impl Window {
             ssao: None,
             ssao_enabled: false,
             clustered: None,
+            cluster_grid: crate::builtin::clustered::DEFAULT_GRID,
+            max_lights_per_cluster: crate::builtin::clustered::DEFAULT_MAX_LIGHTS_PER_CLUSTER,
             reflection_probes: None,
             probe_capture: None,
             pending_probe_captures: Vec::new(),
-            reflection_capture_layers: u32::MAX,
+            reflection_probe_size: crate::renderer::DEFAULT_PROBE_SIZE,
             ssr: None,
             ssr_enabled: false,
             dof: None,
@@ -1133,10 +1291,12 @@ impl Window {
             transmission: None,
             transmission_enabled: true,
             reflector_oit: None,
+            reflector_transmission: None,
             post_process_render_target: framebuffer_manager.new_render_target(width, height, true),
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
             film_render_targets: None,
+            scene_depth: None,
             offscreen_output_target: None,
             aov_renderer: None,
             hidden: hide,
@@ -1175,8 +1335,8 @@ impl Window {
         let (event_send, event_receive) = mpsc::channel();
         let canvas = Canvas::open_headless(width, height, setup, event_send).await;
         let (width, height) = canvas.size();
-        // A headless surface is never multisampled.
         let canvas_surface_format = canvas.surface_format();
+        let sample_count = canvas.sample_count();
 
         Context::increment_window_count();
         WindowCache::populate();
@@ -1193,6 +1353,7 @@ impl Window {
             canvas,
             events: Rc::new(event_receive),
             unhandled_events: Rc::new(RefCell::new(Vec::new())),
+            events_queued: false,
             ime_events: Rc::new(RefCell::new(Vec::new())),
             screen_2d: None,
             ambient_intensity: 0.2,
@@ -1203,19 +1364,21 @@ impl Window {
             point_renderer_2d: PointRenderer2d::new(),
             point_renderer: PointRenderer3d::new(),
             polyline_renderer: PolylineRenderer3d::new(),
+            #[cfg(feature = "text")]
             text_renderer: TextRenderer::new(),
             #[cfg(feature = "egui")]
             egui_context: EguiContext::new(),
-            // Offscreen rendering is single-sampled (see `render_single_frame`).
-            hdr: HdrPipeline::new(width, height, 1, canvas_surface_format),
+            hdr: HdrPipeline::new(width, height, sample_count, canvas_surface_format),
             skybox: crate::renderer::Skybox::new(),
             ssao: None,
             ssao_enabled: false,
             clustered: None,
+            cluster_grid: crate::builtin::clustered::DEFAULT_GRID,
+            max_lights_per_cluster: crate::builtin::clustered::DEFAULT_MAX_LIGHTS_PER_CLUSTER,
             reflection_probes: None,
             probe_capture: None,
             pending_probe_captures: Vec::new(),
-            reflection_capture_layers: u32::MAX,
+            reflection_probe_size: crate::renderer::DEFAULT_PROBE_SIZE,
             ssr: None,
             ssr_enabled: false,
             dof: None,
@@ -1223,10 +1386,12 @@ impl Window {
             transmission: None,
             transmission_enabled: true,
             reflector_oit: None,
+            reflector_transmission: None,
             post_process_render_target: framebuffer_manager.new_render_target(width, height, true),
             post_process_render_target_b: framebuffer_manager
                 .new_render_target(width, height, false),
             film_render_targets: None,
+            scene_depth: None,
             offscreen_output_target: None,
             aov_renderer: None,
             // A headless window has no surface; always render off-screen.
@@ -1258,6 +1423,7 @@ impl Drop for Window {
             // Clear 2D resource managers
             MeshManager2d::reset_global_manager();
             MaterialManager2d::reset_global_manager();
+            crate::builtin::deform::reset();
 
             // Finally, clear the wgpu context itself
             Context::reset();
