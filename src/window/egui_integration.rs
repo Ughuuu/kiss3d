@@ -93,6 +93,13 @@ fn egui_modifiers(modifiers: Modifiers) -> egui::Modifiers {
     }
 }
 
+/// What `event` tells egui is held; `i.modifiers` hears of it no other way.
+fn held_event(event: &WindowEvent) -> Option<egui::Event> {
+    event
+        .modifiers()
+        .map(|held| egui::Event::ModifiersChanged(egui_modifiers(held)))
+}
+
 /// egui's key for one of ours. Keys arrive as physical codes on both
 /// backends, so a shifted `\` is still `Backslash` and one arm covers every
 /// layout. Anything egui has no key for is dropped.
@@ -306,6 +313,7 @@ impl Window {
     /// Feed a window event to egui for processing.
     pub(crate) fn feed_egui_event(&mut self, event: &WindowEvent) {
         let scale_factor = self.egui_pixels_per_point();
+        self.egui_context.raw_input.events.extend(held_event(event));
 
         match *event {
             WindowEvent::CursorPos(x, y, _) => {
@@ -740,6 +748,34 @@ mod tests {
             other,
             command
         );
+    }
+
+    #[test]
+    fn an_input_event_tells_egui_what_is_held() {
+        let ctx = egui::Context::default();
+        let shift_after = |event: WindowEvent| {
+            ctx.begin_pass(RawInput {
+                events: held_event(&event).into_iter().collect(),
+                ..Default::default()
+            });
+            let shift = ctx.input(|i| i.modifiers.shift);
+            ctx.end_pass().textures_delta.clear();
+            shift
+        };
+        assert!(shift_after(WindowEvent::Key(
+            Key::Tab,
+            Action::Press,
+            Modifiers::Shift
+        )));
+        assert!(
+            shift_after(WindowEvent::Char('x')),
+            "an event that says nothing of the modifiers leaves them"
+        );
+        assert!(!shift_after(WindowEvent::CursorPos(
+            0.0,
+            0.0,
+            Modifiers::empty()
+        )));
     }
 
     /// ⌘ is a Mac's alone: egui's mac-only paths read `mac_cmd`, and a chord
