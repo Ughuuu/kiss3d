@@ -1058,12 +1058,9 @@ impl WgpuCanvas {
                         });
                     }
                     // Emit a Char event for single-character (printable) keys so
-                    // egui text fields receive text input. Skip when a command
-                    // modifier is held so shortcuts (e.g. Ctrl+A) don't insert text,
-                    // mirroring the native path which relies on winit's `text` field.
-                    let command = Modifiers::Control | Modifiers::Super;
+                    // egui text fields receive text input.
                     let key_string = event.key();
-                    if !modifiers.intersects(command) && key_string.chars().count() == 1 {
+                    if !is_shortcut(modifiers) && key_string.chars().count() == 1 {
                         if let Some(ch) = key_string.chars().next() {
                             pending.borrow_mut().push(WindowEvent::Char(ch));
                         }
@@ -1687,7 +1684,9 @@ impl WgpuCanvas {
                         // so the mask is stamped in here, once the preceding
                         // `PendingEvent::Modifiers` of this batch have been applied.
                         let modifiers = translate_modifiers(self.modifiers_state);
-                        let _ = self.out_events.send(we.with_modifiers(modifiers));
+                        if let Some(we) = stamped(we, modifiers) {
+                            let _ = self.out_events.send(we);
+                        }
                     }
                     PendingEvent::ButtonState(button, action) => {
                         self.button_states[button as usize] = action;
@@ -2398,10 +2397,9 @@ fn translate_keyboard_input(
     ];
 
     if action == Action::Press {
-        // Prefer winit's `text` field: it is `None` when the keypress shouldn't
-        // produce text (e.g. Ctrl+A), so it naturally suppresses unwanted text
-        // input from shortcuts. Fall back to the logical key's character form
-        // for platforms or events where `text` is not populated.
+        // Prefer winit's `text` field, falling back to the logical key's
+        // character form where it is not populated. A shortcut's letter is
+        // dropped by `stamped`, once the modifiers are known.
         let chars = text.or_else(|| match logical_key {
             winit::keyboard::Key::Character(s) => Some(s.as_str()),
             _ => None,
@@ -2414,6 +2412,22 @@ fn translate_keyboard_input(
     }
 
     events
+}
+
+/// Whether a key pressed under `modifiers` is a shortcut, whose letter is not
+/// typed. winit has already taken AltGr out of Control on Windows.
+fn is_shortcut(modifiers: Modifiers) -> bool {
+    modifiers.intersects(Modifiers::Control | Modifiers::Super)
+}
+
+/// `event` as it leaves under `modifiers`, or nothing for a shortcut's letter:
+/// on macOS winit's `text` still holds the `c` of ⌘C.
+#[cfg(not(target_arch = "wasm32"))]
+fn stamped(event: WindowEvent, modifiers: Modifiers) -> Option<WindowEvent> {
+    if matches!(event, WindowEvent::Char(_)) && is_shortcut(modifiers) {
+        return None;
+    }
+    Some(event.with_modifiers(modifiers))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2936,6 +2950,35 @@ mod tests {
         assert!(translate_modifiers(ModifiersState::CONTROL).contains(Modifiers::Control));
         let web = web_modifiers(|key| key == "Meta" || key == "Shift");
         assert!(web.contains(Modifiers::Super) && web.contains(Modifiers::Shift));
+    }
+
+    #[test]
+    fn a_shortcut_types_no_letter_and_still_reaches_the_keys() {
+        for held in [
+            Modifiers::Super,
+            Modifiers::Control,
+            Modifiers::Super | Modifiers::Shift,
+        ] {
+            assert!(stamped(WindowEvent::Char('c'), held).is_none());
+            let key = stamped(
+                WindowEvent::Key(Key::C, Action::Press, Modifiers::empty()),
+                held,
+            );
+            assert!(matches!(
+                key,
+                Some(WindowEvent::Key(Key::C, Action::Press, mask)) if mask == held
+            ));
+        }
+    }
+
+    #[test]
+    fn shift_and_option_still_type() {
+        for held in [Modifiers::empty(), Modifiers::Shift, Modifiers::Alt] {
+            assert!(matches!(
+                stamped(WindowEvent::Char('c'), held),
+                Some(WindowEvent::Char('c'))
+            ));
+        }
     }
 
     // Regression test for https://github.com/dimforge/kiss3d/issues/380:
