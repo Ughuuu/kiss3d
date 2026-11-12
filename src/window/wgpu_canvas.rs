@@ -120,10 +120,7 @@ pub(crate) fn loop_waker() -> Option<Waker> {
 
 /// Runs `with` on the loop's `ActiveEventLoop`, which exists only inside a
 /// callback: one pump, whose window events go where every other pump's do.
-#[cfg(all(
-    feature = "egui",
-    not(any(target_arch = "wasm32", target_os = "ios", target_os = "android"))
-))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
 pub(crate) fn with_active_loop<T>(with: impl FnOnce(&ActiveEventLoop) -> T) -> T {
     EVENT_LOOP.with(|cell| {
         let mut event_loop = cell.borrow_mut();
@@ -224,8 +221,8 @@ fn opening_monitor(event_loop: &ActiveEventLoop) -> Option<winit::monitor::Monit
 
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
-    // Raw mouse motion heard since the last drain: what a locked cursor moves
-    // by, since it reports no position.
+    // Raw mouse motion heard since the last drain: what a held cursor moves by,
+    // since its position stops at the window's edge or does not move at all.
     static RAW_MOTION: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
 }
 
@@ -296,6 +293,10 @@ thread_local! {
 /// this height, so what is left above it is the keyboard. A height first seen
 /// with the keyboard asked for, as a rotation while typing is, borrows the
 /// bar's share from the height before it rather than calling it all bar.
+/// Window heights whose bar is remembered: both ways up, each in a split screen.
+#[cfg(any(target_os = "android", test))]
+const ANDROID_HEIGHTS: usize = 4;
+
 #[cfg(any(target_os = "android", test))]
 fn android_keyboard(height: i32, covered: i32) -> f32 {
     let asked = KEYBOARD_ASKED.with(Cell::get);
@@ -310,7 +311,21 @@ fn android_keyboard(height: i32, covered: i32) -> f32 {
             None => covered,
         };
         resting.insert(0, (height, least));
+        resting.truncate(ANDROID_HEIGHTS);
         (covered - least).max(0) as f32
+    })
+}
+
+/// The navigation bar's share of the cover at `height`, as the keyboard's
+/// reading last measured it.
+#[cfg(target_os = "android")]
+fn android_bar(height: i32) -> Option<i32> {
+    ANDROID_RESTING.with(|resting| {
+        resting
+            .borrow()
+            .iter()
+            .find(|(at, _)| *at == height)
+            .map(|(_, least)| *least)
     })
 }
 
@@ -466,8 +481,8 @@ pub struct WgpuCanvas {
     surface_config: wgpu::SurfaceConfiguration,
     cursor_pos: Option<(f64, f64)>,
     held: Held,
-    /// Whether a grab locked the cursor in place, so motion is read raw.
-    pointer_locked: std::cell::Cell<bool>,
+    /// Whether a grab holds the cursor, so motion is read raw.
+    cursor_held: std::cell::Cell<bool>,
     /// Between the system's `Suspended` and `Resumed`: an app in the
     /// background that keeps rendering is one iOS ends.
     suspended: bool,
@@ -680,6 +695,11 @@ impl WgpuCanvas {
         let window = Arc::new(window);
         let access = accessible.then(|| Access::attach(&window));
         if accessible {
+            // In a loop turn, so the resize AppKit reports as it shrinks a
+            // window too big for the screen reaches the canvas.
+            #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+            with_active_loop(|_| window.set_visible(shown));
+            #[cfg(any(target_arch = "wasm32", target_os = "ios", target_os = "android"))]
             window.set_visible(shown);
         }
 
@@ -1146,7 +1166,7 @@ impl WgpuCanvas {
             surface_config,
             cursor_pos: None,
             held: Held::default(),
-            pointer_locked: std::cell::Cell::new(false),
+            cursor_held: std::cell::Cell::new(false),
             suspended: false,
             out_events,
             modifiers_state: ModifiersState::default(),
@@ -1275,7 +1295,7 @@ impl WgpuCanvas {
             surface_config,
             cursor_pos: None,
             held: Held::default(),
-            pointer_locked: std::cell::Cell::new(false),
+            cursor_held: std::cell::Cell::new(false),
             suspended: false,
             out_events,
             modifiers_state: ModifiersState::default(),
@@ -1756,11 +1776,7 @@ impl WgpuCanvas {
             for event in events {
                 match event {
                     PendingEvent::WindowEvent(we) => {
-                        match we {
-                            WindowEvent::Focus(false) => self.let_go(),
-                            WindowEvent::CursorEnter(false) => self.cursor_pos = None,
-                            _ => {}
-                        }
+                        self.note(&we);
                         // Winit reports modifiers separately from the events they apply to,
                         // so the mask is stamped in here, once the preceding
                         // `PendingEvent::Modifiers` of this batch have been applied.
@@ -1788,7 +1804,7 @@ impl WgpuCanvas {
             }
 
             let motion = RAW_MOTION.with(|motion| motion.replace((0.0, 0.0)));
-            if self.pointer_locked.get() && motion != (0.0, 0.0) {
+            if self.cursor_held.get() && motion != (0.0, 0.0) {
                 let _ = self
                     .out_events
                     .send(WindowEvent::MouseMotion(motion.0, motion.1));
@@ -1796,9 +1812,8 @@ impl WgpuCanvas {
             }
         }
 
-        // AppKit drops the `Resized` of a change made between pumps, such as
-        // showing or maximizing the window, and a browser reports a canvas late.
-        #[cfg(any(target_os = "macos", target_arch = "wasm32"))]
+        // A browser has no pump: it reports a canvas late, so every poll looks.
+        #[cfg(target_arch = "wasm32")]
         {
             arrived |= self.fit_to_window();
         }
@@ -1819,9 +1834,7 @@ impl WgpuCanvas {
                     WindowEvent::Key(key, action, _) => {
                         self.held.set_key(*key, *action);
                     }
-                    WindowEvent::Focus(false) => self.let_go(),
-                    WindowEvent::CursorEnter(false) => self.cursor_pos = None,
-                    _ => {}
+                    other => self.note(other),
                 }
                 let _ = self.out_events.send(event);
             }
@@ -2179,10 +2192,23 @@ impl WgpuCanvas {
 
     /// Enter or leave borderless fullscreen on the current monitor.
     pub fn set_fullscreen(&self, fullscreen: bool) {
-        if let Some(window) = &self.window {
-            let mode = fullscreen.then(|| winit::window::Fullscreen::Borderless(None));
+        self.change_window(|window| {
+            let mode = fullscreen.then_some(winit::window::Fullscreen::Borderless(None));
             window.set_fullscreen(mode);
-        }
+        });
+    }
+
+    /// Run `change` on the window inside a turn of its event loop where kiss3d
+    /// pumps one: winit on macOS drops an event raised while no handler is set,
+    /// and a resize or a focus change raised between pumps would be lost.
+    fn change_window(&self, change: impl FnOnce(&Window)) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+        with_active_loop(|_| change(window));
+        #[cfg(any(target_arch = "wasm32", target_os = "ios", target_os = "android"))]
+        change(window);
     }
 
     /// Enter exclusive fullscreen on the current monitor, in its largest
@@ -2190,33 +2216,38 @@ impl WgpuCanvas {
     /// Falls back to borderless where the platform offers no video modes, as
     /// the web does.
     pub fn set_exclusive_fullscreen(&self, exclusive: bool) {
-        let Some(window) = &self.window else {
-            return;
-        };
-        if !exclusive {
-            window.set_fullscreen(None);
-            return;
-        }
-        let mode = window.current_monitor().and_then(|monitor| {
-            monitor.video_modes().max_by_key(|mode| {
-                let size = mode.size();
-                (
-                    u64::from(size.width) * u64::from(size.height),
-                    mode.refresh_rate_millihertz(),
-                )
-            })
+        self.change_window(|window| {
+            if exclusive {
+                window.set_fullscreen(Some(exclusive_mode(window)));
+            } else {
+                window.set_fullscreen(None);
+            }
         });
-        window.set_fullscreen(Some(match mode {
-            Some(mode) => winit::window::Fullscreen::Exclusive(mode),
-            None => winit::window::Fullscreen::Borderless(None),
-        }));
     }
+}
 
+/// The current monitor's largest video mode at its highest refresh rate, or
+/// borderless where the platform offers no video modes, as the web does.
+fn exclusive_mode(window: &Window) -> winit::window::Fullscreen {
+    let mode = window.current_monitor().and_then(|monitor| {
+        monitor.video_modes().max_by_key(|mode| {
+            let size = mode.size();
+            (
+                u64::from(size.width) * u64::from(size.height),
+                mode.refresh_rate_millihertz(),
+            )
+        })
+    });
+    match mode {
+        Some(mode) => winit::window::Fullscreen::Exclusive(mode),
+        None => winit::window::Fullscreen::Borderless(None),
+    }
+}
+
+impl WgpuCanvas {
     /// Maximize the window, or restore it.
     pub fn set_maximized(&self, maximized: bool) {
-        if let Some(window) = &self.window {
-            window.set_maximized(maximized);
-        }
+        self.change_window(|window| window.set_maximized(maximized));
     }
 
     /// Whether the window is currently maximized.
@@ -2295,21 +2326,28 @@ impl WgpuCanvas {
         let _ = allowed;
     }
 
+    /// The window's width and height and NativeActivity's content rect,
+    /// `[left, top, right, bottom]`, in pixels.
+    #[cfg(target_os = "android")]
+    fn android_content(&self) -> Option<(i32, i32, [i32; 4])> {
+        let size = self.window.as_ref()?.inner_size();
+        let content = ANDROID_APP.with(|app| app.borrow().as_ref().map(|a| a.content_rect()))?;
+        Some((
+            size.width as i32,
+            size.height as i32,
+            [content.left, content.top, content.right, content.bottom],
+        ))
+    }
+
     /// How many pixels of the window the on-screen keyboard covers, from the
     /// bottom; zero with it down, and zero everywhere but Android and iOS.
     pub fn keyboard_height(&self) -> f32 {
         #[cfg(target_os = "android")]
         {
-            let Some(window) = &self.window else {
+            let Some((_, height, [_, _, _, bottom])) = self.android_content() else {
                 return 0.0;
             };
-            let height = window.inner_size().height as i32;
-            let Some(content) =
-                ANDROID_APP.with(|app| app.borrow().as_ref().map(|a| a.content_rect()))
-            else {
-                return 0.0;
-            };
-            android_keyboard(height, height - content.bottom)
+            android_keyboard(height, height - bottom)
         }
         #[cfg(target_os = "ios")]
         {
@@ -2327,27 +2365,16 @@ impl WgpuCanvas {
     /// `[left, top, right, bottom]` insets in pixels; zero on a desktop and
     /// the web.
     pub fn safe_area(&self) -> [f32; 4] {
-        // What the content rect leaves uncovered, less the keyboard, which
-        // `keyboard_height` says on its own.
+        // What the content rect leaves uncovered, the bar's share alone at the
+        // bottom: the keyboard is `keyboard_height`'s.
         #[cfg(target_os = "android")]
         {
-            let Some(window) = &self.window else {
+            let Some((width, height, [left, top, right, bottom])) = self.android_content() else {
                 return [0.0; 4];
             };
-            let size = window.inner_size();
-            let Some(content) =
-                ANDROID_APP.with(|app| app.borrow().as_ref().map(|a| a.content_rect()))
-            else {
-                return [0.0; 4];
-            };
-            let (width, height) = (size.width as i32, size.height as i32);
-            let bottom = (height - content.bottom) as f32 - self.keyboard_height();
-            [
-                content.left.max(0) as f32,
-                content.top.max(0) as f32,
-                (width - content.right).max(0) as f32,
-                bottom.max(0.0),
-            ]
+            let covered = height - bottom;
+            let bar = android_bar(height).unwrap_or(covered).min(covered);
+            [left, top, width - right, bar].map(|inset| inset.max(0) as f32)
         }
         #[cfg(target_os = "ios")]
         {
@@ -2377,35 +2404,40 @@ impl WgpuCanvas {
     }
 
     /// Hold the cursor for mouse-look: kept inside the window where the
-    /// system allows that, else locked in place (macOS, the web), where the
-    /// motion arrives as [`WindowEvent::MouseMotion`] since no position does.
+    /// system allows that, else locked in place (macOS, the web). While it is
+    /// held the mouse's raw motion arrives as [`WindowEvent::MouseMotion`],
+    /// which keeps counting at the window's edge.
     pub fn set_cursor_grab(&self, grab: bool) {
         use winit::window::CursorGrabMode;
         let Some(window) = &self.window else {
             return;
         };
-        let locked = if grab {
-            window.set_cursor_grab(CursorGrabMode::Confined).is_err()
-                && window.set_cursor_grab(CursorGrabMode::Locked).is_ok()
+        let held = if grab {
+            window
+                .set_cursor_grab(CursorGrabMode::Confined)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked))
+                .is_ok()
         } else {
             let _ = window.set_cursor_grab(CursorGrabMode::None);
             false
         };
-        self.pointer_locked.set(locked);
+        self.cursor_held.set(held);
+    }
+
+    /// Whether a grab holds the cursor, so its motion arrives raw.
+    pub fn is_cursor_held(&self) -> bool {
+        self.cursor_held.get()
     }
 
     /// Where the text being composed sits, in physical pixels, so the system's
     /// candidate window opens beside it rather than in a corner.
     pub fn set_ime_cursor_area(&self, x: f64, y: f64, width: f64, height: f64) {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(window) = &self.window {
             window.set_ime_cursor_area(
                 winit::dpi::PhysicalPosition::new(x, y),
                 winit::dpi::PhysicalSize::new(width, height),
             );
         }
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        let _ = (x, y, width, height);
     }
 
     /// Set the cursor position.
@@ -2431,16 +2463,12 @@ impl WgpuCanvas {
 
     /// Hide the window.
     pub fn hide(&mut self) {
-        if let Some(window) = &self.window {
-            window.set_visible(false);
-        }
+        self.change_window(|window| window.set_visible(false));
     }
 
     /// Show the window.
     pub fn show(&mut self) {
-        if let Some(window) = &self.window {
-            window.set_visible(true);
-        }
+        self.change_window(|window| window.set_visible(true));
     }
 
     /// The state of a mouse button.
@@ -2451,6 +2479,17 @@ impl WgpuCanvas {
     /// The state of a key.
     pub fn get_key(&self, key: Key) -> Action {
         self.held.key(key)
+    }
+
+    /// What an event changes in what the canvas holds besides keys and
+    /// buttons: losing focus lets go of everything, a pointer outside has no
+    /// position.
+    fn note(&mut self, event: &WindowEvent) {
+        match event {
+            WindowEvent::Focus(false) => self.let_go(),
+            WindowEvent::CursorEnter(false) => self.cursor_pos = None,
+            _ => {}
+        }
     }
 
     /// Releases everything still held, which no event will once the window
@@ -2470,35 +2509,36 @@ struct Held {
     buttons: BTreeSet<MouseButton>,
 }
 
+fn held_state<T: Ord>(held: &BTreeSet<T>, item: &T) -> Action {
+    if held.contains(item) {
+        Action::Press
+    } else {
+        Action::Release
+    }
+}
+
+fn hold<T: Ord>(held: &mut BTreeSet<T>, item: T, action: Action) {
+    match action {
+        Action::Press => held.insert(item),
+        Action::Release => held.remove(&item),
+    };
+}
+
 impl Held {
     fn key(&self, key: Key) -> Action {
-        if self.keys.contains(&key) {
-            Action::Press
-        } else {
-            Action::Release
-        }
+        held_state(&self.keys, &key)
     }
 
     fn button(&self, button: MouseButton) -> Action {
-        if self.buttons.contains(&button) {
-            Action::Press
-        } else {
-            Action::Release
-        }
+        held_state(&self.buttons, &button)
     }
 
     fn set_key(&mut self, key: Key, action: Action) {
-        match action {
-            Action::Press => self.keys.insert(key),
-            Action::Release => self.keys.remove(&key),
-        };
+        hold(&mut self.keys, key, action);
     }
 
     fn set_button(&mut self, button: MouseButton, action: Action) {
-        match action {
-            Action::Press => self.buttons.insert(button),
-            Action::Release => self.buttons.remove(&button),
-        };
+        hold(&mut self.buttons, button, action);
     }
 
     /// A release for each thing held, leaving nothing held.
@@ -3120,10 +3160,8 @@ mod tests {
             .collect()
     }
 
-    /// The navigation bar covers the window whether or not the keyboard is up,
-    /// so the first cover seen at a height is taken as the bar alone and only
-    /// what a later one adds is the keyboard. A rotation changes the height,
-    /// which starts the measurement again.
+    /// A height first seen with the keyboard asked for borrows the bar's share
+    /// from the height before it, so a turn while typing is not all bar.
     #[test]
     fn a_rotation_while_typing_still_reads_the_keyboard() {
         assert_eq!(android_keyboard(1920, 60), 0.0, "upright, the bar alone");
@@ -3143,6 +3181,9 @@ mod tests {
         );
     }
 
+    /// The navigation bar covers the window whether or not the keyboard is up,
+    /// so the first cover seen at a height is taken as the bar alone and only
+    /// what a later one adds is the keyboard.
     #[test]
     fn the_android_keyboard_is_what_covers_more_than_the_navigation_bar() {
         // 1080-tall window whose navigation bar takes the bottom 60.

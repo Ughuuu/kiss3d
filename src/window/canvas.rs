@@ -219,6 +219,11 @@ impl Canvas {
         self.canvas.set_ime_cursor_area(x, y, width, height);
     }
 
+    /// Whether a grab holds the cursor, so its motion arrives raw.
+    pub fn is_cursor_held(&self) -> bool {
+        self.canvas.is_cursor_held()
+    }
+
     /// Set the window title.
     pub fn set_title(&mut self, title: &str) {
         self.canvas.set_title(title)

@@ -350,15 +350,20 @@ impl Window {
 
     /// Sets the cursor grabbing behaviour.
     ///
-    /// If cursor grabbing is enabled, the cursor is prevented from leaving the window.
+    /// A grabbed cursor is kept inside the window where the system allows
+    /// that, else locked in place (macOS, the web). While it is held the
+    /// mouse's raw motion arrives as [`WindowEvent::MouseMotion`].
     ///
     /// # Arguments
     /// * `grab` - `true` to enable cursor grabbing, `false` to disable it
-    ///
-    /// # Platform-specific
-    /// Does nothing on web platforms.
     pub fn set_cursor_grab(&self, grab: bool) {
         self.canvas.set_cursor_grab(grab);
+    }
+
+    /// Whether a grab holds the cursor, so its motion arrives as
+    /// [`WindowEvent::MouseMotion`]: false where no grab mode was available.
+    pub fn is_cursor_held(&self) -> bool {
+        self.canvas.is_cursor_held()
     }
 
     /// Enters or leaves borderless fullscreen on the current monitor.
