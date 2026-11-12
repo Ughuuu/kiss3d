@@ -140,7 +140,7 @@ impl Canvas {
     }
 
     /// Gets the current surface texture for rendering.
-    pub fn get_current_texture(&self) -> Option<wgpu::SurfaceTexture> {
+    pub fn get_current_texture(&mut self) -> Option<wgpu::SurfaceTexture> {
         self.canvas.get_current_texture()
     }
 
@@ -206,6 +206,17 @@ impl Canvas {
     /// The scale factor.
     pub fn scale_factor(&self) -> f64 {
         self.canvas.scale_factor()
+    }
+
+    /// The refresh rate of the display the window is on, in hertz, where the
+    /// system says.
+    pub fn refresh_rate(&self) -> Option<f32> {
+        self.canvas.refresh_rate()
+    }
+
+    /// Where the text being composed sits, in physical pixels.
+    pub fn set_ime_cursor_area(&self, x: f64, y: f64, width: f64, height: f64) {
+        self.canvas.set_ime_cursor_area(x, y, width, height);
     }
 
     /// Set the window title.

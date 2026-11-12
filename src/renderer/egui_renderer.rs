@@ -18,6 +18,7 @@ pub struct EguiRenderer {
     uploaded_for: Option<[u32; 2]>,
     textures_delta: egui::TexturesDelta,
     cursor: egui::CursorIcon,
+    ime: Option<egui::output::IMEOutput>,
     retain_shapes: bool,
     #[cfg(test)]
     uploads: u32,
@@ -61,6 +62,7 @@ impl EguiRenderer {
         // to initialize it to the actual value (which might be 1)
         // and trigger a redraw.
         egui_ctx.set_pixels_per_point(0.987);
+        leave_zoom_to_host(&egui_ctx);
 
         // Run a dummy frame to initialize fonts with correct DPI
         let dummy_input = RawInput::default();
@@ -100,6 +102,7 @@ impl EguiRenderer {
             uploaded_for: None,
             textures_delta: Default::default(),
             cursor: egui::CursorIcon::Default,
+            ime: None,
             retain_shapes: false,
             #[cfg(test)]
             uploads: 0,
@@ -156,10 +159,16 @@ impl EguiRenderer {
         self.cursor
     }
 
+    /// Where the last pass put a text field being typed into, if one was.
+    pub fn ime(&self) -> Option<egui::output::IMEOutput> {
+        self.ime
+    }
+
     /// End the current frame and prepare for rendering.
     pub fn end_frame(&mut self) {
         let output = self.egui_ctx.end_pass();
         self.cursor = output.platform_output.cursor_icon;
+        self.ime = output.platform_output.ime;
         self.shapes = output.shapes;
         self.primitives = None;
         // Append rather than replace: if a previous frame's render was skipped
@@ -368,10 +377,42 @@ fn egui_captures_pointer(ctx: &EguiContext) -> bool {
         .is_some_and(|layer| layer.order != egui::Order::Background)
 }
 
+/// The window sets the zoom every pass (`Window::set_ui_zoom`); egui's own
+/// ⌘+, ⌘− and ⌘0 would move it for a frame behind the host's back.
+fn leave_zoom_to_host(ctx: &egui::Context) {
+    ctx.options_mut(|options| options.zoom_with_keyboard = false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_gpu::on_gpu;
+
+    #[test]
+    fn command_minus_leaves_the_zoom_to_the_host() {
+        let ctx = egui::Context::default();
+        leave_zoom_to_host(&ctx);
+        let command = egui::Modifiers::COMMAND;
+        let pass = |events: Vec<egui::Event>| {
+            ctx.begin_pass(RawInput {
+                events,
+                ..RawInput::default()
+            });
+            ctx.end_pass().textures_delta.clear();
+        };
+        pass(vec![
+            egui::Event::ModifiersChanged(command),
+            egui::Event::Key {
+                key: egui::Key::Minus,
+                physical_key: Some(egui::Key::Minus),
+                pressed: true,
+                repeat: false,
+                modifiers: command,
+            },
+        ]);
+        pass(Vec::new());
+        assert_eq!(ctx.zoom_factor(), 1.0);
+    }
 
     const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
     const WINDOW_POS: egui::Pos2 = egui::pos2(10.0, 10.0);

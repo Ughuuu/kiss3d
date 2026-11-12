@@ -26,6 +26,8 @@ pub(crate) struct EguiContext {
     /// The shape the pointer was last set to. Setting one is a hop to the
     /// main thread, so only a change is worth making.
     pub(crate) cursor: egui::CursorIcon,
+    /// The caret last handed to the system for its candidate window.
+    pub(crate) ime_area: Option<egui::Rect>,
     /// The UI zoom the host asked for, in points per design pixel. Held here
     /// rather than read back from the context because `set_zoom_factor` only
     /// lands at the next `begin_pass`, so the context answers with the old
@@ -51,6 +53,7 @@ impl EguiContext {
             pointer_touch_id: None,
             rerun_input: RawInput::default(),
             cursor: egui::CursorIcon::Default,
+            ime_area: None,
             zoom: 1.0,
             fed: 0,
             pointer: None,
@@ -446,6 +449,19 @@ impl Window {
                     });
                 }
             }
+            WindowEvent::Focus(focused) => {
+                self.egui_context
+                    .raw_input
+                    .events
+                    .push(egui::Event::WindowFocused(focused));
+            }
+            WindowEvent::CursorEnter(false) => {
+                self.egui_context.pointer = None;
+                self.egui_context
+                    .raw_input
+                    .events
+                    .push(egui::Event::PointerGone);
+            }
             _ => {}
         }
     }
@@ -642,6 +658,20 @@ impl Window {
             if want != self.egui_context.cursor {
                 self.egui_context.cursor = want;
                 self.canvas.set_cursor_icon(winit_cursor(want));
+            }
+            // The caret, so the system's candidate window opens beside it.
+            let area = self.egui_context.renderer.ime().map(|ime| ime.cursor_rect);
+            if area != self.egui_context.ime_area {
+                self.egui_context.ime_area = area;
+                if let Some(rect) = area {
+                    let ppp = f64::from(self.egui_pixels_per_point());
+                    self.canvas.set_ime_cursor_area(
+                        f64::from(rect.min.x) * ppp,
+                        f64::from(rect.min.y) * ppp,
+                        f64::from(rect.width()) * ppp,
+                        f64::from(rect.height()) * ppp,
+                    );
+                }
             }
         }
         // Note: `raw_input` is *not* reset here. It is drained by

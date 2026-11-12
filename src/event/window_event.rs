@@ -25,6 +25,9 @@ pub enum WindowEvent {
     CursorPos(f64, f64, Modifiers),
     /// The cursor entered or left the window.
     CursorEnter(bool),
+    /// How far the mouse moved, in the device's own units, while the cursor
+    /// is locked in place and reports no position.
+    MouseMotion(f64, f64),
     /// The mouse wheel was scrolled (x_offset, y_offset, modifiers).
     Scroll(f64, f64, Modifiers),
     /// A keyboard key was pressed, released, or repeated (key, action, modifiers).

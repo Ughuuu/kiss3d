@@ -534,6 +534,12 @@ impl Window {
         self.canvas.scale_factor()
     }
 
+    /// The refresh rate of the display the window is on, in hertz, where the
+    /// system says: the monitor's own figure, not how often frames are drawn.
+    pub fn refresh_rate(&self) -> Option<f32> {
+        self.canvas.refresh_rate()
+    }
+
     /// Sets the ambient light intensity for the scene.
     ///
     /// # Example

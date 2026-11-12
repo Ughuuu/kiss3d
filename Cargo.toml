@@ -146,6 +146,11 @@ name = "access_adapter"
 harness = false
 required-features = ["egui"]
 
+[[test]]
+name = "surface_follows_window"
+harness = false
+required-features = ["egui"]
+
 [[example]]
 name = "text"
 required-features = ["text"]
