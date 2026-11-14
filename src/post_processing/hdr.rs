@@ -23,6 +23,33 @@ use bytemuck::{Pod, Zeroable};
 /// The floating-point format used for the HDR scene target and bloom chain.
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// Texels along each side of the Tony McMapface LUT.
+pub const TONY_LUT_DIM: u32 = 48;
+/// One `Rgba16Float` texel: four channels of two bytes.
+const TONY_TEXEL_BYTES: u32 = 8;
+/// The bytes of a whole Tony McMapface LUT.
+pub const TONY_LUT_BYTES: usize = (TONY_LUT_DIM.pow(3) * TONY_TEXEL_BYTES) as usize;
+
+/// Tony McMapface's baked LUT, [`TONY_LUT_DIM`]³ `Rgba16Float` texels decoded
+/// offline from the CC0 original.
+#[cfg(feature = "tony-lut")]
+pub const TONY_MCMAPFACE_LUT: &[u8] = include_bytes!("../builtin/tony_mc_mapface.bin");
+#[cfg(feature = "tony-lut")]
+const EMBEDDED_TONY_LUT: Option<&[u8]> = Some(TONY_MCMAPFACE_LUT);
+#[cfg(not(feature = "tony-lut"))]
+const EMBEDDED_TONY_LUT: Option<&[u8]> = None;
+
+static TONY_LUT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// Hands kiss3d the Tony McMapface LUT, for a build without the `tony-lut`
+/// feature; a window opened before it samples one flat texel.
+///
+/// `false` when `data` is not [`TONY_LUT_BYTES`] long, or a LUT was handed
+/// over already.
+pub fn set_tony_lut(data: Vec<u8>) -> bool {
+    data.len() == TONY_LUT_BYTES && TONY_LUT.set(data).is_ok()
+}
+
 /// Weighted-blended OIT accumulation target (premultiplied weighted color + weight).
 pub const OIT_ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Weighted-blended OIT revealage target (product of `1 - alpha`).
@@ -881,18 +908,22 @@ impl HdrPipeline {
         }
     }
 
-    /// Uploads the embedded Tony McMapface LUT (48³ `Rgba16Float`, decoded offline
-    /// from the CC0 baked LUT) as a 3D texture. Shared with the path tracer's
-    /// tonemap pass so both sample the identical LUT.
+    /// Uploads the Tony McMapface LUT as a 3D texture. Shared with the path
+    /// tracer's tonemap pass so both sample the identical LUT.
+    ///
+    /// With no LUT embedded or handed over, one texel keeps the bind group
+    /// whole, and `Tonemap::TonyMcMapface` draws one flat colour.
     pub(crate) fn create_tony_lut(ctxt: &Context) -> wgpu::Texture {
-        const DIM: u32 = 48;
-        let data: &[u8] = include_bytes!("../builtin/tony_mc_mapface.bin");
+        let (dim, data) = match TONY_LUT.get().map(Vec::as_slice).or(EMBEDDED_TONY_LUT) {
+            Some(data) => (TONY_LUT_DIM, data),
+            None => (1, &[0u8; TONY_TEXEL_BYTES as usize][..]),
+        };
         let tex = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("hdr_tony_lut"),
             size: wgpu::Extent3d {
-                width: DIM,
-                height: DIM,
-                depth_or_array_layers: DIM,
+                width: dim,
+                height: dim,
+                depth_or_array_layers: dim,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -911,13 +942,13 @@ impl HdrPipeline {
             data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(DIM * 8), // 4 channels * 2 bytes (f16)
-                rows_per_image: Some(DIM),
+                bytes_per_row: Some(dim * TONY_TEXEL_BYTES),
+                rows_per_image: Some(dim),
             },
             wgpu::Extent3d {
-                width: DIM,
-                height: DIM,
-                depth_or_array_layers: DIM,
+                width: dim,
+                height: dim,
+                depth_or_array_layers: dim,
             },
         );
         tex

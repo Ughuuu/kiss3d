@@ -8,9 +8,11 @@ pub use crate::post_processing::gi2d::{
     MAX_SEGMENT_OCCLUDERS,
 };
 pub use crate::post_processing::grayscales::Grayscales;
+#[cfg(feature = "tony-lut")]
+pub use crate::post_processing::hdr::TONY_MCMAPFACE_LUT;
 pub use crate::post_processing::hdr::{
-    ColorGrading, HdrPipeline, HdrSettings, Tonemap, HDR_FORMAT, MAX_BLOOM_MIPS, OIT_ACCUM_FORMAT,
-    OIT_REVEAL_FORMAT,
+    set_tony_lut, ColorGrading, HdrPipeline, HdrSettings, Tonemap, HDR_FORMAT, MAX_BLOOM_MIPS,
+    OIT_ACCUM_FORMAT, OIT_REVEAL_FORMAT, TONY_LUT_BYTES, TONY_LUT_DIM,
 };
 pub use crate::post_processing::loupe::{Loupe, LoupeCorner};
 pub use crate::post_processing::oculus_stereo::OculusStereo;

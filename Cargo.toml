@@ -30,7 +30,7 @@ name = "kiss3d"
 path = "src/lib.rs"
 
 [features]
-default = ["text", "egui-default-fonts", "image-formats", "webgl"]
+default = ["text", "egui-default-fonts", "image-formats", "webgl", "tony-lut"]
 # `rfd` powers the inspector's native "Open…" image dialogs (unused on wasm, which
 # falls back to a path text field). `accesskit_winit` is the platform's way into a
 # window for a screen reader, made only for one opened with `CanvasSetup::accessible`.
@@ -53,6 +53,9 @@ image-formats = ["image/default-formats"]
 # WebGL2 beside WebGPU in a browser: wgpu's GL backend, wgpu-core and naga in
 # the module. Off, a page without WebGPU draws nothing.
 webgl = ["wgpu/webgl"]
+# Tony McMapface's baked LUT in the binary, 864 KiB; off, an app hands it over
+# with `post_processing::set_tony_lut` before the first window opens.
+tony-lut = []
 
 [dependencies]
 bitflags     = "2"
