@@ -30,7 +30,7 @@ name = "kiss3d"
 path = "src/lib.rs"
 
 [features]
-default = ["text", "egui-default-fonts", "image-formats"]
+default = ["text", "egui-default-fonts", "image-formats", "webgl"]
 # `rfd` powers the inspector's native "Open…" image dialogs (unused on wasm, which
 # falls back to a path text field). `accesskit_winit` is the platform's way into a
 # window for a screen reader, made only for one opened with `CanvasSetup::accessible`.
@@ -50,12 +50,16 @@ text = ["dep:rusttype"]
 egui-default-fonts = ["egui?/default_fonts"]
 # Every format the image crate decodes; off, PNG and JPEG only.
 image-formats = ["image/default-formats"]
+# WebGL2 beside WebGPU in a browser: wgpu's GL backend, wgpu-core and naga in
+# the module. Off, a page without WebGPU draws nothing.
+webgl = ["wgpu/webgl"]
 
 [dependencies]
 bitflags     = "2"
 bytemuck     = { version = "1", features = ["derive"] }
 egui         = { version = "0.37", optional = true, default-features = false }
-egui-wgpu    = { version = "0.37", optional = true }
+# Its defaults turn `wgpu/webgl` on; the `webgl` feature above decides that.
+egui-wgpu    = { version = "0.37", optional = true, default-features = false, features = ["fragile-send-sync-non-atomic-wasm", "macos-window-resize-jitter-fix"] }
 gltf         = { version = "1.4", features = ["import", "utils", "names"] }
 image        = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 log          = "0.4"
