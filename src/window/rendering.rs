@@ -331,15 +331,12 @@ impl Window {
         // Acquire the surface texture for visible windows. A just-created
         // window may not be presentable yet, so `acquire_next_frame` retries
         // until it is.
-        let frame = if offscreen {
+        let frame = if offscreen && !self.surface_refused {
             None
         } else {
             match self.acquire_next_frame() {
                 Some(frame) => Some(frame),
-                None => {
-                    self.discard_queued_draws();
-                    return !self.should_close();
-                }
+                None => return self.finish_undrawn_frame(camera, Some(camera_2d)).await,
             }
         };
 
@@ -1655,15 +1652,12 @@ impl Window {
         self.gpu_timer.begin_frame();
         let offscreen = self.hidden;
 
-        let frame = if offscreen {
+        let frame = if offscreen && !self.surface_refused {
             None
         } else {
             match self.acquire_next_frame() {
                 Some(frame) => Some(frame),
-                None => {
-                    self.discard_queued_draws();
-                    return !self.should_close();
-                }
+                None => return self.finish_undrawn_frame(camera, None).await,
             }
         };
 
@@ -1852,6 +1846,36 @@ impl Window {
         !self.should_close()
     }
 
+    /// The rest of a frame with no surface to draw into: everything but the
+    /// GPU's work and the present. The cameras take the window's size and the
+    /// UI pass ends, or the next frame's widgets run inside this one's pass,
+    /// laid out by it and deaf to input that came since.
+    async fn finish_undrawn_frame(
+        &mut self,
+        camera: &mut dyn Camera3d,
+        mut camera_2d: Option<&mut dyn Camera2d>,
+    ) -> bool {
+        self.discard_queued_draws();
+        let size = WindowEvent::FramebufferSize(self.width(), self.height());
+        if let Some(camera_2d) = camera_2d.as_deref_mut() {
+            camera_2d.handle_event(&self.canvas, &size);
+        }
+        camera.handle_event(&self.canvas, &size);
+        if let Some(camera_2d) = camera_2d {
+            camera_2d.update(&self.canvas);
+        }
+        camera.update(&self.canvas);
+        #[cfg(feature = "egui")]
+        self.finish_egui_pass();
+
+        #[cfg(target_arch = "wasm32")]
+        next_animation_frame().await;
+        #[cfg(target_os = "ios")]
+        super::ios::next_frame().await;
+
+        !self.should_close()
+    }
+
     /// Drops the lines, points and text queued for a frame that is skipped.
     /// Otherwise they pile up while no frame is drawn (e.g. a window on another macOS Space).
     fn discard_queued_draws(&mut self) {
@@ -1870,17 +1894,19 @@ impl Window {
     /// waiting for window events between attempts, never sleeping — for up
     /// to a couple of seconds, because a freshly created window may need the
     /// event loop to run a few times before its surface becomes presentable.
-    /// Once a frame has been acquired, a later failure (e.g. a minimized
-    /// window) skips the frame immediately instead of stalling.
+    /// That wait is spent once: after a frame has been acquired, or after the
+    /// wait ran out, a failure (a minimized window, a display asleep) skips
+    /// the frame immediately instead of stalling.
     fn acquire_next_frame(&mut self) -> Option<wgpu::SurfaceTexture> {
-        if let Some(frame) = self.canvas.get_current_texture() {
+        if let Some(frame) = self.surface_texture() {
             self.first_frame = false;
             return Some(frame);
         }
 
         // The window has rendered before: treat this as a transient failure
-        // and skip the frame without stalling.
-        if !self.first_frame {
+        // and skip the frame without stalling. A hidden window has no surface
+        // to wait for, and a refused one would wait in vain.
+        if !self.first_frame || self.hidden || self.surface_refused {
             return None;
         }
 
@@ -1896,12 +1922,13 @@ impl Window {
             loop {
                 self.events_queued |= self.canvas.wait_events(Some(SURFACE_RETRY_INTERVAL));
 
-                if let Some(frame) = self.canvas.get_current_texture() {
+                if let Some(frame) = self.surface_texture() {
                     self.first_frame = false;
                     return Some(frame);
                 }
 
                 if std::time::Instant::now() >= deadline {
+                    self.first_frame = false;
                     log::warn!(
                         "could not acquire a surface texture within \
                          {STARTUP_SURFACE_TIMEOUT:?}; the window failed to become ready"
@@ -1910,6 +1937,13 @@ impl Window {
                 }
             }
         }
+    }
+
+    fn surface_texture(&mut self) -> Option<wgpu::SurfaceTexture> {
+        if self.surface_refused {
+            return None;
+        }
+        self.canvas.get_current_texture()
     }
 
     fn render_scene(

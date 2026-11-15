@@ -145,10 +145,13 @@ pub struct Window {
     /// Whether the window is hidden. Hidden windows render offscreen.
     pub(super) hidden: bool,
     pub(super) should_close: bool,
-    /// `true` until the first surface texture has been successfully acquired.
-    /// While set, frame acquisition retries (pumping window events) instead of
-    /// skipping, so a freshly created window reliably renders its first frame.
+    /// `true` until the first surface texture has been acquired, or the wait
+    /// for one ran out. While set, frame acquisition retries (pumping window
+    /// events) instead of skipping, so a freshly created window reliably
+    /// renders its first frame.
     pub(super) first_frame: bool,
+    /// Set by [`Window::set_surface_refused`]: no frame is handed out.
+    pub(super) surface_refused: bool,
     pub(super) close_key: Option<Key>,
     pub(super) close_modifiers: Option<Modifiers>,
     /// Per-step timings of the most recently rendered frame, for the active
@@ -489,6 +492,13 @@ impl Window {
     pub fn show(&mut self) {
         self.hidden = false;
         self.canvas.show()
+    }
+
+    /// Make the surface hand out no frame, as a display that is asleep does,
+    /// so a test can run the frames a window cannot present. A hidden window
+    /// draws none either while it is set.
+    pub fn set_surface_refused(&mut self, refused: bool) {
+        self.surface_refused = refused;
     }
 
     /// Sets the background color for the window.
@@ -1271,6 +1281,7 @@ impl Window {
         let mut usr_window = Window {
             should_close: false,
             first_frame: true,
+            surface_refused: false,
             close_key: None,
             close_modifiers: None,
             last_timings: None,
@@ -1366,6 +1377,7 @@ impl Window {
         Window {
             should_close: false,
             first_frame: true,
+            surface_refused: false,
             close_key: None,
             close_modifiers: None,
             last_timings: None,
