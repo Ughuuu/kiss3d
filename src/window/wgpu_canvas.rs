@@ -438,6 +438,15 @@ pub(crate) fn collect_window_event(window_id: winit::window::WindowId, event: Wi
         WinitWindowEvent::Occluded(hidden) => {
             vec![PendingEvent::WindowEvent(WindowEvent::Iconify(hidden))]
         }
+        WinitWindowEvent::ThemeChanged(theme) => {
+            let dark = theme == winit::window::Theme::Dark;
+            vec![PendingEvent::WindowEvent(WindowEvent::DarkMode(dark))]
+        }
+        WinitWindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+            vec![PendingEvent::WindowEvent(WindowEvent::ScaleFactor(
+                scale_factor,
+            ))]
+        }
         WinitWindowEvent::DroppedFile(path) => {
             DROPPED_FILES.with(|dropped| dropped.borrow_mut().push((window_id, path)));
             vec![]
@@ -3103,6 +3112,24 @@ mod tests {
             })
             .collect();
         assert_eq!(told, [false, true]);
+    }
+
+    #[test]
+    fn the_system_turning_dark_and_light_is_told() {
+        use winit::window::Theme;
+        let window = winit::window::WindowId::dummy();
+        collect_window_event(window, WinitWindowEvent::ThemeChanged(Theme::Dark));
+        collect_window_event(window, WinitWindowEvent::ThemeChanged(Theme::Light));
+        let pending = PENDING_WINDOW_EVENTS
+            .with(|storage| storage.borrow_mut().remove(&window).unwrap_or_default());
+        let told: Vec<bool> = pending
+            .iter()
+            .filter_map(|event| match event {
+                PendingEvent::WindowEvent(WindowEvent::DarkMode(dark)) => Some(*dark),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told, [true, false]);
     }
 
     #[test]

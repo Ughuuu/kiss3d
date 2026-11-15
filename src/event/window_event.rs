@@ -42,6 +42,14 @@ pub enum WindowEvent {
     /// The system is short of memory: what can be rebuilt is worth freeing.
     /// Sent on iOS and Android; a desktop pages instead.
     LowMemory,
+    /// The system switched between its light and dark appearance; `true` for
+    /// dark. Sent where winit hears it, macOS and Windows, and never for a
+    /// window whose own theme was set.
+    DarkMode(bool),
+    /// The window's scale factor changed: a move to a display of another
+    /// density, or on Android any change to the configuration, night mode
+    /// and font size included, which winit reports this way.
+    ScaleFactor(f64),
 }
 
 use WindowEvent::*;
