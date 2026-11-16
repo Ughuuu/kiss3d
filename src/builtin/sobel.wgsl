@@ -7,11 +7,10 @@ var t_color: texture_2d<f32>;
 @group(0) @binding(1)
 var s_color: sampler;
 
-// Bind group 1: Depth texture and sampler
+// Bind group 1: Depth texture, read as unfilterable float texel by texel: GLSL
+// samples a depth texture only through a shadow sampler.
 @group(1) @binding(0)
-var t_depth: texture_depth_2d;
-@group(1) @binding(1)
-var s_depth: sampler;
+var t_depth: texture_2d<f32>;
 
 // Bind group 2: Uniforms
 struct SobelUniforms {
@@ -47,10 +46,12 @@ fn vs_main(vertex: VertexInput) -> VertexOutput {
     return out;
 }
 
-// Convert non-linear depth to linear depth
+// Convert non-linear depth to linear depth, at the texel a nearest, clamped
+// sample of `uv` would read.
 fn lin_depth(uv: vec2<f32>) -> f32 {
-    // textureSample on texture_depth_2d returns a scalar f32
-    let nlin_depth = textureSample(t_depth, s_depth, uv);
+    let size = vec2<i32>(textureDimensions(t_depth));
+    let texel = clamp(vec2<i32>(floor(uv * vec2<f32>(size))), vec2<i32>(0), size - vec2<i32>(1));
+    let nlin_depth = textureLoad(t_depth, texel, 0).r;
     return uniforms.znear * uniforms.zfar / ((nlin_depth * (uniforms.zfar - uniforms.znear)) - uniforms.zfar);
 }
 

@@ -109,10 +109,7 @@ impl Crt {
 
         let shader = ctxt.create_shader_module(
             Some("crt_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::crt",
-                include_str!("../builtin/crt.wgsl"),
-            ),
+            &crate::builtin::linked("package::crt", &[]),
         );
 
         let vertex_buffer_layout = wgpu::VertexBufferLayout {

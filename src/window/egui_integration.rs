@@ -26,11 +26,20 @@ pub(crate) struct EguiContext {
     /// The shape the pointer was last set to. Setting one is a hop to the
     /// main thread, so only a change is worth making.
     pub(crate) cursor: egui::CursorIcon,
+    /// The caret last handed to the system for its candidate window.
+    pub(crate) ime_area: Option<egui::Rect>,
     /// The UI zoom the host asked for, in points per design pixel. Held here
     /// rather than read back from the context because `set_zoom_factor` only
     /// lands at the next `begin_pass`, so the context answers with the old
     /// one until then and every size computed from it would be a frame late.
     pub(crate) zoom: f32,
+    /// How many of the events the app read through `events()` this frame the
+    /// pass has been handed already, so `handle_events` does not feed them twice.
+    pub(crate) fed: usize,
+    /// Where the pointer was as of the last event fed, in physical pixels. A
+    /// button event carries no position, and the canvas's own is where the
+    /// pointer is now, which a click followed by a move has already left.
+    pub(crate) pointer: Option<(f64, f64)>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) start_time: std::time::Instant,
 }
@@ -44,7 +53,10 @@ impl EguiContext {
             pointer_touch_id: None,
             rerun_input: RawInput::default(),
             cursor: egui::CursorIcon::Default,
+            ime_area: None,
             zoom: 1.0,
+            fed: 0,
+            pointer: None,
             #[cfg(not(target_arch = "wasm32"))]
             start_time: std::time::Instant::now(),
         }
@@ -82,6 +94,13 @@ fn egui_modifiers(modifiers: Modifiers) -> egui::Modifiers {
         // the platform's apps read it.
         command: if command_is_super() { mac_cmd } else { ctrl },
     }
+}
+
+/// What `event` tells egui is held; `i.modifiers` hears of it no other way.
+fn held_event(event: &WindowEvent) -> Option<egui::Event> {
+    event
+        .modifiers()
+        .map(|held| egui::Event::ModifiersChanged(egui_modifiers(held)))
 }
 
 /// egui's key for one of ours. Keys arrive as physical codes on both
@@ -297,9 +316,11 @@ impl Window {
     /// Feed a window event to egui for processing.
     pub(crate) fn feed_egui_event(&mut self, event: &WindowEvent) {
         let scale_factor = self.egui_pixels_per_point();
+        self.egui_context.raw_input.events.extend(held_event(event));
 
         match *event {
             WindowEvent::CursorPos(x, y, _) => {
+                self.egui_context.pointer = Some((x, y));
                 // Convert physical pixels to logical coordinates
                 let pos = egui::Pos2::new((x as f32) / scale_factor, (y as f32) / scale_factor);
                 self.egui_context
@@ -315,7 +336,7 @@ impl Window {
                     _ => return,
                 };
 
-                if let Some(pos) = self.cursor_pos() {
+                if let Some(pos) = self.egui_context.pointer.or_else(|| self.cursor_pos()) {
                     // Convert physical pixels to logical coordinates
                     let pos = egui::Pos2::new(
                         (pos.0 as f32) / scale_factor,
@@ -344,6 +365,7 @@ impl Window {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::Vec2::new(x as f32, y as f32),
                         phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                         modifiers: egui_modifiers(modifiers),
                     });
             }
@@ -426,6 +448,19 @@ impl Window {
                         modifiers: egui_modifiers(modifiers),
                     });
                 }
+            }
+            WindowEvent::Focus(focused) => {
+                self.egui_context
+                    .raw_input
+                    .events
+                    .push(egui::Event::WindowFocused(focused));
+            }
+            WindowEvent::CursorEnter(false) => {
+                self.egui_context.pointer = None;
+                self.egui_context
+                    .raw_input
+                    .events
+                    .push(egui::Event::PointerGone);
             }
             _ => {}
         }
@@ -558,7 +593,10 @@ impl Window {
             .context()
             .set_zoom_factor(self.egui_context.zoom);
 
-        // Build raw input with accumulated events
+        // What the app read through `events()` this frame is otherwise fed in
+        // `handle_events`, after this pass: the pass would answer the last
+        // frame's input, and a host that skips passes would never answer this.
+        self.feed_read_events();
         let mut raw_input = std::mem::take(&mut self.egui_context.raw_input);
         // The display's own scale, which egui multiplies by the zoom factor to
         // reach `pixels_per_point`. Setting that directly instead would pin the
@@ -579,9 +617,32 @@ impl Window {
         // `take` leaves what `Context::run` hands a later pass of the same
         // frame: the time, and none of the events.
         let first = raw_input.take();
+        // A rerun of this frame's pass is given the screen again: egui's
+        // `take` leaves none, and a pass begun with none on this context
+        // laid out on egui's 10000 by 10000 placeholder (2026-10-20).
+        raw_input.screen_rect = first.screen_rect;
         self.egui_context.rerun_input = raw_input;
         self.egui_context.renderer.begin_frame(first);
         self.egui_context.pass_active = true;
+    }
+
+    /// Feeds egui the events the app has read through [`Self::events`] since
+    /// the last feed.
+    fn feed_read_events(&mut self) {
+        let read: Vec<WindowEvent> =
+            self.unhandled_events.borrow()[self.egui_context.fed..].to_vec();
+        self.egui_context.fed += read.len();
+        for event in &read {
+            self.feed_egui_event(event);
+        }
+    }
+
+    /// Whether egui holds input no pass has answered: events the app has read
+    /// this frame, or ones fed since the last pass. A host that skips passes
+    /// runs one while this is true, or a click waits for the next input.
+    pub fn has_unread_ui_input(&self) -> bool {
+        !self.egui_context.raw_input.events.is_empty()
+            || self.unhandled_events.borrow().len() > self.egui_context.fed
     }
 
     /// Closes the egui pass opened by `draw_ui`/`draw_inspector`, if any, so the
@@ -597,6 +658,20 @@ impl Window {
             if want != self.egui_context.cursor {
                 self.egui_context.cursor = want;
                 self.canvas.set_cursor_icon(winit_cursor(want));
+            }
+            // The caret, so the system's candidate window opens beside it.
+            let area = self.egui_context.renderer.ime().map(|ime| ime.cursor_rect);
+            if area != self.egui_context.ime_area {
+                self.egui_context.ime_area = area;
+                if let Some(rect) = area {
+                    let ppp = f64::from(self.egui_pixels_per_point());
+                    self.canvas.set_ime_cursor_area(
+                        f64::from(rect.min.x) * ppp,
+                        f64::from(rect.min.y) * ppp,
+                        f64::from(rect.width()) * ppp,
+                        f64::from(rect.height()) * ppp,
+                    );
+                }
             }
         }
         // Note: `raw_input` is *not* reset here. It is drained by
@@ -703,6 +778,34 @@ mod tests {
             other,
             command
         );
+    }
+
+    #[test]
+    fn an_input_event_tells_egui_what_is_held() {
+        let ctx = egui::Context::default();
+        let shift_after = |event: WindowEvent| {
+            ctx.begin_pass(RawInput {
+                events: held_event(&event).into_iter().collect(),
+                ..Default::default()
+            });
+            let shift = ctx.input(|i| i.modifiers.shift);
+            ctx.end_pass().textures_delta.clear();
+            shift
+        };
+        assert!(shift_after(WindowEvent::Key(
+            Key::Tab,
+            Action::Press,
+            Modifiers::Shift
+        )));
+        assert!(
+            shift_after(WindowEvent::Char('x')),
+            "an event that says nothing of the modifiers leaves them"
+        );
+        assert!(!shift_after(WindowEvent::CursorPos(
+            0.0,
+            0.0,
+            Modifiers::empty()
+        )));
     }
 
     /// ⌘ is a Mac's alone: egui's mac-only paths read `mac_cmd`, and a chord

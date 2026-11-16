@@ -10,7 +10,7 @@ struct ClusterUniforms {
     view: mat4x4<f32>,
     grid: vec4<u32>,    // (grid_x, grid_y, grid_z, num_clustered_lights)
     screen: vec4<f32>,  // (width_px, height_px, tile_w_px, tile_h_px)
-    depth: vec4<f32>,   // (z_near, z_far, ln(z_far/z_near), unused)
+    depth: vec4<f32>,   // (z_near, z_far, ln(z_far/z_near), max lights per cluster)
 };
 
 struct ClusterAABB {
@@ -39,9 +39,6 @@ struct GpuLight {
 @group(0) @binding(3) var<storage, read_write> grid: array<vec2<u32>>;
 @group(0) @binding(4) var<storage, read_write> index_list: array<u32>;
 
-// Must match `MAX_LIGHTS_PER_CLUSTER` in clustered.rs.
-const MAX_PER_CLUSTER: u32 = 256u;
-
 // Squared distance from `c` to the AABB [lo, hi]; 0 if inside.
 fn sphere_hits_aabb(c: vec3<f32>, r: f32, lo: vec3<f32>, hi: vec3<f32>) -> bool {
     let closest = clamp(c, lo, hi);
@@ -60,14 +57,15 @@ fn cull_lights(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lo = aabbs[cluster].min_pt.xyz;
     let hi = aabbs[cluster].max_pt.xyz;
     let n = u.grid.w;
+    let max_per_cluster = u32(u.depth.w);
 
-    // Each cluster owns a fixed `MAX_PER_CLUSTER` slice of the index list (one
+    // Each cluster owns a fixed `max_per_cluster` slice of the index list (one
     // thread per cluster, so no atomics or per-thread scratch array needed). The
-    // slice base is `cluster * MAX_PER_CLUSTER`; lights past the cap are dropped.
-    let base = cluster * MAX_PER_CLUSTER;
+    // slice base is `cluster * max_per_cluster`; lights past the cap are dropped.
+    let base = cluster * max_per_cluster;
     var count = 0u;
     for (var i = 0u; i < n; i = i + 1u) {
-        if count >= MAX_PER_CLUSTER {
+        if count >= max_per_cluster {
             break;
         }
         let l = lights[i];

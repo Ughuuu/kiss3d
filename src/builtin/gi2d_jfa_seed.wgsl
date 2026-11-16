@@ -1,11 +1,13 @@
 import package::common::{unpack_mat3, fullscreen_uv_from_clip};
 // Jump-flood seed pass for the 2D occluder distance field. Each low-res texel is
-// classified against the analytic occluder discs: texels inside any occluder become
-// seeds storing their own world position (xy) with a valid flag (z = 1); empty
-// texels store z = 0. The jump-flood passes then propagate the nearest seed.
+// classified against the analytic occluder discs and segments: texels inside any
+// occluder become seeds storing their own world position (xy) with a valid flag
+// (z = 1); empty texels store z = 0. The jump-flood passes then propagate the nearest seed.
 
 const MAX_EMITTERS: u32 = 32u;
 const MAX_OCCLUDERS: u32 = 64u;
+// Must match `MAX_SEGMENT_OCCLUDERS` in gi2d.rs.
+const MAX_SEGMENTS: u32 = 128u;
 
 struct Emitter {
     pos_radius: vec4<f32>,
@@ -14,6 +16,21 @@ struct Emitter {
 
 struct Occluder {
     pos_radius: vec4<f32>,
+}
+
+struct Segment {
+    // a.xy, b.xy
+    ab: vec4<f32>,
+    // radius, _, _, _
+    radius: vec4<f32>,
+}
+
+// Distance from `q` to the segment occluder `s`'s surface (negative inside).
+fn segment_distance(q: vec2<f32>, s: Segment) -> f32 {
+    let a = s.ab.xy;
+    let ab = s.ab.zw - a;
+    let h = clamp(dot(q - a, ab) / max(dot(ab, ab), 1e-12), 0.0, 1.0);
+    return length(q - a - ab * h) - s.radius.x;
 }
 
 // Same layout as FieldUniforms in gi2d_field.wgsl (the field uniform buffer is reused).
@@ -32,6 +49,7 @@ struct FieldUniforms {
     counts: vec4<f32>,
     emitters: array<Emitter, MAX_EMITTERS>,
     occluders: array<Occluder, MAX_OCCLUDERS>,
+    segments: array<Segment, MAX_SEGMENTS>,
 }
 
 @group(0) @binding(0)
@@ -70,6 +88,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     for (var i = 0u; i < num_occluders; i = i + 1u) {
         let o = u.occluders[i];
         if (length(world - o.pos_radius.xy) <= o.pos_radius.z) {
+            inside = true;
+            break;
+        }
+    }
+    // A segment thinner than a texel still seeds the texels it crosses: half the
+    // bias is one texel in world units.
+    let texel = u.flags.y * 0.5;
+    let num_segments = u32(u.flags.z);
+    for (var i = 0u; i < num_segments; i = i + 1u) {
+        let s = u.segments[i];
+        if (segment_distance(world, s) + s.radius.x <= max(s.radius.x, texel)) {
             inside = true;
             break;
         }

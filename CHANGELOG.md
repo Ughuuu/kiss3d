@@ -56,6 +56,14 @@
 
 ## Bug Fixes
 
+- Window: the first frame's wait for a presentable surface waits for the window's events (up to 16 ms a turn) instead of sleeping and polling between attempts.
+- Web: the first frame no longer goes to a 1×1 surface. Winit reports the canvas 0×0 until its
+  `ResizeObserver` runs, which a browser does only when it next paints the page, so the surface was
+  configured at 1×1 and the first frame drawn there; `measured_size` reads the canvas's own layout
+  (`client_width` × scale factor) while winit still says 0×0, at open and in the event pump.
+- Web: a pass that egui discards and reruns within a frame is given the screen rect again. egui's
+  `RawInput::take` leaves none for the rerun, and that pass laid out on egui's 10000 by 10000
+  placeholder viewport, so the frame after a font install drew nothing it could show.
 - On the web, the surface is presented opaque wherever the platform offers it: a WebGPU canvas
   lists premultiplied alpha first, and the page showed through every pixel left at alpha 0.
 - A canvas the page supplies keeps the layout and the scrolling the page gave it; only a canvas
@@ -74,6 +82,32 @@
   a resize drops it rather than rebuilding one nothing has asked for.
 - The film-stage render targets are allocated on the first frame a film chain is passed, so a run
   that never passes one costs nothing.
+
+# v0.47.0
+
+## Breaking Changes
+
+- `GpuMesh3d::coords_buffer` / `faces_buffer` / `normals_buffer` / `uvs_buffer` now return `Option<wgpu::Buffer>` (a cloned handle) instead of `Option<&wgpu::Buffer>`; they previously always returned `None` ([#408](https://github.com/dimforge/kiss3d/pull/408)).
+
+## New Features
+
+- Android and iOS support: `#[kiss3d::main]` generates the platform entry points (`android_main`, `window::run_ios`), the Android surface is dropped and recreated across suspend/resume, and touches drive egui. See `examples/android` and `examples/ios` ([#408](https://github.com/dimforge/kiss3d/pull/408)).
+- `Window::set_keyboard_visible` shows the on-screen keyboard on Android and iOS (no-op elsewhere) ([#408](https://github.com/dimforge/kiss3d/pull/408)).
+- `Window::set_fullscreen` / `is_fullscreen` and `Window::dropped_files` (also on `Canvas`) ([#408](https://github.com/dimforge/kiss3d/pull/408)).
+- `MaterialManager3d::for_each`; per-frame inputs (IBL, reflection probes, SSAO, transmission background, clustered lights, clip plane) now reach every registered material, not just the default one ([#408](https://github.com/dimforge/kiss3d/pull/408)).
+- `Context::supports_deform`: skinning/morph targets are disabled on devices with fewer than 5 vertex storage buffers (WebGL2, Android GLES), whose meshes now draw in rest pose instead of failing validation ([#408](https://github.com/dimforge/kiss3d/pull/408)).
+- `OffscreenSurface` supports MSAA via `set_samples` / `samples` or `CanvasSetup::samples` (previously always single-sampled) ([#413](https://github.com/dimforge/kiss3d/pull/413)).
+- `OffscreenSurface` gains `set_shadow_softness` / `set_shadows_enabled` and their getters, mirroring `Window` ([#413](https://github.com/dimforge/kiss3d/pull/413)).
+- `set_shadow_atlas_layers` (`Window`, `OffscreenSurface`, `ShadowMapper::set_atlas_layers`) to allocate fewer than 16 shadow atlas layers ([#413](https://github.com/dimforge/kiss3d/pull/413)).
+- `set_shadow_distance` / `set_first_cascade_far_bound` and getters on `Window` and `OffscreenSurface` ([#413](https://github.com/dimforge/kiss3d/pull/413)).
+- `TextureManager::set_anisotropy`: anisotropic filtering (up to 16x) for mipmapped, linearly filtered textures ([#413](https://github.com/dimforge/kiss3d/pull/413)).
+- New `offscreen_msaa` example ([#413](https://github.com/dimforge/kiss3d/pull/413)).
+
+## Bug Fixes
+
+- Creating a second `Window` or `OffscreenSurface` on the same thread no longer replaces the global mesh/texture/material managers, which caused a wgpu validation error after 256 draws of objects created earlier. New `offscreen_shared_managers` example ([#413](https://github.com/dimforge/kiss3d/pull/413)).
+- Downlevel GL (Android GLES): clustered lighting now also requires `BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED`, and the surface only requests `COPY_SRC` when supported ([#408](https://github.com/dimforge/kiss3d/pull/408)).
+- On macOS, egui now receives ⌘ as its `command` modifier instead of Ctrl.
 
 # v0.46.0
 

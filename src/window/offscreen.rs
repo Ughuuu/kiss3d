@@ -6,7 +6,7 @@ use crate::color::Color;
 use crate::post_processing::{PostProcessingEffect, Tonemap};
 use crate::renderer::{RayTracer, Renderer3d};
 use crate::scene::{SceneNode2d, SceneNode3d};
-use crate::window::{CanvasSetup, Window};
+use crate::window::{CanvasSetup, NumSamples, Window};
 use glamx::UVec2;
 #[cfg(not(target_arch = "wasm32"))]
 use image::{ImageBuffer, Luma, Rgb};
@@ -44,14 +44,20 @@ pub struct OffscreenSurface {
 }
 
 impl OffscreenSurface {
-    /// Creates a new off-screen surface of the given size, in pixels.
+    /// Creates a new off-screen surface of the given size, in pixels, without
+    /// antialiasing (see [`Self::set_samples`] or [`Self::with_setup`] for MSAA).
     pub async fn new(width: u32, height: u32) -> OffscreenSurface {
+        let setup = CanvasSetup {
+            samples: NumSamples::One,
+            ..Default::default()
+        };
         OffscreenSurface {
-            window: Window::do_new_headless(width, height, None).await,
+            window: Window::do_new_headless(width, height, Some(setup)).await,
         }
     }
 
-    /// Creates a new off-screen surface with custom setup options (e.g. MSAA).
+    /// Creates a new off-screen surface with custom setup options, its scene
+    /// multisampled at `setup.samples`.
     pub async fn with_setup(width: u32, height: u32, setup: CanvasSetup) -> OffscreenSurface {
         OffscreenSurface {
             window: Window::do_new_headless(width, height, Some(setup)).await,
@@ -370,6 +376,72 @@ impl OffscreenSurface {
         self.window.set_shadow_resolution(resolution);
     }
 
+    /// Sets how many shadow atlas layers are allocated. See
+    /// [`Window::set_shadow_atlas_layers`].
+    pub fn set_shadow_atlas_layers(&mut self, layers: u32) {
+        self.window.set_shadow_atlas_layers(layers);
+    }
+
+    /// The number of shadow atlas layers allocated. See [`Window::shadow_atlas_layers`].
+    pub fn shadow_atlas_layers(&self) -> u32 {
+        self.window.shadow_atlas_layers()
+    }
+
+    /// Sets the shadow-edge softness (PCF blur): `1.0` is the default penumbra,
+    /// `0.0` hard edges. See [`Window::set_shadow_softness`].
+    pub fn set_shadow_softness(&mut self, softness: f32) {
+        self.window.set_shadow_softness(softness);
+    }
+
+    /// The current shadow-edge softness. See [`Window::shadow_softness`].
+    pub fn shadow_softness(&self) -> f32 {
+        self.window.shadow_softness()
+    }
+
+    /// Caps how far directional shadows reach. See [`Window::set_shadow_distance`].
+    pub fn set_shadow_distance(&mut self, distance: f32) {
+        self.window.set_shadow_distance(distance);
+    }
+
+    /// The directional-shadow distance cap. See [`Window::shadow_distance`].
+    pub fn shadow_distance(&self) -> f32 {
+        self.window.shadow_distance()
+    }
+
+    /// Far view distance of the highest-resolution directional cascade. See
+    /// [`Window::set_first_cascade_far_bound`].
+    pub fn set_first_cascade_far_bound(&mut self, bound: f32) {
+        self.window.set_first_cascade_far_bound(bound);
+    }
+
+    /// The far view distance of the highest-resolution directional cascade. See
+    /// [`Window::first_cascade_far_bound`].
+    pub fn first_cascade_far_bound(&self) -> f32 {
+        self.window.first_cascade_far_bound()
+    }
+
+    /// Enables or disables shadow mapping. See [`Window::set_shadows_enabled`].
+    pub fn set_shadows_enabled(&mut self, enabled: bool) {
+        self.window.set_shadows_enabled(enabled);
+    }
+
+    /// Whether shadow mapping is enabled. See [`Window::shadows_enabled`].
+    pub fn shadows_enabled(&self) -> bool {
+        self.window.shadows_enabled()
+    }
+
+    /// Sets the number of MSAA samples of the rendered image (the default is
+    /// one, i.e. no antialiasing). Takes effect on the next rendered frame. See
+    /// [`Window::set_samples`].
+    pub fn set_samples(&mut self, samples: NumSamples) {
+        self.window.set_samples(samples);
+    }
+
+    /// The current number of MSAA samples (`1` = no antialiasing).
+    pub fn samples(&self) -> u32 {
+        self.window.samples()
+    }
+
     /// Selects the tonemapping operator used by the HDR resolve pass.
     /// See [`Window::set_tonemap`].
     pub fn set_tonemap(&mut self, tonemap: Tonemap) {
@@ -414,5 +486,134 @@ impl OffscreenSurface {
     #[cfg(feature = "egui")]
     pub fn clear_ui(&mut self) {
         self.window.clear_ui();
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::OffscreenSurface;
+    use crate::camera::{CoordinateSystem2d, FixedView2d, OrbitCamera3d};
+    use crate::color::Color;
+    use crate::scene::{SceneNode2d, SceneNode3d};
+    use crate::test_gpu::{luma_at, on_gpu, on_gpu_with};
+    use crate::window::{CanvasSetup, NumSamples};
+    use glamx::Vec3;
+
+    /// Pixels part-way between the black background and the white shapes: the
+    /// blended edge samples MSAA leaves.
+    fn edge_pixels(surface: &OffscreenSurface) -> usize {
+        surface
+            .snap_image()
+            .pixels()
+            .filter(|p| (40..215).contains(&p.0[1]))
+            .count()
+    }
+
+    async fn render_tilted_shapes(surface: &mut OffscreenSurface) {
+        let mut scene = SceneNode3d::empty();
+        scene
+            .add_cube(1.5, 1.5, 1.5)
+            .set_emissive(Color::new(4.0, 4.0, 4.0, 1.0))
+            .set_rotation(glamx::Quat::from_rotation_z(0.4));
+        let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+        surface.render_3d(&mut scene, &mut camera).await;
+        let mut flat = SceneNode2d::empty();
+        flat.add_rectangle(20.0, 20.0)
+            .set_position(glamx::Vec2::new(-20.0, 20.0))
+            .set_rotation(0.4);
+        let mut camera_2d = FixedView2d::new(CoordinateSystem2d::default(), false);
+        surface.render_2d(&mut flat, &mut camera_2d).await;
+    }
+
+    /// Edge pixels of the tilted shapes at `samples`.
+    fn edge_pixels_at(samples: NumSamples) -> usize {
+        let mut count = 0;
+        on_gpu_with(
+            CanvasSetup {
+                samples,
+                ..CanvasSetup::default()
+            },
+            async |surface| {
+                assert_eq!(surface.window().canvas.sample_count(), samples as u32);
+                render_tilted_shapes(surface).await;
+                count = edge_pixels(surface);
+            },
+        );
+        count
+    }
+
+    #[test]
+    fn a_surface_that_never_drew_2d_drops_cleanly() {
+        on_gpu(8, 8, async |_| {});
+    }
+
+    #[test]
+    fn a_second_surface_on_the_same_thread_draws_like_the_first() {
+        for _ in 0..2 {
+            on_gpu(32, 32, async |surface| {
+                let mut scene = SceneNode3d::empty();
+                scene
+                    .add_cube(2.0, 2.0, 2.0)
+                    .set_emissive(Color::new(4.0, 4.0, 4.0, 1.0));
+                let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+                surface.render_3d(&mut scene, &mut camera).await;
+                assert!(luma_at(surface, 16, 16) > 0.5);
+
+                let mut flat = SceneNode2d::empty();
+                flat.add_rectangle(10.0, 10.0);
+                let mut camera_2d = FixedView2d::new(CoordinateSystem2d::default(), false);
+                surface.render_2d(&mut flat, &mut camera_2d).await;
+                assert!(luma_at(surface, 16, 16) > 0.5);
+                assert!(luma_at(surface, 2, 2) < 0.1);
+            });
+        }
+    }
+
+    #[test]
+    fn an_offscreen_surface_draws_at_the_sample_count_it_asks() {
+        let single = edge_pixels_at(NumSamples::One);
+        let four = edge_pixels_at(NumSamples::Four);
+        assert!(four > single + 10, "{} {}", single, four);
+    }
+
+    /// A press and its release read through `events()` in one frame, as a
+    /// tap delivers them. Fed only at render, the pass that frame answered the
+    /// frame before, and a host skipping passes left the click unanswered.
+    #[cfg(feature = "egui")]
+    #[test]
+    fn a_click_read_before_the_pass_is_answered_by_that_pass() {
+        use crate::event::{Action, Modifiers, MouseButton, WindowEvent};
+        let button = |ctx: &egui::Context| {
+            egui::Area::new(egui::Id::unique("go"))
+                .fixed_pos(egui::pos2(20.0, 20.0))
+                .show(ctx, |ui| ui.button("go"))
+                .inner
+        };
+        on_gpu(200, 100, async |surface| {
+            let mut flat = SceneNode2d::empty();
+            let mut camera_2d = FixedView2d::new(CoordinateSystem2d::default(), false);
+            let mut at = egui::Pos2::ZERO;
+            // A new area is hit-tested only once it has been shown a frame.
+            for _ in 0..3 {
+                surface.draw_ui(|ctx| at = button(ctx).rect.center());
+                surface.render_2d(&mut flat, &mut camera_2d).await;
+            }
+
+            let window = surface.window_mut();
+            let ppp = window.egui_pixels_per_point() as f64;
+            let none = Modifiers::empty();
+            window.unhandled_events.borrow_mut().extend([
+                WindowEvent::CursorPos(at.x as f64 * ppp, at.y as f64 * ppp, none),
+                WindowEvent::MouseButton(MouseButton::Button1, Action::Press, none),
+                WindowEvent::MouseButton(MouseButton::Button1, Action::Release, none),
+            ]);
+            assert!(window.has_unread_ui_input());
+
+            let mut clicked = false;
+            surface.draw_ui(|ctx| clicked |= button(ctx).clicked());
+            assert!(clicked);
+            surface.render_2d(&mut flat, &mut camera_2d).await;
+            assert!(!surface.window().has_unread_ui_input());
+        });
     }
 }

@@ -1,5 +1,6 @@
 //! The window, and things to handle the rendering loop and events.
 
+mod access;
 mod aov;
 mod canvas;
 mod drawing;
@@ -19,6 +20,8 @@ mod wgpu_canvas;
 mod window;
 mod window_cache;
 
+#[cfg(feature = "egui")]
+pub use access::AccessEvent;
 pub use canvas::{Canvas, CanvasSetup, NumSamples};
 #[cfg(feature = "egui")]
 pub use inspector::{Inspector, InspectorTab};

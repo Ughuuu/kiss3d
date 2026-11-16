@@ -60,7 +60,7 @@ async fn main() {
 
     while window.render_3d(&mut scene, &mut camera).await {
         camera.set_projection(if orthographic {
-            Projection::Orthographic
+            Projection::Orthographic { height: None }
         } else {
             Projection::Perspective
         });

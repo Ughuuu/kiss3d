@@ -9,7 +9,7 @@ struct ClusterUniforms {
     view: mat4x4<f32>,
     grid: vec4<u32>,    // (grid_x, grid_y, grid_z, num_clustered_lights)
     screen: vec4<f32>,  // (width_px, height_px, tile_w_px, tile_h_px)
-    depth: vec4<f32>,   // (z_near, z_far, ln(z_far/z_near), unused)
+    depth: vec4<f32>,   // (z_near, z_far, ln(z_far/z_near), max lights per cluster)
 };
 
 struct ClusterAABB {

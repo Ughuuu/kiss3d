@@ -25,6 +25,10 @@ pub enum WindowEvent {
     CursorPos(f64, f64, Modifiers),
     /// The cursor entered or left the window.
     CursorEnter(bool),
+    /// How far the mouse moved, in the device's own units, while a grab holds
+    /// the cursor: what mouse-look reads, since a held cursor stops at the
+    /// window's edge or, locked in place, reports no position at all.
+    MouseMotion(f64, f64),
     /// The mouse wheel was scrolled (x_offset, y_offset, modifiers).
     Scroll(f64, f64, Modifiers),
     /// A keyboard key was pressed, released, or repeated (key, action, modifiers).
@@ -38,6 +42,14 @@ pub enum WindowEvent {
     /// The system is short of memory: what can be rebuilt is worth freeing.
     /// Sent on iOS and Android; a desktop pages instead.
     LowMemory,
+    /// The system switched between its light and dark appearance; `true` for
+    /// dark. Sent where winit hears it, macOS and Windows, and never for a
+    /// window whose own theme was set.
+    DarkMode(bool),
+    /// The window's scale factor changed: a move to a display of another
+    /// density, or on Android any change to the configuration, night mode
+    /// and font size included, which winit reports this way.
+    ScaleFactor(f64),
 }
 
 use WindowEvent::*;

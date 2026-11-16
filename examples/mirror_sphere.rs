@@ -106,7 +106,6 @@ async fn main() {
         .set_render_layers(0b10);
 
     // The runtime probe captures only layer 0 (everything except the sphere).
-    window.set_reflection_capture_layers(0b01);
     let probe = window
         .add_reflection_probe(ReflectionProbe {
             center: Vec3::new(0.0, 1.0, 0.0),
@@ -115,7 +114,8 @@ async fn main() {
             half_extents: Vec3::new(8.5, 5.0, 8.5),
             falloff: 1.5,
             intensity: 1.0,
-            rotation: 0.0,
+            capture_layers: 0b01,
+            ..Default::default()
         })
         .expect("probe slot 0");
 

@@ -9,9 +9,19 @@ pub struct EguiRenderer {
     egui_ctx: EguiContext,
     renderer: egui_wgpu::Renderer,
     shapes: Vec<egui::epaint::ClippedShape>,
+    /// `shapes` tessellated, at the points-per-pixel they were tessellated at:
+    /// a frame that ran no pass draws these again rather than tessellating the
+    /// same shapes. `None` once the shapes change.
+    primitives: Option<(f32, Vec<egui::ClippedPrimitive>)>,
+    /// The size the renderer's buffers were last filled for; `None` once
+    /// `primitives` changed, so a frame drawing the same ones uploads nothing.
+    uploaded_for: Option<[u32; 2]>,
     textures_delta: egui::TexturesDelta,
     cursor: egui::CursorIcon,
+    ime: Option<egui::output::IMEOutput>,
     retain_shapes: bool,
+    #[cfg(test)]
+    uploads: u32,
 }
 
 impl EguiRenderer {
@@ -19,36 +29,40 @@ impl EguiRenderer {
     pub fn new() -> EguiRenderer {
         let egui_ctx = EguiContext::default();
 
-        // Load fonts manually - use kiss3d's embedded font
-        let mut fonts = egui::FontDefinitions::default();
+        #[cfg(feature = "text")]
+        {
+            // Load fonts manually - use kiss3d's embedded font
+            let mut fonts = egui::FontDefinitions::default();
 
-        // Add WorkSans font from kiss3d
-        fonts.font_data.insert(
-            "WorkSans".to_owned(),
-            egui::FontData::from_static(include_bytes!("../text/WorkSans-Regular.ttf")).into(),
-        );
+            // Add WorkSans font from kiss3d
+            fonts.font_data.insert(
+                "WorkSans".to_owned(),
+                egui::FontData::from_static(include_bytes!("../text/WorkSans-Regular.ttf")).into(),
+            );
 
-        // Set it as the proportional font
-        fonts
-            .families
-            .get_mut(&egui::FontFamily::Proportional)
-            .unwrap()
-            .insert(0, "WorkSans".to_owned());
+            // Set it as the proportional font
+            fonts
+                .families
+                .get_mut(&egui::FontFamily::Proportional)
+                .unwrap()
+                .insert(0, "WorkSans".to_owned());
 
-        // Set it as the monospace font too
-        fonts
-            .families
-            .get_mut(&egui::FontFamily::Monospace)
-            .unwrap()
-            .insert(0, "WorkSans".to_owned());
+            // Set it as the monospace font too
+            fonts
+                .families
+                .get_mut(&egui::FontFamily::Monospace)
+                .unwrap()
+                .insert(0, "WorkSans".to_owned());
 
-        egui_ctx.set_fonts(fonts);
+            egui_ctx.set_fonts(fonts);
+        }
 
         // Set default pixels_per_point to avoid DPI warnings.
         // Not using 1.0 exactly so that draw_ui() gets a chance
         // to initialize it to the actual value (which might be 1)
         // and trigger a redraw.
         egui_ctx.set_pixels_per_point(0.987);
+        leave_zoom_to_host(&egui_ctx);
 
         // Run a dummy frame to initialize fonts with correct DPI
         let dummy_input = RawInput::default();
@@ -57,7 +71,9 @@ impl EguiRenderer {
 
         let ctxt = Context::get();
 
-        // Create the egui-wgpu renderer
+        // Create the egui-wgpu renderer: one shader module and one pipeline, on the
+        // device directly, so they are counted here.
+        let started = web_time::Instant::now();
         let mut renderer = egui_wgpu::Renderer::new(
             &ctxt.device,
             ctxt.surface_format,
@@ -67,6 +83,7 @@ impl EguiRenderer {
                 ..Default::default()
             },
         );
+        Context::note_shader_build(1, 1, started.elapsed());
 
         // Apply textures from the dummy pass (font textures, etc.)
         for (id, image_deltas) in &dummy_output.textures_delta.set {
@@ -81,9 +98,14 @@ impl EguiRenderer {
             egui_ctx,
             renderer,
             shapes: Vec::new(),
+            primitives: None,
+            uploaded_for: None,
             textures_delta: Default::default(),
             cursor: egui::CursorIcon::Default,
+            ime: None,
             retain_shapes: false,
+            #[cfg(test)]
+            uploads: 0,
         }
     }
 
@@ -103,6 +125,7 @@ impl EguiRenderer {
         // they are dropped once they have been rendered too (see
         // `set_retain_shapes`).
         self.shapes.clear();
+        self.primitives = None;
         self.egui_ctx.begin_pass(raw_input);
     }
 
@@ -127,6 +150,7 @@ impl EguiRenderer {
     /// since otherwise rendering them already dropped them.
     pub fn clear_shapes(&mut self) {
         self.shapes.clear();
+        self.primitives = None;
     }
 
     /// What the last pass asked the pointer to look like over the widget it
@@ -135,11 +159,18 @@ impl EguiRenderer {
         self.cursor
     }
 
+    /// Where the last pass put a text field being typed into, if one was.
+    pub fn ime(&self) -> Option<egui::output::IMEOutput> {
+        self.ime
+    }
+
     /// End the current frame and prepare for rendering.
     pub fn end_frame(&mut self) {
         let output = self.egui_ctx.end_pass();
         self.cursor = output.platform_output.cursor_icon;
+        self.ime = output.platform_output.ime;
         self.shapes = output.shapes;
+        self.primitives = None;
         // Append rather than replace: if a previous frame's render was skipped
         // (e.g. failed to acquire surface texture), we must not lose its texture
         // deltas (such as the font atlas glyph upload).
@@ -219,8 +250,24 @@ impl EguiRenderer {
             }
         }
 
-        // Prepare clipped primitives
-        let clipped_primitives = self.egui_ctx.tessellate(self.shapes.clone(), scale_factor);
+        let stale = match &self.primitives {
+            Some((ppp, _)) => *ppp != scale_factor,
+            None => true,
+        };
+        if stale {
+            // Kept only while a later frame may tessellate them again.
+            let shapes = if self.retain_shapes {
+                self.shapes.clone()
+            } else {
+                std::mem::take(&mut self.shapes)
+            };
+            let tessellated = self.egui_ctx.tessellate(shapes, scale_factor);
+            self.primitives = Some((scale_factor, tessellated));
+            self.uploaded_for = None;
+        }
+        let Some((_, clipped_primitives)) = &self.primitives else {
+            return;
+        };
 
         // Create screen descriptor
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -231,14 +278,23 @@ impl EguiRenderer {
         // Create our own encoder for egui rendering to avoid lifetime issues
         let mut encoder = ctxt.create_command_encoder(Some("egui_command_encoder"));
 
-        // Update buffers
-        self.renderer.update_buffers(
-            &ctxt.device,
-            &ctxt.queue,
-            &mut encoder,
-            &clipped_primitives,
-            &screen_descriptor,
-        );
+        // A frame drawing the last pass again draws from what the buffers
+        // already hold: an upload is a staging buffer each for the vertices and
+        // the indices, made afresh inside wgpu.
+        if self.uploaded_for != Some([width, height]) {
+            self.renderer.update_buffers(
+                &ctxt.device,
+                &ctxt.queue,
+                &mut encoder,
+                clipped_primitives,
+                &screen_descriptor,
+            );
+            self.uploaded_for = Some([width, height]);
+            #[cfg(test)]
+            {
+                self.uploads += 1;
+            }
+        }
 
         // Render
         {
@@ -266,7 +322,7 @@ impl EguiRenderer {
             let mut render_pass = render_pass.forget_lifetime();
 
             self.renderer
-                .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+                .render(&mut render_pass, clipped_primitives, &screen_descriptor);
         }
 
         // Submit the egui commands
@@ -280,6 +336,7 @@ impl EguiRenderer {
         self.textures_delta.clear();
         if !self.retain_shapes {
             self.shapes.clear();
+            self.primitives = None;
         }
     }
 }
@@ -320,9 +377,42 @@ fn egui_captures_pointer(ctx: &EguiContext) -> bool {
         .is_some_and(|layer| layer.order != egui::Order::Background)
 }
 
+/// The window sets the zoom every pass (`Window::set_ui_zoom`); egui's own
+/// ⌘+, ⌘− and ⌘0 would move it for a frame behind the host's back.
+fn leave_zoom_to_host(ctx: &egui::Context) {
+    ctx.options_mut(|options| options.zoom_with_keyboard = false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_gpu::on_gpu;
+
+    #[test]
+    fn command_minus_leaves_the_zoom_to_the_host() {
+        let ctx = egui::Context::default();
+        leave_zoom_to_host(&ctx);
+        let command = egui::Modifiers::COMMAND;
+        let pass = |events: Vec<egui::Event>| {
+            ctx.begin_pass(RawInput {
+                events,
+                ..RawInput::default()
+            });
+            ctx.end_pass().textures_delta.clear();
+        };
+        pass(vec![
+            egui::Event::ModifiersChanged(command),
+            egui::Event::Key {
+                key: egui::Key::Minus,
+                physical_key: Some(egui::Key::Minus),
+                pressed: true,
+                repeat: false,
+                modifiers: command,
+            },
+        ]);
+        pass(Vec::new());
+        assert_eq!(ctx.zoom_factor(), 1.0);
+    }
 
     const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
     const WINDOW_POS: egui::Pos2 = egui::pos2(10.0, 10.0);
@@ -381,5 +471,69 @@ mod tests {
     fn pointer_over_a_widget_goes_to_egui() {
         assert!(captures_at(OVER_WINDOW, false));
         assert!(captures_at(OVER_WINDOW, true));
+    }
+
+    fn target(width: u32, height: u32) -> wgpu::TextureView {
+        Context::get()
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("egui_test_target"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: Context::get().surface_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&Default::default())
+    }
+
+    fn pass(renderer: &mut EguiRenderer, text: &str) {
+        renderer.begin_frame(RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+            ..Default::default()
+        });
+        egui::Window::new("panel").show(renderer.context(), |ui| ui.label(text));
+        renderer.end_frame();
+    }
+
+    #[test]
+    fn a_frame_drawing_the_last_pass_again_uploads_nothing() {
+        on_gpu(64, 64, async |_surface| {
+            let mut renderer = EguiRenderer::new();
+            renderer.set_retain_shapes(true);
+            let small = target(800, 600);
+            let large = target(1000, 600);
+            pass(&mut renderer, "first");
+            renderer.render(&small, &small, 800, 600, 1.0);
+            assert_eq!(renderer.uploads, 1, "a pass is uploaded");
+            renderer.render(&small, &small, 800, 600, 1.0);
+            assert_eq!(renderer.uploads, 1, "nothing changed");
+            renderer.render(&large, &large, 1000, 600, 1.0);
+            assert_eq!(renderer.uploads, 2, "the screen size is in the upload");
+            renderer.render(&large, &large, 1000, 600, 2.0);
+            assert_eq!(renderer.uploads, 3, "tessellated again for the new scale");
+            pass(&mut renderer, "second");
+            renderer.render(&large, &large, 1000, 600, 2.0);
+            assert_eq!(renderer.uploads, 4, "a new pass is uploaded");
+        });
+    }
+
+    #[test]
+    fn a_renderer_that_keeps_nothing_uploads_every_pass() {
+        on_gpu(64, 64, async |_surface| {
+            let mut renderer = EguiRenderer::new();
+            let view = target(800, 600);
+            for frame in 1..=3 {
+                pass(&mut renderer, "text");
+                renderer.render(&view, &view, 800, 600, 1.0);
+                assert_eq!(renderer.uploads, frame);
+            }
+        });
     }
 }

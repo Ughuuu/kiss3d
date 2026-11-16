@@ -102,10 +102,7 @@ impl Fxaa {
 
         let shader = ctxt.create_shader_module(
             Some("fxaa_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::fxaa",
-                include_str!("../builtin/fxaa.wgsl"),
-            ),
+            &crate::builtin::linked("package::fxaa", &[]),
         );
 
         let vertex_buffer_layout = wgpu::VertexBufferLayout {

@@ -4,19 +4,22 @@ pub use crate::post_processing::cas::Cas;
 pub use crate::post_processing::crt::Crt;
 pub use crate::post_processing::fxaa::Fxaa;
 pub use crate::post_processing::gi2d::{
-    Gi2d, GiEmitter2d, GiOccluder2d, MAX_EMITTERS, MAX_OCCLUDERS,
+    Gi2d, GiEmitter2d, GiOccluder2d, GiSegmentOccluder2d, MAX_EMITTERS, MAX_OCCLUDERS,
+    MAX_SEGMENT_OCCLUDERS,
 };
 pub use crate::post_processing::grayscales::Grayscales;
+#[cfg(feature = "tony-lut")]
+pub use crate::post_processing::hdr::TONY_MCMAPFACE_LUT;
 pub use crate::post_processing::hdr::{
-    ColorGrading, HdrPipeline, HdrSettings, Tonemap, HDR_FORMAT, OIT_ACCUM_FORMAT,
-    OIT_REVEAL_FORMAT,
+    set_tony_lut, ColorGrading, HdrPipeline, HdrSettings, Tonemap, HDR_FORMAT, MAX_BLOOM_MIPS,
+    OIT_ACCUM_FORMAT, OIT_REVEAL_FORMAT, TONY_LUT_BYTES, TONY_LUT_DIM,
 };
 pub use crate::post_processing::loupe::{Loupe, LoupeCorner};
 pub use crate::post_processing::oculus_stereo::OculusStereo;
 pub use crate::post_processing::post_processing_effect::{
     FormatPipelines, PostProcessingContext, PostProcessingEffect,
 };
-#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use crate::post_processing::scene_depth::SceneDepth;
 pub use crate::post_processing::sobel_edge_highlight::SobelEdgeHighlight;
 pub use crate::post_processing::waves::Waves;
 
@@ -29,6 +32,6 @@ mod hdr;
 mod loupe;
 mod oculus_stereo;
 pub mod post_processing_effect;
-#[cfg(not(target_arch = "wasm32"))]
+mod scene_depth;
 mod sobel_edge_highlight;
 mod waves;

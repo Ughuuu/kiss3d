@@ -53,6 +53,14 @@ pub struct CanvasSetup {
     /// the ones kiss3d enables by default.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub required_features: wgpu::Features,
+    /// Whether a screen reader can reach this window, through AccessKit's adapter
+    /// for the platform. Off by default. On, the adapter answers the platform by
+    /// itself and a frame pays nothing until a reader asks: see
+    /// [`Window::take_access_events`](super::Window::take_access_events). Needs the
+    /// `egui` feature, and does nothing on the web or Android, or on a headless
+    /// window.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub accessible: bool,
 }
 
 impl Default for CanvasSetup {
@@ -62,6 +70,7 @@ impl Default for CanvasSetup {
             samples: NumSamples::Four,
             canvas_id: "canvas".to_string(),
             required_features: wgpu::Features::empty(),
+            accessible: false,
         }
     }
 }
@@ -96,7 +105,8 @@ impl Canvas {
     }
 
     /// Poll all events that occurred since the last call to this method.
-    pub fn poll_events(&mut self) {
+    /// Answers whether any arrived.
+    pub fn poll_events(&mut self) -> bool {
         self.canvas.poll_events()
     }
 
@@ -111,13 +121,26 @@ impl Canvas {
         self.canvas.waker()
     }
 
+    /// What a screen reader asked since the last call; see
+    /// [`CanvasSetup::accessible`].
+    #[cfg(feature = "egui")]
+    pub fn take_access_events(&self) -> Vec<super::AccessEvent> {
+        self.canvas.take_access_events()
+    }
+
+    /// Hand a screen reader what changed; see [`CanvasSetup::accessible`].
+    #[cfg(feature = "egui")]
+    pub fn update_access(&self, update: egui::accesskit::TreeUpdate) {
+        self.canvas.update_access(update);
+    }
+
     /// Resizes the canvas render targets.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.canvas.resize(width, height)
     }
 
     /// Gets the current surface texture for rendering.
-    pub fn get_current_texture(&self) -> Option<wgpu::SurfaceTexture> {
+    pub fn get_current_texture(&mut self) -> Option<wgpu::SurfaceTexture> {
         self.canvas.get_current_texture()
     }
 
@@ -129,6 +152,11 @@ impl Canvas {
     /// Gets the depth texture view for rendering.
     pub fn depth_view(&self) -> &wgpu::TextureView {
         self.canvas.depth_view()
+    }
+
+    /// Make the depth buffer one an effect can read, or stop.
+    pub(crate) fn set_depth_readable(&mut self, readable: bool) {
+        self.canvas.set_depth_readable(readable)
     }
 
     /// Gets the MSAA texture view if MSAA is enabled.
@@ -178,6 +206,22 @@ impl Canvas {
     /// The scale factor.
     pub fn scale_factor(&self) -> f64 {
         self.canvas.scale_factor()
+    }
+
+    /// The refresh rate of the display the window is on, in hertz, where the
+    /// system says.
+    pub fn refresh_rate(&self) -> Option<f32> {
+        self.canvas.refresh_rate()
+    }
+
+    /// Where the text being composed sits, in physical pixels.
+    pub fn set_ime_cursor_area(&self, x: f64, y: f64, width: f64, height: f64) {
+        self.canvas.set_ime_cursor_area(x, y, width, height);
+    }
+
+    /// Whether a grab holds the cursor, so its motion arrives raw.
+    pub fn is_cursor_held(&self) -> bool {
+        self.canvas.is_cursor_held()
     }
 
     /// Set the window title.

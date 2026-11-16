@@ -10,7 +10,7 @@
 //! # Texture / atlas layout
 //!
 //! All shadow maps are packed into a single `Depth32Float` **2D texture array**
-//! (`resolution × resolution × MAX_SHADOW_VIEWS`). Using one array texture keeps
+//! (`resolution × resolution × atlas_layers`, see [`ShadowMapper::set_atlas_layers`]). Using one array texture keeps
 //! the material's bind group small — a single depth texture binding plus one
 //! comparison sampler — regardless of how many lights are active, so we never run
 //! into per-stage texture-binding limits even with the full `MAX_LIGHTS` budget.
@@ -19,13 +19,13 @@
 //!
 //! | Light type    | Technique                          | Layers |
 //! |---------------|------------------------------------|--------|
-//! | Directional   | single tight orthographic cascade  | 1      |
+//! | Directional   | orthographic cascades              | `num_cascades` (default 4) |
 //! | Spot          | perspective map fit to the cone    | 1      |
 //! | Point         | cube map unrolled to 6 perspectives| 6      |
 //!
 //! Point lights select the relevant cube face in the shader from the dominant
 //! axis of the light→fragment vector. The total number of views is capped at
-//! [`MAX_SHADOW_VIEWS`]; lights that do not fit keep lighting without shadows.
+//! [`ShadowMapper::atlas_layers`]; lights that do not fit keep lighting without shadows.
 
 use crate::camera::Camera3d;
 use crate::context::Context;
@@ -35,11 +35,27 @@ use bytemuck::{Pod, Zeroable};
 use glamx::glam::camera::rh::{proj::directx, view::look_at_mat4};
 use glamx::{Mat4, Vec3};
 
-/// Maximum number of shadow views (atlas layers) across all lights.
+/// The largest shadow view budget (atlas layers across all lights)
+/// [`ShadowMapper::set_atlas_layers`] accepts.
 ///
-/// A directional or spot light uses one view; a point light uses six. The cap
-/// bounds GPU memory and keeps the per-frame uniform fixed-size.
-pub const MAX_SHADOW_VIEWS: usize = 16;
+/// A spot light uses one view, a directional light one per cascade, a point light
+/// six. This sizes the per-frame shadow uniform (and its WGSL mirror in
+/// `default.wgsl`), so it stays a constant; the atlas itself only holds the
+/// budget's layers.
+pub const MAX_SHADOW_VIEWS: usize = 64;
+
+/// Layers an atlas has at least, with a budget of one view. GLES picks a
+/// texture's target at creation, and a one-layer one is no array.
+const MIN_ATLAS_LAYERS: u32 = 2;
+
+/// The atlas layers a [`ShadowMapper`] starts with.
+pub const DEFAULT_SHADOW_VIEWS: u32 = 16;
+
+/// The comparison depth bias a [`ShadowMapper`] starts with.
+pub const DEFAULT_SHADOW_DEPTH_BIAS: f32 = 0.0012;
+
+/// The rasterizer depth bias `(constant, slope_scale)` a [`ShadowMapper`] starts with.
+pub const DEFAULT_SHADOW_RASTER_BIAS: (i32, f32) = (1, 1.75);
 
 /// Maximum number of lights with shadow metadata in a frame. The primary tier
 /// occupies slots `0..MAX_LIGHTS` (indexed by uniform slot); clustered shadow
@@ -55,11 +71,33 @@ pub const MAX_CASCADES: u32 = 4;
 /// constant compare bias plus receiver-plane depth bias. (Contacts stay attached
 /// because the per-light near/far planes are fit to the casters — see
 /// [`light_near_far`] — keeping the depth precision high.)
-fn shadow_depth_bias() -> wgpu::DepthBiasState {
+fn shadow_depth_bias((constant, slope_scale): (i32, f32)) -> wgpu::DepthBiasState {
     wgpu::DepthBiasState {
-        constant: 1,
-        slope_scale: 1.75,
+        constant,
+        slope_scale,
         clamp: 0.0,
+    }
+}
+
+/// The fragment entry of a transmittance-shader pipeline: the tint for the
+/// transmittance pass, the cutout test for an alpha-tested depth pass.
+fn fragment_entry(alpha_depth: Option<(i32, f32)>) -> &'static str {
+    if alpha_depth.is_some() {
+        "fs_alpha_test"
+    } else {
+        "fs_main"
+    }
+}
+
+/// Depth state of a transmittance-shader pipeline: read-only for the tint, or
+/// written with the raster bias like the plain depth pass for a cutout caster.
+fn transmittance_depth_state(alpha_depth: Option<(i32, f32)>) -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth32Float,
+        depth_write_enabled: Some(alpha_depth.is_some()),
+        depth_compare: Some(wgpu::CompareFunction::Less),
+        stencil: wgpu::StencilState::default(),
+        bias: alpha_depth.map_or_else(wgpu::DepthBiasState::default, shadow_depth_bias),
     }
 }
 
@@ -195,8 +233,12 @@ struct ShadowModelUniforms {
     transform: [[f32; 4]; 4],
     scale: [[f32; 4]; 3], // mat3x3 padded to mat3x4 for alignment
     /// Base color (RGBA). Only read by the transmittance pass (to tint the
-    /// shadow by translucent occluders); the depth pass ignores it.
+    /// shadow by translucent occluders) and the cutout depth pass; the plain depth
+    /// pass ignores it.
     color: [f32; 4],
+    /// x: the alpha cutoff of a `Mask` caster (the cutout depth pass discards
+    /// texels below it); 0 otherwise.
+    params: [f32; 4],
 }
 
 /// Aligned stride of the dynamic per-view/per-object buffers (256 satisfies the
@@ -225,8 +267,13 @@ pub struct ShadowMapper {
     enabled: bool,
     /// Atlas resolution (per layer, square).
     resolution: u32,
+    /// Atlas layers allocated (`1..=MAX_SHADOW_VIEWS`); lights whose views do not
+    /// fit keep lighting without shadows.
+    atlas_layers: u32,
     /// Slope-scaled-ish constant depth bias used by the PCF comparison.
     depth_bias: f32,
+    /// Rasterizer depth bias `(constant, slope_scale)` baked into the depth pipelines.
+    raster_bias: (i32, f32),
     /// Shadow-edge softness: scales the PCF tap spacing (`1.0` = default ~5x5
     /// penumbra, larger = blurrier, `0.0` = hard edges).
     softness: f32,
@@ -259,8 +306,9 @@ pub struct ShadowMapper {
     transmittance_array_view: wgpu::TextureView,
     /// Filtering sampler for the transmittance atlas (bilinear).
     transmittance_sampler: wgpu::Sampler,
-    /// Pipeline that rasterizes translucent casters into the transmittance atlas.
-    transmittance_pipeline: wgpu::RenderPipeline,
+    /// Pipeline that rasterizes translucent casters into the transmittance atlas,
+    /// built when the first one casts.
+    transmittance_pipeline: Option<wgpu::RenderPipeline>,
     /// Layout for the per-object albedo-texture bind group sampled by the
     /// transmittance pass (so colored shadows follow the occluder's texture).
     transmittance_tex_bgl: wgpu::BindGroupLayout,
@@ -270,8 +318,8 @@ pub struct ShadowMapper {
     bind_group_layout: wgpu::BindGroupLayout,
     /// Bind group bound by `ObjectMaterial` (group 4).
     bind_group: wgpu::BindGroup,
-    /// Depth-only pipeline used by the pre-pass.
-    depth_pipeline: wgpu::RenderPipeline,
+    /// Depth-only pipeline used by the pre-pass, built when the first caster casts.
+    depth_pipeline: Option<wgpu::RenderPipeline>,
     /// Deformed depth pipeline (GPU skinning + morph). `None` on web (and any adapter
     /// without a free bind group), where deformable casters fall back to the rest
     /// shape.
@@ -279,6 +327,9 @@ pub struct ShadowMapper {
     /// Deformed colored-transmittance pipeline (translucent deformable casters).
     /// `None` on web, where they fall back to the rest shape.
     deform_transmittance_pipeline: Option<wgpu::RenderPipeline>,
+    /// Depth pipelines of `Mask` casters, plain and deformed, which discard texels
+    /// below the cutoff. Built the first frame a cutout caster appears.
+    cutout_pipelines: Option<(wgpu::RenderPipeline, Option<wgpu::RenderPipeline>)>,
     /// Layout for the per-view bind group (group 0 of the depth pipeline).
     view_bind_group_layout: wgpu::BindGroupLayout,
     /// Dynamic per-view uniform buffer (one entry per scheduled view).
@@ -307,10 +358,12 @@ impl ShadowMapper {
     pub fn new(resolution: u32) -> Self {
         let ctxt = Context::get();
         let resolution = resolution.max(1);
+        let atlas_layers = DEFAULT_SHADOW_VIEWS;
 
-        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution);
+        let raster_bias = DEFAULT_SHADOW_RASTER_BIAS;
+        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution, atlas_layers);
         let (transmittance_atlas, transmittance_layer_views, transmittance_array_view) =
-            Self::create_transmittance_atlas(&ctxt, resolution);
+            Self::create_transmittance_atlas(&ctxt, resolution, atlas_layers);
 
         // Comparison sampler: hardware does the depth test and (with linear
         // filtering) bilinear PCF across the 2x2 neighborhood per tap.
@@ -420,48 +473,7 @@ impl ShadowMapper {
                 ],
             });
 
-        let depth_pipeline =
-            Self::create_depth_pipeline(&ctxt, &view_bind_group_layout, &model_bind_group_layout);
-        let transmittance_pipeline = Self::create_transmittance_pipeline(
-            &ctxt,
-            &view_bind_group_layout,
-            &model_bind_group_layout,
-            &transmittance_tex_bgl,
-        );
-
-        // Deformed depth/transmittance pipelines: the deform data is bound as a 3rd
-        // bind group (4th for transmittance, which also needs the albedo texture), so
-        // these stay within WebGPU's 4-bind-group cap and run on every target where
-        // deform runs at all — including WebGPU browsers, where the color pass
-        // deforms skinned/morphed meshes. Gating these off where the color pass
-        // deforms would leave the shadow map in the rest pose while the lit geometry
-        // is animated, self-shadowing the moved surfaces (acne). The deform
-        // bind-group layout is the shared one from `builtin::deform`, so each
-        // object's deform bind group works in both the color and shadow passes.
-        // Where the device cannot bind the deform group (WebGL2, Android GLES; see
-        // `Context::supports_deform`) the color pass draws rest poses too, so a
-        // rest-pose shadow map is consistent rather than acne-prone.
-        let (deform_depth_pipeline, deform_transmittance_pipeline) = if ctxt.supports_deform() {
-            let deform_layout = crate::builtin::deform::deform_bind_group_layout();
-            let depth = Self::create_depth_pipeline_deform(
-                &ctxt,
-                &view_bind_group_layout,
-                &model_bind_group_layout,
-                &deform_layout,
-            );
-            let transmittance = Self::create_transmittance_pipeline_deform(
-                &ctxt,
-                &view_bind_group_layout,
-                &model_bind_group_layout,
-                &deform_layout,
-                &transmittance_tex_bgl,
-            );
-            (Some(depth), Some(transmittance))
-        } else {
-            (None, None)
-        };
-
-        let view_capacity = MAX_SHADOW_VIEWS as u64;
+        let view_capacity = DEFAULT_SHADOW_VIEWS as u64;
         let view_uniform_buffer = ctxt.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow_view_uniform_buffer"),
             size: SHADOW_VIEW_STRIDE * view_capacity,
@@ -510,7 +522,9 @@ impl ShadowMapper {
         Self {
             enabled: true,
             resolution,
-            depth_bias: 0.0012,
+            atlas_layers,
+            depth_bias: DEFAULT_SHADOW_DEPTH_BIAS,
+            raster_bias,
             softness: 1.0,
             num_cascades: 4,
             shadow_distance: f32::INFINITY,
@@ -523,14 +537,15 @@ impl ShadowMapper {
             transmittance_layer_views,
             transmittance_array_view,
             transmittance_sampler,
-            transmittance_pipeline,
+            transmittance_pipeline: None,
             transmittance_tex_bgl,
             uniform_buffer,
             bind_group_layout,
             bind_group,
-            depth_pipeline,
-            deform_depth_pipeline,
-            deform_transmittance_pipeline,
+            depth_pipeline: None,
+            deform_depth_pipeline: None,
+            deform_transmittance_pipeline: None,
+            cutout_pipelines: None,
             view_bind_group_layout,
             view_uniform_buffer,
             view_capacity,
@@ -564,7 +579,7 @@ impl ShadowMapper {
     /// Computes the light-space matrices for a shadow-casting light, writes them
     /// into `view_proj` (and queues the views for the depth pre-pass), and returns
     /// the light's `GpuLightShadow` metadata. `base_view` is the light's first atlas
-    /// layer; the caller must have checked it fits within [`MAX_SHADOW_VIEWS`].
+    /// layer; the caller must have checked it fits within the view budget.
     #[allow(clippy::too_many_arguments)]
     fn build_light_shadow(
         &self,
@@ -667,13 +682,14 @@ impl ShadowMapper {
     fn create_atlas(
         ctxt: &Context,
         resolution: u32,
+        layers: u32,
     ) -> (wgpu::Texture, Vec<wgpu::TextureView>, wgpu::TextureView) {
         let atlas = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow_atlas"),
             size: wgpu::Extent3d {
                 width: resolution,
                 height: resolution,
-                depth_or_array_layers: MAX_SHADOW_VIEWS as u32,
+                depth_or_array_layers: layers.max(MIN_ATLAS_LAYERS),
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -683,7 +699,7 @@ impl ShadowMapper {
             view_formats: &[],
         });
 
-        let layer_views = (0..MAX_SHADOW_VIEWS as u32)
+        let layer_views = (0..layers)
             .map(|layer| {
                 atlas.create_view(&wgpu::TextureViewDescriptor {
                     label: Some("shadow_atlas_layer"),
@@ -710,13 +726,14 @@ impl ShadowMapper {
     fn create_transmittance_atlas(
         ctxt: &Context,
         resolution: u32,
+        layers: u32,
     ) -> (wgpu::Texture, Vec<wgpu::TextureView>, wgpu::TextureView) {
         let atlas = ctxt.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow_transmittance_atlas"),
             size: wgpu::Extent3d {
                 width: resolution,
                 height: resolution,
-                depth_or_array_layers: MAX_SHADOW_VIEWS as u32,
+                depth_or_array_layers: layers.max(MIN_ATLAS_LAYERS),
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -726,7 +743,7 @@ impl ShadowMapper {
             view_formats: &[],
         });
 
-        let layer_views = (0..MAX_SHADOW_VIEWS as u32)
+        let layer_views = (0..layers)
             .map(|layer| {
                 atlas.create_view(&wgpu::TextureViewDescriptor {
                     label: Some("shadow_transmittance_layer"),
@@ -789,14 +806,11 @@ impl ShadowMapper {
         ctxt: &Context,
         view_bind_group_layout: &wgpu::BindGroupLayout,
         model_bind_group_layout: &wgpu::BindGroupLayout,
+        raster_bias: (i32, f32),
     ) -> wgpu::RenderPipeline {
         let shader = ctxt.create_shader_module(
             Some("shadow_depth_shader"),
-            &crate::builtin::compile_wesl(
-                &[("package::shadow_depth", crate::builtin::SHADOW_DEPTH_WESL)],
-                "package::shadow_depth",
-                &[("skinned", false)],
-            ),
+            &crate::builtin::linked("package::shadow_depth", &[("skinned", false)]),
         );
 
         let layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -883,7 +897,7 @@ impl ShadowMapper {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
-                bias: shadow_depth_bias(),
+                bias: shadow_depth_bias(raster_bias),
             }),
             multisample: wgpu::MultisampleState {
                 count: 1,
@@ -906,14 +920,11 @@ impl ShadowMapper {
         view_bind_group_layout: &wgpu::BindGroupLayout,
         model_bind_group_layout: &wgpu::BindGroupLayout,
         deform_bind_group_layout: &wgpu::BindGroupLayout,
+        raster_bias: (i32, f32),
     ) -> wgpu::RenderPipeline {
         let shader = ctxt.create_shader_module(
             Some("shadow_depth_deform_shader"),
-            &crate::builtin::compile_wesl(
-                &[("package::shadow_depth", crate::builtin::SHADOW_DEPTH_WESL)],
-                "package::shadow_depth",
-                &[("skinned", true)],
-            ),
+            &crate::builtin::linked("package::shadow_depth", &[("skinned", true)]),
         );
 
         let layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -993,7 +1004,7 @@ impl ShadowMapper {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
-                bias: shadow_depth_bias(),
+                bias: shadow_depth_bias(raster_bias),
             }),
             multisample: wgpu::MultisampleState {
                 count: 1,
@@ -1016,17 +1027,11 @@ impl ShadowMapper {
         model_bind_group_layout: &wgpu::BindGroupLayout,
         deform_bind_group_layout: &wgpu::BindGroupLayout,
         tex_bind_group_layout: &wgpu::BindGroupLayout,
+        alpha_depth: Option<(i32, f32)>,
     ) -> wgpu::RenderPipeline {
         let shader = ctxt.create_shader_module(
             Some("shadow_transmittance_deform_shader"),
-            &crate::builtin::compile_wesl(
-                &[(
-                    "package::shadow_transmittance",
-                    crate::builtin::SHADOW_TRANSMITTANCE_WESL,
-                )],
-                "package::shadow_transmittance",
-                &[("skinned", true)],
-            ),
+            &crate::builtin::linked("package::shadow_transmittance", &[("skinned", true)]),
         );
 
         let layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1099,6 +1104,14 @@ impl ShadowMapper {
             dst_factor: wgpu::BlendFactor::Zero,
             operation: wgpu::BlendOperation::Add,
         };
+        let transmittance_target = [Some(wgpu::ColorTargetState {
+            format: TRANSMITTANCE_FORMAT,
+            blend: Some(wgpu::BlendState {
+                color: mult_blend,
+                alpha: mult_blend,
+            }),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
 
         ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow_transmittance_skinned_pipeline"),
@@ -1111,15 +1124,12 @@ impl ShadowMapper {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: TRANSMITTANCE_FORMAT,
-                    blend: Some(wgpu::BlendState {
-                        color: mult_blend,
-                        alpha: mult_blend,
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                entry_point: Some(fragment_entry(alpha_depth)),
+                targets: if alpha_depth.is_some() {
+                    &[]
+                } else {
+                    &transmittance_target
+                },
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -1131,13 +1141,7 @@ impl ShadowMapper {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            depth_stencil: Some(transmittance_depth_state(alpha_depth)),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -1158,17 +1162,11 @@ impl ShadowMapper {
         view_bind_group_layout: &wgpu::BindGroupLayout,
         model_bind_group_layout: &wgpu::BindGroupLayout,
         tex_bind_group_layout: &wgpu::BindGroupLayout,
+        alpha_depth: Option<(i32, f32)>,
     ) -> wgpu::RenderPipeline {
         let shader = ctxt.create_shader_module(
             Some("shadow_transmittance_shader"),
-            &crate::builtin::compile_wesl(
-                &[(
-                    "package::shadow_transmittance",
-                    crate::builtin::SHADOW_TRANSMITTANCE_WESL,
-                )],
-                "package::shadow_transmittance",
-                &[("skinned", false)],
-            ),
+            &crate::builtin::linked("package::shadow_transmittance", &[("skinned", false)]),
         );
 
         let layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1243,6 +1241,14 @@ impl ShadowMapper {
             dst_factor: wgpu::BlendFactor::Zero,
             operation: wgpu::BlendOperation::Add,
         };
+        let transmittance_target = [Some(wgpu::ColorTargetState {
+            format: TRANSMITTANCE_FORMAT,
+            blend: Some(wgpu::BlendState {
+                color: mult_blend,
+                alpha: mult_blend,
+            }),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
 
         ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow_transmittance_pipeline"),
@@ -1255,15 +1261,12 @@ impl ShadowMapper {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: TRANSMITTANCE_FORMAT,
-                    blend: Some(wgpu::BlendState {
-                        color: mult_blend,
-                        alpha: mult_blend,
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                entry_point: Some(fragment_entry(alpha_depth)),
+                targets: if alpha_depth.is_some() {
+                    &[]
+                } else {
+                    &transmittance_target
+                },
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -1279,13 +1282,7 @@ impl ShadowMapper {
             // fragment tints only where it is in front of the nearest opaque
             // surface. Depth writes are off so translucent occluders don't hide
             // one another (their transmittances multiply commutatively).
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            depth_stencil: Some(transmittance_depth_state(alpha_depth)),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -1375,20 +1372,170 @@ impl ShadowMapper {
         self.first_cascade_far_bound = bound.max(0.01);
     }
 
+    /// Far view distance of the highest-resolution directional cascade. Default 12.
+    pub fn first_cascade_far_bound(&self) -> f32 {
+        self.first_cascade_far_bound
+    }
+
+    /// The constant depth bias the lighting shader subtracts when comparing a
+    /// fragment against the shadow map. Default [`DEFAULT_SHADOW_DEPTH_BIAS`] (0.0012).
+    pub fn depth_bias(&self) -> f32 {
+        self.depth_bias
+    }
+
+    /// Sets the comparison depth bias. Larger values cure acne and detach contact
+    /// shadows sooner. Clamped to `>= 0`.
+    pub fn set_depth_bias(&mut self, bias: f32) {
+        self.depth_bias = bias.max(0.0);
+    }
+
+    /// The rasterizer depth bias `(constant, slope_scale)` of the shadow depth pass.
+    /// Default [`DEFAULT_SHADOW_RASTER_BIAS`] (1, 1.75).
+    pub fn raster_bias(&self) -> (i32, f32) {
+        self.raster_bias
+    }
+
+    /// Sets the rasterizer depth bias of the shadow depth pass: `constant` in
+    /// depth-buffer units and `slope_scale` times the polygon's depth slope. It is
+    /// baked into the depth pipelines, so a change rebuilds them.
+    pub fn set_raster_bias(&mut self, constant: i32, slope_scale: f32) {
+        let bias = (constant, slope_scale);
+        if bias == self.raster_bias {
+            return;
+        }
+        self.raster_bias = bias;
+        self.depth_pipeline = None;
+        self.deform_depth_pipeline = None;
+        self.cutout_pipelines = None;
+    }
+
+    /// Builds what this frame's casters draw with, if it is not built yet. A driver
+    /// takes hundreds of milliseconds over a pipeline it has not seen, so a scene
+    /// that casts no shadow compiles none of these.
+    ///
+    /// The deformed pipelines bind the deform data as a 3rd bind group (4th for
+    /// transmittance, which also needs the albedo texture), so they stay within
+    /// WebGPU's 4-bind-group cap and run on every target where deform runs at all,
+    /// WebGPU browsers included. Gating them off where the color pass deforms would
+    /// leave the shadow map in the rest pose while the lit geometry is animated,
+    /// self-shadowing the moved surfaces (acne). The deform bind-group layout is the
+    /// shared one from `builtin::deform`, so each object's deform bind group works in
+    /// both the color and shadow passes. Where the device cannot bind the deform group
+    /// (WebGL2, Android GLES; see `Context::supports_deform`) the color pass draws rest
+    /// poses too, so a rest-pose shadow map is consistent rather than acne-prone.
+    fn ensure_caster_pipelines(
+        &mut self,
+        has_transparent: bool,
+        has_cutout: bool,
+        has_deformed: bool,
+    ) {
+        let ctxt = Context::get();
+        if self.depth_pipeline.is_none() {
+            self.depth_pipeline = Some(Self::create_depth_pipeline(
+                &ctxt,
+                &self.view_bind_group_layout,
+                &self.model_bind_group_layout,
+                self.raster_bias,
+            ));
+        }
+        if has_transparent && self.transmittance_pipeline.is_none() {
+            self.transmittance_pipeline = Some(Self::create_transmittance_pipeline(
+                &ctxt,
+                &self.view_bind_group_layout,
+                &self.model_bind_group_layout,
+                &self.transmittance_tex_bgl,
+                None,
+            ));
+        }
+        if has_deformed && self.deform_depth_pipeline.is_none() {
+            self.deform_depth_pipeline = Some(Self::create_depth_pipeline_deform(
+                &ctxt,
+                &self.view_bind_group_layout,
+                &self.model_bind_group_layout,
+                &crate::builtin::deform::deform_bind_group_layout(),
+                self.raster_bias,
+            ));
+        }
+        if has_deformed && has_transparent && self.deform_transmittance_pipeline.is_none() {
+            self.deform_transmittance_pipeline = Some(Self::create_transmittance_pipeline_deform(
+                &ctxt,
+                &self.view_bind_group_layout,
+                &self.model_bind_group_layout,
+                &crate::builtin::deform::deform_bind_group_layout(),
+                &self.transmittance_tex_bgl,
+                None,
+            ));
+        }
+        if has_cutout {
+            self.ensure_cutout_pipelines();
+        }
+    }
+
+    /// Builds the cutout depth pipelines if they are not built yet.
+    fn ensure_cutout_pipelines(&mut self) {
+        if self.cutout_pipelines.is_some() {
+            return;
+        }
+        let ctxt = Context::get();
+        let bias = Some(self.raster_bias);
+        let plain = Self::create_transmittance_pipeline(
+            &ctxt,
+            &self.view_bind_group_layout,
+            &self.model_bind_group_layout,
+            &self.transmittance_tex_bgl,
+            bias,
+        );
+        let deformed = ctxt.supports_deform().then(|| {
+            Self::create_transmittance_pipeline_deform(
+                &ctxt,
+                &self.view_bind_group_layout,
+                &self.model_bind_group_layout,
+                &crate::builtin::deform::deform_bind_group_layout(),
+                &self.transmittance_tex_bgl,
+                bias,
+            )
+        });
+        self.cutout_pipelines = Some((plain, deformed));
+    }
+
     /// Sets the shadow atlas per-layer resolution, reallocating the atlas.
     pub fn set_resolution(&mut self, resolution: u32) {
         let resolution = resolution.max(1);
         if resolution == self.resolution {
             return;
         }
-        let ctxt = Context::get();
         self.resolution = resolution;
-        let (atlas, layer_views, array_view) = Self::create_atlas(&ctxt, resolution);
+        self.reallocate_atlases();
+    }
+
+    /// Number of atlas layers allocated (the default is [`DEFAULT_SHADOW_VIEWS`]).
+    pub fn atlas_layers(&self) -> u32 {
+        self.atlas_layers
+    }
+
+    /// Sets how many atlas layers are allocated (`1..=MAX_SHADOW_VIEWS`),
+    /// reallocating the atlas. A directional light needs one layer per cascade,
+    /// a spot light one, a point light six; lights that do not fit keep lighting
+    /// without shadows. Fewer layers make a higher `resolution` affordable: the
+    /// atlas costs `resolution² × layers × 8` bytes (depth plus transmittance).
+    pub fn set_atlas_layers(&mut self, layers: u32) {
+        let layers = layers.clamp(1, MAX_SHADOW_VIEWS as u32);
+        if layers == self.atlas_layers {
+            return;
+        }
+        self.atlas_layers = layers;
+        self.reallocate_atlases();
+    }
+
+    fn reallocate_atlases(&mut self) {
+        let ctxt = Context::get();
+        let (atlas, layer_views, array_view) =
+            Self::create_atlas(&ctxt, self.resolution, self.atlas_layers);
         self.atlas = atlas;
         self.layer_views = layer_views;
         self.array_view = array_view;
         let (t_atlas, t_layer_views, t_array_view) =
-            Self::create_transmittance_atlas(&ctxt, resolution);
+            Self::create_transmittance_atlas(&ctxt, self.resolution, self.atlas_layers);
         self.transmittance_atlas = t_atlas;
         self.transmittance_layer_views = t_layer_views;
         self.transmittance_array_view = t_array_view;
@@ -1490,7 +1637,7 @@ impl ShadowMapper {
                 continue;
             }
             let needed = self.shadow_view_count(light);
-            if next_layer as usize + needed > MAX_SHADOW_VIEWS {
+            if next_layer + needed as u32 > self.atlas_layers {
                 // Out of atlas space: this light lights without shadows.
                 continue;
             }
@@ -1518,7 +1665,7 @@ impl ShadowMapper {
                 continue;
             }
             let needed = self.shadow_view_count(light);
-            if next_layer as usize + needed > MAX_SHADOW_VIEWS {
+            if next_layer + needed as u32 > self.atlas_layers {
                 // Out of atlas space; a smaller later light might still fit.
                 continue;
             }
@@ -1552,10 +1699,14 @@ impl ShadowMapper {
         // buffer writes can't be interleaved with an active pass.
         let mut models: Vec<ShadowModelUniforms> = Vec::new();
         let mut has_transparent = false;
+        let mut has_cutout = false;
+        let mut has_deformed = false;
         scene
             .data()
-            .collect_shadow_models(&mut |transform, scale, color| {
-                has_transparent |= color.a < OPAQUE_ALPHA_THRESHOLD;
+            .collect_shadow_models(&mut |transform, scale, color, cutoff, deformed| {
+                has_transparent |= cutoff.is_none() && color.a < OPAQUE_ALPHA_THRESHOLD;
+                has_cutout |= cutoff.is_some();
+                has_deformed |= deformed;
                 let scale_mat = glamx::Mat3::from_diagonal(scale).to_cols_array_2d();
                 models.push(ShadowModelUniforms {
                     transform: transform.to_mat4().to_cols_array_2d(),
@@ -1565,6 +1716,7 @@ impl ShadowMapper {
                         [scale_mat[2][0], scale_mat[2][1], scale_mat[2][2], 0.0],
                     ],
                     color: [color.r, color.g, color.b, color.a],
+                    params: [cutoff.unwrap_or(0.0), 0.0, 0.0, 0.0],
                 });
             });
 
@@ -1574,6 +1726,8 @@ impl ShadowMapper {
             ctxt.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
             return;
         }
+
+        self.ensure_caster_pipelines(has_transparent, has_cutout, has_deformed);
 
         // Upload per-view matrices into the dynamic buffer (one aligned slot each).
         self.ensure_view_capacity(views.len() as u64);
@@ -1622,7 +1776,8 @@ impl ShadowMapper {
                     multiview_mask: None,
                 });
 
-                pass.set_pipeline(&self.depth_pipeline);
+                let depth_pipeline = self.depth_pipeline.as_ref().expect("built above");
+                pass.set_pipeline(depth_pipeline);
                 pass.set_bind_group(0, &self.view_bind_group, &[offset]);
 
                 // Deformable casters use the deformed depth pipeline so their shadow
@@ -1633,7 +1788,7 @@ impl ShadowMapper {
                 let mut object_index = 0u32;
                 scene.data_mut().render_shadow_casters(
                     &mut pass,
-                    &self.depth_pipeline,
+                    depth_pipeline,
                     deform,
                     None, // depth pass: no albedo texture / UVs
                     &self.model_bind_group,
@@ -1641,6 +1796,9 @@ impl ShadowMapper {
                     &mut object_index,
                     false,
                     OPAQUE_ALPHA_THRESHOLD,
+                    self.cutout_pipelines.as_ref().map(|(plain, deformed)| {
+                        (plain, deformed.as_ref(), &self.transmittance_tex_bgl)
+                    }),
                 );
             }
 
@@ -1677,7 +1835,9 @@ impl ShadowMapper {
                     multiview_mask: None,
                 });
 
-                pass.set_pipeline(&self.transmittance_pipeline);
+                let transmittance_pipeline =
+                    self.transmittance_pipeline.as_ref().expect("built above");
+                pass.set_pipeline(transmittance_pipeline);
                 pass.set_bind_group(0, &self.view_bind_group, &[offset]);
 
                 // Deformable translucent casters use the deformed transmittance
@@ -1687,7 +1847,7 @@ impl ShadowMapper {
                 let mut object_index = 0u32;
                 scene.data_mut().render_shadow_casters(
                     &mut pass,
-                    &self.transmittance_pipeline,
+                    transmittance_pipeline,
                     deform,
                     Some(&self.transmittance_tex_bgl), // tints the shadow by the albedo texture
                     &self.model_bind_group,
@@ -1695,6 +1855,7 @@ impl ShadowMapper {
                     &mut object_index,
                     true,
                     OPAQUE_ALPHA_THRESHOLD,
+                    None,
                 );
             }
         }
@@ -1988,4 +2149,291 @@ fn cube_face_view_projs(eye: Vec3, near: f32, far: f32) -> [Mat4; 6] {
         out[i] = proj * view;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::camera::OrbitCamera3d;
+    use crate::color::Color;
+    use crate::light::Light;
+    use crate::scene::{AlphaMode, SceneNode3d};
+    use crate::test_gpu::{mean_luma, on_gpu};
+    use glamx::Vec3;
+
+    fn lit_cube_on_ground(point_lights: usize) -> SceneNode3d {
+        let mut scene = SceneNode3d::empty();
+        for i in 0..point_lights {
+            scene
+                .add_light(Light::point(40.0).with_intensity(2.0))
+                .set_position(Vec3::new(3.0 + i as f32 * 0.5, 3.0, 1.0));
+        }
+        let mut ground = scene.add_cube(12.0, 0.2, 12.0);
+        ground.set_color(Color::new(0.8, 0.8, 0.8, 1.0));
+        ground.set_position(Vec3::new(0.0, -1.1, 0.0));
+        scene.add_cube(2.0, 2.0, 2.0);
+        scene
+    }
+
+    /// What rendering `scene` once built, among the pipelines this file owns.
+    async fn caster_pipelines_built_by(
+        surface: &mut crate::window::OffscreenSurface,
+        scene: &mut SceneNode3d,
+    ) -> Vec<String> {
+        crate::context::Context::take_built_pipelines();
+        let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 3.0, 8.0), Vec3::ZERO);
+        surface.render_3d(scene, &mut camera).await;
+        crate::context::Context::take_built_pipelines()
+            .into_iter()
+            .filter(|label| label.starts_with("shadow_"))
+            .collect()
+    }
+
+    #[test]
+    fn a_new_mapper_compiles_nothing() {
+        on_gpu(32, 32, async |_surface| {
+            crate::context::Context::take_built_pipelines();
+            let _mapper = super::ShadowMapper::new(16);
+            assert_eq!(
+                crate::context::Context::take_built_pipelines(),
+                Vec::<String>::new()
+            );
+        });
+    }
+
+    #[test]
+    fn a_scene_with_no_caster_compiles_no_shadow_pipeline() {
+        on_gpu(32, 32, async |surface| {
+            let mut scene = SceneNode3d::empty();
+            scene
+                .add_light(Light::point(40.0).with_intensity(2.0))
+                .set_position(Vec3::new(3.0, 3.0, 1.0));
+            assert_eq!(
+                caster_pipelines_built_by(surface, &mut scene).await,
+                Vec::<String>::new()
+            );
+        });
+    }
+
+    #[test]
+    fn opaque_casters_compile_the_depth_pipeline_alone_and_once() {
+        on_gpu(32, 32, async |surface| {
+            let mut scene = lit_cube_on_ground(1);
+            assert_eq!(
+                caster_pipelines_built_by(surface, &mut scene).await,
+                ["shadow_depth_pipeline"]
+            );
+            assert_eq!(
+                caster_pipelines_built_by(surface, &mut scene).await,
+                Vec::<String>::new()
+            );
+        });
+    }
+
+    #[test]
+    fn a_translucent_caster_adds_the_transmittance_pipeline_when_it_appears() {
+        on_gpu(32, 32, async |surface| {
+            let mut scene = lit_cube_on_ground(1);
+            caster_pipelines_built_by(surface, &mut scene).await;
+            let mut glass = scene.add_cube(1.0, 1.0, 1.0);
+            glass.set_color(Color::new(0.2, 0.4, 0.9, 0.5));
+            glass.set_position(Vec3::new(0.0, 2.0, 0.0));
+            assert_eq!(
+                caster_pipelines_built_by(surface, &mut scene).await,
+                ["shadow_transmittance_pipeline"]
+            );
+        });
+    }
+
+    #[test]
+    fn a_morphed_caster_compiles_the_deformed_pipelines_it_draws_with() {
+        use crate::resource::{GpuMesh3d, MorphTargets};
+        use glamx::Vec2;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        on_gpu(32, 32, async |surface| {
+            if !crate::context::Context::get().supports_deform() {
+                return;
+            }
+            let coords = vec![
+                Vec3::new(-0.5, 0.0, -0.5),
+                Vec3::new(0.5, 0.0, -0.5),
+                Vec3::new(0.5, 0.0, 0.5),
+                Vec3::new(-0.5, 0.0, 0.5),
+            ];
+            let mut mesh = GpuMesh3d::new(
+                coords,
+                vec![[0, 1, 2], [0, 2, 3]],
+                None,
+                Some(vec![Vec2::ZERO; 4]),
+                false,
+            );
+            mesh.set_morph_targets(MorphTargets::new(1, 4, vec![[1.5, 0.0, 0.0, 0.0]; 4], None));
+            let mut scene = lit_cube_on_ground(1);
+            let mut morphed = scene.add_mesh(Rc::new(RefCell::new(mesh)), Vec3::ONE);
+            morphed.set_morph_weights(&[1.0]);
+
+            // Twice: the object's deform group is built as it is first drawn.
+            let mut built = caster_pipelines_built_by(surface, &mut scene).await;
+            built.extend(caster_pipelines_built_by(surface, &mut scene).await);
+            assert!(
+                built.iter().any(|l| l == "shadow_depth_deform_pipeline"),
+                "{:?}",
+                built
+            );
+            assert!(
+                !built
+                    .iter()
+                    .any(|l| l == "shadow_transmittance_skinned_pipeline"),
+                "{:?}",
+                built
+            );
+
+            morphed.set_color(Color::new(0.2, 0.4, 0.9, 0.5));
+            let built = caster_pipelines_built_by(surface, &mut scene).await;
+            assert!(
+                built
+                    .iter()
+                    .any(|l| l == "shadow_transmittance_skinned_pipeline"),
+                "{:?}",
+                built
+            );
+        });
+    }
+
+    #[test]
+    fn shadow_settings_start_at_their_documented_defaults() {
+        on_gpu(32, 32, async |surface| {
+            let window = surface.window();
+            assert_eq!(window.shadow_resolution(), 2048);
+            assert_eq!(window.shadow_cascades(), 4);
+            assert_eq!(window.shadow_distance(), f32::INFINITY);
+            assert_eq!(window.first_cascade_far_bound(), 12.0);
+            assert_eq!(window.shadow_depth_bias(), 0.0012);
+            assert_eq!(window.shadow_raster_bias(), (1, 1.75));
+            assert_eq!(window.shadow_atlas_layers(), 16);
+        });
+    }
+
+    #[test]
+    fn a_light_past_the_view_budget_casts_no_shadow() {
+        on_gpu(64, 64, async |surface| {
+            surface.set_shadow_resolution(128);
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 6.0, 8.0), Vec3::ZERO);
+            let mut scene = lit_cube_on_ground(2);
+
+            surface.render_3d(&mut scene, &mut camera).await;
+            let slots = surface.window().shadow_mapper().shadow_slots().to_vec();
+            assert!(slots.iter().all(|&s| s != u32::MAX), "{:?}", slots);
+
+            surface.window_mut().set_shadow_atlas_layers(6);
+            assert_eq!(surface.window().shadow_atlas_layers(), 6);
+            surface.render_3d(&mut scene, &mut camera).await;
+            let slots = surface.window().shadow_mapper().shadow_slots().to_vec();
+            assert_eq!(slots.iter().filter(|&&s| s != u32::MAX).count(), 1);
+
+            surface.window_mut().set_shadow_atlas_layers(1000);
+            assert_eq!(surface.window().shadow_atlas_layers(), 64);
+        });
+    }
+
+    #[test]
+    fn a_large_depth_bias_lifts_the_shadow() {
+        on_gpu(64, 64, async |surface| {
+            surface.set_shadow_resolution(256);
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 6.0, 8.0), Vec3::ZERO);
+            let mut scene = lit_cube_on_ground(1);
+
+            surface.render_3d(&mut scene, &mut camera).await;
+            let shadowed = mean_luma(surface);
+
+            surface.window_mut().set_shadow_depth_bias(1.0);
+            surface.render_3d(&mut scene, &mut camera).await;
+            let compare_biased = mean_luma(surface);
+            assert!(
+                compare_biased > shadowed + 0.01,
+                "{} {}",
+                shadowed,
+                compare_biased
+            );
+
+            surface.window_mut().set_shadow_depth_bias(0.0012);
+            surface.window_mut().set_shadow_raster_bias(1 << 30, 1.75);
+            assert_eq!(surface.window().shadow_raster_bias(), (1 << 30, 1.75));
+            surface.render_3d(&mut scene, &mut camera).await;
+            let raster_biased = mean_luma(surface);
+            assert!(
+                raster_biased > shadowed + 0.01,
+                "{} {}",
+                shadowed,
+                raster_biased
+            );
+        });
+    }
+
+    /// A slab above the ground, lit from straight above, its texture opaque on
+    /// the left half and clear on the right.
+    fn half_clear_slab(scene: &mut SceneNode3d) -> SceneNode3d {
+        let mut pixels = image::RgbaImage::new(8, 1);
+        for (x, _, p) in pixels.enumerate_pixels_mut() {
+            *p = image::Rgba([255, 255, 255, if x < 4 { 255 } else { 0 }]);
+        }
+        let texture = crate::resource::TextureManager::get_global_manager(|tm| {
+            tm.add_image(
+                image::DynamicImage::ImageRgba8(pixels.clone()),
+                "half_clear",
+            )
+        });
+        let mut slab = scene.add_cube(3.0, 0.05, 3.0);
+        slab.set_texture(texture);
+        slab.set_position(Vec3::new(0.0, 1.0, 0.0));
+        slab
+    }
+
+    #[test]
+    fn a_masked_caster_shadows_only_where_its_texture_is_opaque() {
+        on_gpu(64, 64, async |surface| {
+            surface.set_shadow_resolution(256);
+            let mut scene = SceneNode3d::empty();
+            scene
+                .add_light(Light::point(40.0).with_intensity(2.0))
+                .set_position(Vec3::new(0.0, 6.0, 0.0));
+            scene
+                .add_cube(12.0, 0.2, 12.0)
+                .set_color(Color::new(0.8, 0.8, 0.8, 1.0))
+                .set_position(Vec3::new(0.0, -1.1, 0.0));
+            let mut slab = half_clear_slab(&mut scene);
+            // Looking up from below the slab, so only the ground and its shadow show.
+            let mut camera =
+                OrbitCamera3d::new(Vec3::new(0.0, 0.4, 0.01), Vec3::new(0.0, -1.0, 0.0));
+
+            slab.set_alpha_mode(AlphaMode::Opaque);
+            surface.render_3d(&mut scene, &mut camera).await;
+            let solid = mean_luma(surface);
+
+            slab.set_alpha_mode(AlphaMode::Mask(0.5));
+            surface.render_3d(&mut scene, &mut camera).await;
+            let cut = mean_luma(surface);
+            assert!(cut > solid + 0.02, "{} {}", solid, cut);
+
+            slab.set_casts_shadows(false);
+            surface.render_3d(&mut scene, &mut camera).await;
+            let open = mean_luma(surface);
+            assert!(open > cut + 0.02, "{} {}", cut, open);
+        });
+    }
+
+    #[test]
+    fn cascade_settings_read_back_clamped() {
+        on_gpu(32, 32, async |surface| {
+            let window = surface.window_mut();
+            window.set_shadow_cascades(9);
+            window.set_shadow_distance(40.0);
+            window.set_first_cascade_far_bound(0.0);
+            assert_eq!(window.shadow_cascades(), 4);
+            assert_eq!(window.shadow_distance(), 40.0);
+            assert_eq!(window.first_cascade_far_bound(), 0.01);
+            window.set_shadow_cascades(0);
+            assert_eq!(window.shadow_cascades(), 1);
+        });
+    }
 }

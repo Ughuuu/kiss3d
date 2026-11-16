@@ -12,6 +12,8 @@ import package::common::unpack_mat3;
 
 const MAX_EMITTERS: u32 = 32u;
 const MAX_OCCLUDERS: u32 = 64u;
+// Must match `MAX_SEGMENT_OCCLUDERS` in gi2d.rs.
+const MAX_SEGMENTS: u32 = 128u;
 const TAU: f32 = 6.2831853;
 
 struct Emitter {
@@ -21,6 +23,21 @@ struct Emitter {
 
 struct Occluder {
     pos_radius: vec4<f32>,
+}
+
+struct Segment {
+    // a.xy, b.xy
+    ab: vec4<f32>,
+    // radius, _, _, _
+    radius: vec4<f32>,
+}
+
+// Distance from `q` to the segment occluder `s`'s surface (negative inside).
+fn segment_distance(q: vec2<f32>, s: Segment) -> f32 {
+    let a = s.ab.xy;
+    let ab = s.ab.zw - a;
+    let h = clamp(dot(q - a, ab) / max(dot(ab, ab), 1e-12), 0.0, 1.0);
+    return length(q - a - ab * h) - s.radius.x;
 }
 
 // Reused from gi2d_field.wgsl (the same field uniform buffer is bound).
@@ -39,6 +56,7 @@ struct FieldUniforms {
     counts: vec4<f32>,
     emitters: array<Emitter, MAX_EMITTERS>,
     occluders: array<Occluder, MAX_OCCLUDERS>,
+    segments: array<Segment, MAX_SEGMENTS>,
 }
 
 struct CascadeParams {
@@ -105,6 +123,10 @@ fn occluder_distance(q: vec2<f32>) -> f32 {
         let o = field.occluders[i];
         d = min(d, length(q - o.pos_radius.xy) - o.pos_radius.z);
     }
+    let num_s = u32(field.flags.z);
+    for (var i = 0u; i < num_s; i = i + 1u) {
+        d = min(d, segment_distance(q, field.segments[i]));
+    }
     return d;
 }
 
@@ -136,7 +158,7 @@ fn march_interval(origin: vec2<f32>, dir: vec2<f32>, start: f32, end: f32, max_s
             return vec4<f32>(0.0, 0.0, 0.0, 0.0);
         }
 
-        t += max(min(d_emit, d_occ), 0.5);
+        t += max(min(d_emit, d_occ), 0.25 * field.flags.w);
         if (t >= end) {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }

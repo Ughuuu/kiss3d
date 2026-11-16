@@ -3,11 +3,13 @@
 #[cfg(any(target_os = "android", test))]
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use crate::context::Context;
 use crate::event::{Action, Key, Modifiers, MouseButton, TouchAction, WindowEvent};
+use crate::window::access::{self, Access};
 use crate::window::canvas::CanvasSetup;
 use image::{GenericImage, Pixel};
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
@@ -104,6 +106,126 @@ impl Waker {
     }
 }
 
+/// What ends a wait on the loop kiss3d pumps, if it pumps one here.
+pub(crate) fn loop_waker() -> Option<Waker> {
+    #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
+    {
+        EVENT_LOOP.with(|cell| cell.borrow().as_ref().map(|el| Waker(el.create_proxy())))
+    }
+    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
+    {
+        None
+    }
+}
+
+/// Runs `with` on the loop's `ActiveEventLoop`, which exists only inside a
+/// callback: one pump, whose window events go where every other pump's do.
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+pub(crate) fn with_active_loop<T>(with: impl FnOnce(&ActiveEventLoop) -> T) -> T {
+    EVENT_LOOP.with(|cell| {
+        let mut event_loop = cell.borrow_mut();
+        let event_loop = event_loop
+            .as_mut()
+            .expect("a window has just been made on this loop");
+        one_turn(event_loop, with)
+    })
+}
+
+/// [`with_active_loop`] on a loop already in hand.
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+fn one_turn<T>(event_loop: &mut EventLoop<()>, with: impl FnOnce(&ActiveEventLoop) -> T) -> T {
+    use winit::platform::pump_events::EventLoopExtPumpEvents;
+
+    struct OneTurn<Asked, T> {
+        asked: Option<Asked>,
+        answer: Option<T>,
+    }
+
+    impl<Asked: FnOnce(&ActiveEventLoop) -> T, T> ApplicationHandler for OneTurn<Asked, T> {
+        fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+            if let Some(asked) = self.asked.take() {
+                self.answer = Some(asked(event_loop));
+            }
+        }
+
+        fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+
+        fn window_event(
+            &mut self,
+            _event_loop: &ActiveEventLoop,
+            window_id: winit::window::WindowId,
+            event: WinitWindowEvent,
+        ) {
+            collect_window_event(window_id, event);
+        }
+    }
+
+    let mut turn = OneTurn {
+        asked: Some(with),
+        answer: None,
+    };
+    loop {
+        let _ = event_loop.pump_app_events(Some(std::time::Duration::ZERO), &mut turn);
+        if let Some(answer) = turn.answer.take() {
+            return answer;
+        }
+    }
+}
+
+/// `attrs` asking for no more than `monitor` holds. A window that does not fit
+/// opens maximized, so the system sizes it to the screen less its own bars,
+/// which winit cannot tell, and restores to the most the monitor holds.
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+fn fit_to_monitor(
+    attrs: WindowAttributes,
+    monitor: Option<winit::monitor::MonitorHandle>,
+) -> WindowAttributes {
+    let (Some(monitor), Some(asked)) = (monitor, attrs.inner_size) else {
+        return attrs;
+    };
+    let scale = monitor.scale_factor();
+    match held_size(asked.to_logical(scale), monitor.size().to_logical(scale)) {
+        Some(held) => attrs.with_inner_size(held).with_maximized(true),
+        None => attrs,
+    }
+}
+
+/// The size a window asking for `asked` restores to on a monitor of `room`,
+/// or `None` when it fits as asked.
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+fn held_size(
+    asked: winit::dpi::LogicalSize<f64>,
+    room: winit::dpi::LogicalSize<f64>,
+) -> Option<winit::dpi::LogicalSize<f64>> {
+    let empty = room.width <= 0.0 || room.height <= 0.0;
+    if empty || (asked.width <= room.width && asked.height <= room.height) {
+        return None;
+    }
+    Some(winit::dpi::LogicalSize::new(
+        asked.width.min(room.width),
+        asked.height.min(room.height),
+    ))
+}
+
+/// The monitor a new window opens on: the primary one, or where a system
+/// names none (Wayland), the smallest, which the window then fits anywhere.
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+fn opening_monitor(event_loop: &ActiveEventLoop) -> Option<winit::monitor::MonitorHandle> {
+    event_loop.primary_monitor().or_else(|| {
+        event_loop.available_monitors().min_by_key(|monitor| {
+            let size = monitor.size();
+            u64::from(size.width) * u64::from(size.height)
+        })
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    // Raw mouse motion heard since the last drain: what a held cursor moves by,
+    // since its position stops at the window's edge or does not move at all.
+    static RAW_MOTION: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
     // Shared event storage for multi-window support. Events are stored per window_id
@@ -155,29 +277,55 @@ pub(crate) fn push_lifecycle(event: LifecycleEvent) {
 
 #[cfg(any(target_os = "android", test))]
 thread_local! {
-    // The least of the window NativeActivity's content rect has ever left
-    // uncovered at this window height: the navigation bar, where the system
-    // draws one over the window. Reset when the height changes, since a
-    // rotation moves the bar.
-    static ANDROID_RESTING: Cell<(i32, i32)> = const { Cell::new((0, i32::MAX)) };
+    // The least NativeActivity's content rect has left uncovered at each
+    // window height seen: the navigation bar, where the system draws one over
+    // the window. Kept per height, since a rotation moves the bar, and the
+    // height seen last first.
+    static ANDROID_RESTING: RefCell<Vec<(i32, i32)>> = const { RefCell::new(Vec::new()) };
+    // Whether the keyboard was last asked to show.
+    static KEYBOARD_ASKED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The keyboard's share of what the content rect leaves uncovered.
 ///
 /// NativeActivity reports one rect for everything the system covers, keyboard
 /// and navigation bar alike. The bar's share is the smallest cover seen at
-/// this height, so what is left above it is the keyboard.
+/// this height, so what is left above it is the keyboard. A height first seen
+/// with the keyboard asked for, as a rotation while typing is, borrows the
+/// bar's share from the height before it rather than calling it all bar.
+/// Window heights whose bar is remembered: both ways up, each in a split screen.
+#[cfg(any(target_os = "android", test))]
+const ANDROID_HEIGHTS: usize = 4;
+
 #[cfg(any(target_os = "android", test))]
 fn android_keyboard(height: i32, covered: i32) -> f32 {
+    let asked = KEYBOARD_ASKED.with(Cell::get);
     ANDROID_RESTING.with(|resting| {
-        let (at, least) = resting.get();
-        let least = if at == height {
-            least.min(covered)
-        } else {
-            covered
+        let mut resting = resting.borrow_mut();
+        let least = match resting.iter().position(|(at, _)| *at == height) {
+            Some(index) => {
+                let (_, least) = resting.remove(index);
+                least.min(covered)
+            }
+            None if asked => resting.first().map_or(0, |(_, least)| *least).min(covered),
+            None => covered,
         };
-        resting.set((height, least));
+        resting.insert(0, (height, least));
+        resting.truncate(ANDROID_HEIGHTS);
         (covered - least).max(0) as f32
+    })
+}
+
+/// The navigation bar's share of the cover at `height`, as the keyboard's
+/// reading last measured it.
+#[cfg(target_os = "android")]
+fn android_bar(height: i32) -> Option<i32> {
+    ANDROID_RESTING.with(|resting| {
+        resting
+            .borrow()
+            .iter()
+            .find(|(at, _)| *at == height)
+            .map(|(_, least)| *least)
     })
 }
 
@@ -199,7 +347,10 @@ enum PendingEvent {
     KeyState(Key, Action),
     CursorPos(f64, f64),
     Modifiers(ModifiersState),
-    Resize { width: u32, height: u32 },
+    /// The window changed size. The drain asks the window how big it is:
+    /// winit's own figure can be stale, as one taken before a window was shown
+    /// arrives after AppKit shrank it to fit the screen.
+    Resize,
 }
 
 /// Translates one winit window event into the shared pending-event storage,
@@ -211,25 +362,17 @@ enum PendingEvent {
 /// when the batch is drained.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn collect_window_event(window_id: winit::window::WindowId, event: WinitWindowEvent) {
+    access::window_event(window_id, &event);
     let pending_events: Vec<PendingEvent> = match event {
         WinitWindowEvent::CloseRequested => {
             vec![PendingEvent::WindowEvent(WindowEvent::Close)]
         }
-        WinitWindowEvent::Resized(physical_size) => {
-            if physical_size.width > 0 && physical_size.height > 0 {
-                vec![
-                    PendingEvent::Resize {
-                        width: physical_size.width,
-                        height: physical_size.height,
-                    },
-                    PendingEvent::WindowEvent(WindowEvent::FramebufferSize(
-                        physical_size.width,
-                        physical_size.height,
-                    )),
-                ]
-            } else {
-                vec![]
-            }
+        WinitWindowEvent::Resized(_) => vec![PendingEvent::Resize],
+        WinitWindowEvent::CursorEntered { .. } => {
+            vec![PendingEvent::WindowEvent(WindowEvent::CursorEnter(true))]
+        }
+        WinitWindowEvent::CursorLeft { .. } => {
+            vec![PendingEvent::WindowEvent(WindowEvent::CursorEnter(false))]
         }
         WinitWindowEvent::CursorMoved { position, .. } => {
             vec![
@@ -281,7 +424,7 @@ pub(crate) fn collect_window_event(window_id: winit::window::WindowId, event: Wi
         }
         WinitWindowEvent::KeyboardInput { event, .. } => {
             let action = translate_action(event.state);
-            let key = translate_key(event.physical_key);
+            let key = pressed_key(event.physical_key, &event.logical_key);
             translate_keyboard_input(key, action, &event.logical_key, event.text.as_deref())
         }
         WinitWindowEvent::ModifiersChanged(new_modifiers) => {
@@ -294,6 +437,15 @@ pub(crate) fn collect_window_event(window_id: winit::window::WindowId, event: Wi
         // backgrounded app is.
         WinitWindowEvent::Occluded(hidden) => {
             vec![PendingEvent::WindowEvent(WindowEvent::Iconify(hidden))]
+        }
+        WinitWindowEvent::ThemeChanged(theme) => {
+            let dark = theme == winit::window::Theme::Dark;
+            vec![PendingEvent::WindowEvent(WindowEvent::DarkMode(dark))]
+        }
+        WinitWindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+            vec![PendingEvent::WindowEvent(WindowEvent::ScaleFactor(
+                scale_factor,
+            ))]
         }
         WinitWindowEvent::DroppedFile(path) => {
             DROPPED_FILES.with(|dropped| dropped.borrow_mut().push((window_id, path)));
@@ -337,12 +489,19 @@ pub struct WgpuCanvas {
     surface: Option<wgpu::Surface<'static>>,
     surface_config: wgpu::SurfaceConfiguration,
     cursor_pos: Option<(f64, f64)>,
-    key_states: [Action; Key::Unknown as usize + 1],
-    button_states: [Action; MouseButton::Button8 as usize + 1],
+    held: Held,
+    /// Whether a grab holds the cursor, so motion is read raw.
+    cursor_held: std::cell::Cell<bool>,
+    /// Between the system's `Suspended` and `Resumed`: an app in the
+    /// background that keeps rendering is one iOS ends.
+    suspended: bool,
     out_events: Sender<WindowEvent>,
     modifiers_state: ModifiersState,
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    /// Whether an effect reads the depth, which a multisampled one must then be
+    /// a texture for.
+    depth_readable: bool,
     /// Multisampling texture for MSAA (if enabled)
     msaa_texture: Option<wgpu::Texture>,
     msaa_view: Option<wgpu::TextureView>,
@@ -364,6 +523,8 @@ pub struct WgpuCanvas {
     /// Keep closures alive (WASM only)
     #[cfg(target_arch = "wasm32")]
     _event_closures: Vec<wasm_bindgen::JsValue>,
+    /// A screen reader's way in, for a window opened with `accessible`.
+    access: Option<Access>,
 }
 
 impl WgpuCanvas {
@@ -374,6 +535,11 @@ impl WgpuCanvas {
         out_events: Sender<WindowEvent>,
     ) -> Self {
         let canvas_setup = canvas_setup.unwrap_or_default();
+
+        // An adapter has to exist before the window is first shown.
+        let accessible = canvas_setup.accessible && access::AVAILABLE;
+        let shown = window_attrs.visible;
+        let window_attrs = window_attrs.with_visible(shown && !accessible);
 
         // Create the window.
         //
@@ -444,6 +610,12 @@ impl WgpuCanvas {
                         );
                     }
                 }
+
+                #[cfg(not(target_os = "android"))]
+                let window_attrs = {
+                    let monitor = one_turn(event_loop_opt.as_mut().unwrap(), opening_monitor);
+                    fit_to_monitor(window_attrs, monitor)
+                };
 
                 let event_loop = event_loop_opt.as_ref().unwrap();
                 #[allow(deprecated)]
@@ -530,6 +702,15 @@ impl WgpuCanvas {
         };
 
         let window = Arc::new(window);
+        let access = accessible.then(|| Access::attach(&window));
+        if accessible {
+            // In a loop turn, so the resize AppKit reports as it shrinks a
+            // window too big for the screen reaches the canvas.
+            #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+            with_active_loop(|_| window.set_visible(shown));
+            #[cfg(any(target_arch = "wasm32", target_os = "ios", target_os = "android"))]
+            window.set_visible(shown);
+        }
 
         // Check if we already have a context initialized (multi-window case)
         let (surface, surface_format) = if Context::is_initialized() {
@@ -565,6 +746,7 @@ impl WgpuCanvas {
             // connected to another API". Separate instances mean the failed
             // candidate's surface is dropped — and the window disconnected —
             // before the next backend touches it.
+            let asked = web_time::Instant::now();
             let request = |backends| {
                 let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                     backends,
@@ -620,6 +802,7 @@ impl WgpuCanvas {
                 })
                 .await
                 .expect("Failed to create device");
+            Context::note_device_wait(asked.elapsed());
 
             // Get surface capabilities
             // We explicitly prefer non-sRGB formats for consistent behavior across platforms.
@@ -645,8 +828,7 @@ impl WgpuCanvas {
         // Get surface capabilities for alpha mode
         let surface_caps = surface.get_capabilities(&ctxt.adapter);
 
-        // Get the actual window size
-        let size = window.inner_size();
+        let size = drawable_size(&window);
         let width = size.width.max(1);
         let height = size.height.max(1);
 
@@ -689,8 +871,13 @@ impl WgpuCanvas {
         surface.configure(&ctxt.device, &surface_config);
 
         // Create depth texture
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, canvas_setup.samples as u32);
+        let (depth_texture, depth_view) = Self::create_depth_texture(
+            &ctxt.device,
+            width,
+            height,
+            canvas_setup.samples as u32,
+            false,
+        );
 
         // Create MSAA texture if needed
         let sample_count = canvas_setup.samples as u32;
@@ -725,22 +912,21 @@ impl WgpuCanvas {
                     let canvas_clone = canvas.clone();
                     let closure =
                         Closure::<dyn FnMut(_)>::new(move |event: web_sys::PointerEvent| {
-                            // Get coordinates relative to canvas, accounting for CSS scaling
-                            let rect = canvas_clone.get_bounding_client_rect();
-                            let css_x = event.client_x() as f64 - rect.left();
-                            let css_y = event.client_y() as f64 - rect.top();
-
-                            // Scale from CSS pixels to canvas pixels
-                            let scale_x = canvas_clone.width() as f64 / rect.width();
-                            let scale_y = canvas_clone.height() as f64 / rect.height();
-                            let x = css_x * scale_x;
-                            let y = css_y * scale_y;
-
-                            pending.borrow_mut().push(WindowEvent::CursorPos(
-                                x,
-                                y,
-                                event.modifiers(),
-                            ));
+                            let (x, y) = canvas_point(&canvas_clone, &event);
+                            let mut pending = pending.borrow_mut();
+                            pending.push(WindowEvent::CursorPos(x, y, event.modifiers()));
+                            // A locked pointer keeps its place; only the
+                            // movement says where the mouse went.
+                            let locked = web_sys::window()
+                                .and_then(|page| page.document())
+                                .and_then(|document| document.pointer_lock_element())
+                                .is_some();
+                            if locked {
+                                pending.push(WindowEvent::MouseMotion(
+                                    f64::from(event.movement_x()),
+                                    f64::from(event.movement_y()),
+                                ));
+                            }
                         });
                     let _ = canvas.add_event_listener_with_callback(
                         "pointermove",
@@ -752,12 +938,20 @@ impl WgpuCanvas {
                 // Pointer down
                 {
                     let pending = pending_events.clone();
+                    let canvas_clone = canvas.clone();
                     let closure =
                         Closure::<dyn FnMut(_)>::new(move |event: web_sys::PointerEvent| {
                             // Only handle mouse pointer type (not touch - that's handled separately)
                             if event.pointer_type() == "mouse" {
                                 let button = translate_web_mouse_button(event.button());
-                                pending.borrow_mut().push(WindowEvent::MouseButton(
+                                let (x, y) = canvas_point(&canvas_clone, &event);
+                                // The release then arrives here even off the canvas.
+                                let _ = canvas_clone.set_pointer_capture(event.pointer_id());
+                                let mut pending = pending.borrow_mut();
+                                // Where the press happened, which no move may
+                                // have reported: a tap that never moved.
+                                pending.push(WindowEvent::CursorPos(x, y, event.modifiers()));
+                                pending.push(WindowEvent::MouseButton(
                                     button,
                                     Action::Press,
                                     event.modifiers(),
@@ -774,12 +968,16 @@ impl WgpuCanvas {
                 // Pointer up
                 {
                     let pending = pending_events.clone();
+                    let canvas_clone = canvas.clone();
                     let closure =
                         Closure::<dyn FnMut(_)>::new(move |event: web_sys::PointerEvent| {
                             // Only handle mouse pointer type (not touch - that's handled separately)
                             if event.pointer_type() == "mouse" {
                                 let button = translate_web_mouse_button(event.button());
-                                pending.borrow_mut().push(WindowEvent::MouseButton(
+                                let (x, y) = canvas_point(&canvas_clone, &event);
+                                let mut pending = pending.borrow_mut();
+                                pending.push(WindowEvent::CursorPos(x, y, event.modifiers()));
+                                pending.push(WindowEvent::MouseButton(
                                     button,
                                     Action::Release,
                                     event.modifiers(),
@@ -837,9 +1035,15 @@ impl WgpuCanvas {
                     closures.push(closure.into_js_value());
                 }
 
-                // Touch events
-                {
+                // Touch, in the same canvas pixels as the pointer.
+                for (name, action) in [
+                    ("touchstart", TouchAction::Start),
+                    ("touchmove", TouchAction::Move),
+                    ("touchend", TouchAction::End),
+                    ("touchcancel", TouchAction::Cancel),
+                ] {
                     let pending = pending_events.clone();
+                    let canvas_clone = canvas.clone();
                     let closure =
                         Closure::<dyn FnMut(_)>::new(move |event: web_sys::TouchEvent| {
                             event.prevent_default();
@@ -847,98 +1051,35 @@ impl WgpuCanvas {
                             let touches = event.changed_touches();
                             for i in 0..touches.length() {
                                 if let Some(touch) = touches.get(i) {
+                                    let (x, y) = canvas_point_at(
+                                        &canvas_clone,
+                                        f64::from(touch.client_x()),
+                                        f64::from(touch.client_y()),
+                                    );
                                     pending.borrow_mut().push(WindowEvent::Touch(
                                         touch.identifier() as u64,
-                                        touch.client_x() as f64,
-                                        touch.client_y() as f64,
-                                        TouchAction::Start,
+                                        x,
+                                        y,
+                                        action,
                                         modifiers,
                                     ));
                                 }
                             }
                         });
-                    let _ = canvas.add_event_listener_with_callback(
-                        "touchstart",
-                        closure.as_ref().unchecked_ref(),
-                    );
+                    let _ = canvas
+                        .add_event_listener_with_callback(name, closure.as_ref().unchecked_ref());
                     closures.push(closure.into_js_value());
                 }
 
-                {
+                // The pointer leaving the canvas ends hover, as `CursorLeft` does.
+                for (name, inside) in [("pointerenter", true), ("pointerleave", false)] {
                     let pending = pending_events.clone();
                     let closure =
-                        Closure::<dyn FnMut(_)>::new(move |event: web_sys::TouchEvent| {
-                            event.prevent_default();
-                            let modifiers = event.modifiers();
-                            let touches = event.changed_touches();
-                            for i in 0..touches.length() {
-                                if let Some(touch) = touches.get(i) {
-                                    pending.borrow_mut().push(WindowEvent::Touch(
-                                        touch.identifier() as u64,
-                                        touch.client_x() as f64,
-                                        touch.client_y() as f64,
-                                        TouchAction::Move,
-                                        modifiers,
-                                    ));
-                                }
-                            }
+                        Closure::<dyn FnMut(_)>::new(move |_event: web_sys::PointerEvent| {
+                            pending.borrow_mut().push(WindowEvent::CursorEnter(inside));
                         });
-                    let _ = canvas.add_event_listener_with_callback(
-                        "touchmove",
-                        closure.as_ref().unchecked_ref(),
-                    );
-                    closures.push(closure.into_js_value());
-                }
-
-                {
-                    let pending = pending_events.clone();
-                    let closure =
-                        Closure::<dyn FnMut(_)>::new(move |event: web_sys::TouchEvent| {
-                            event.prevent_default();
-                            let modifiers = event.modifiers();
-                            let touches = event.changed_touches();
-                            for i in 0..touches.length() {
-                                if let Some(touch) = touches.get(i) {
-                                    pending.borrow_mut().push(WindowEvent::Touch(
-                                        touch.identifier() as u64,
-                                        touch.client_x() as f64,
-                                        touch.client_y() as f64,
-                                        TouchAction::End,
-                                        modifiers,
-                                    ));
-                                }
-                            }
-                        });
-                    let _ = canvas.add_event_listener_with_callback(
-                        "touchend",
-                        closure.as_ref().unchecked_ref(),
-                    );
-                    closures.push(closure.into_js_value());
-                }
-
-                {
-                    let pending = pending_events.clone();
-                    let closure =
-                        Closure::<dyn FnMut(_)>::new(move |event: web_sys::TouchEvent| {
-                            event.prevent_default();
-                            let modifiers = event.modifiers();
-                            let touches = event.changed_touches();
-                            for i in 0..touches.length() {
-                                if let Some(touch) = touches.get(i) {
-                                    pending.borrow_mut().push(WindowEvent::Touch(
-                                        touch.identifier() as u64,
-                                        touch.client_x() as f64,
-                                        touch.client_y() as f64,
-                                        TouchAction::Cancel,
-                                        modifiers,
-                                    ));
-                                }
-                            }
-                        });
-                    let _ = canvas.add_event_listener_with_callback(
-                        "touchcancel",
-                        closure.as_ref().unchecked_ref(),
-                    );
+                    let _ = canvas
+                        .add_event_listener_with_callback(name, closure.as_ref().unchecked_ref());
                     closures.push(closure.into_js_value());
                 }
             }
@@ -969,12 +1110,9 @@ impl WgpuCanvas {
                         });
                     }
                     // Emit a Char event for single-character (printable) keys so
-                    // egui text fields receive text input. Skip when a command
-                    // modifier is held so shortcuts (e.g. Ctrl+A) don't insert text,
-                    // mirroring the native path which relies on winit's `text` field.
-                    let command = Modifiers::Control | Modifiers::Super;
+                    // egui text fields receive text input.
                     let key_string = event.key();
-                    if !modifiers.intersects(command) && key_string.chars().count() == 1 {
+                    if !is_shortcut(modifiers) && key_string.chars().count() == 1 {
                         if let Some(ch) = key_string.chars().next() {
                             pending.borrow_mut().push(WindowEvent::Char(ch));
                         }
@@ -1007,6 +1145,21 @@ impl WgpuCanvas {
                 closures.push(closure.into_js_value());
             }
 
+            // A key or button let go while the page is not focused sends no
+            // release here, so losing focus lets go of everything held.
+            for (name, focused) in [("blur", false), ("focus", true)] {
+                let pending = pending_events.clone();
+                let closure = Closure::<dyn FnMut(_)>::new(move |_event: web_sys::Event| {
+                    if !focused {
+                        SUPER_HELD_KEYS.with(|held| held.take());
+                    }
+                    pending.borrow_mut().push(WindowEvent::Focus(focused));
+                });
+                let _ = web_window
+                    .add_event_listener_with_callback(name, closure.as_ref().unchecked_ref());
+                closures.push(closure.into_js_value());
+            }
+
             (pending_events, closures)
         };
 
@@ -1014,18 +1167,21 @@ impl WgpuCanvas {
         let window_id = window.id();
 
         WgpuCanvas {
+            access,
             window: Some(window),
             #[cfg(not(target_arch = "wasm32"))]
             window_id: Some(window_id),
             surface: Some(surface),
             surface_config,
             cursor_pos: None,
-            key_states: [Action::Release; Key::Unknown as usize + 1],
-            button_states: [Action::Release; MouseButton::Button8 as usize + 1],
+            held: Held::default(),
+            cursor_held: std::cell::Cell::new(false),
+            suspended: false,
             out_events,
             modifiers_state: ModifiersState::default(),
             depth_texture,
             depth_view,
+            depth_readable: false,
             msaa_texture,
             msaa_view,
             sample_count,
@@ -1056,6 +1212,7 @@ impl WgpuCanvas {
         let surface_format = if Context::is_initialized() {
             Context::get().surface_format
         } else {
+            let asked = web_time::Instant::now();
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::all(),
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -1097,6 +1254,7 @@ impl WgpuCanvas {
                 })
                 .await
                 .expect("Failed to create device");
+            Context::note_device_wait(asked.elapsed());
 
             // No surface to query for a preferred format; pick a widely
             // supported non-sRGB format (gamma is handled in shaders).
@@ -1122,7 +1280,7 @@ impl WgpuCanvas {
         };
 
         let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, sample_count);
+            Self::create_depth_texture(&ctxt.device, width, height, sample_count, false);
         let (msaa_texture, msaa_view) = if sample_count > 1 {
             let (tex, view) = Self::create_msaa_texture(
                 &ctxt.device,
@@ -1138,18 +1296,21 @@ impl WgpuCanvas {
         let readback_texture = std::cell::RefCell::new(None);
 
         WgpuCanvas {
+            access: None,
             window: None,
             #[cfg(not(target_arch = "wasm32"))]
             window_id: None,
             surface: None,
             surface_config,
             cursor_pos: None,
-            key_states: [Action::Release; Key::Unknown as usize + 1],
-            button_states: [Action::Release; MouseButton::Button8 as usize + 1],
+            held: Held::default(),
+            cursor_held: std::cell::Cell::new(false),
+            suspended: false,
             out_events,
             modifiers_state: ModifiersState::default(),
             depth_texture,
             depth_view,
+            depth_readable: false,
             msaa_texture,
             msaa_view,
             sample_count,
@@ -1193,6 +1354,23 @@ impl WgpuCanvas {
         }
     }
 
+    /// Brings the surface to the size the window has now, read from the
+    /// window rather than from an event, and tells the app. Whether it changed.
+    fn fit_to_window(&mut self) -> bool {
+        let Some(size) = self.window.as_deref().map(drawable_size) else {
+            return false;
+        };
+        let current = (self.surface_config.width, self.surface_config.height);
+        if size.width == 0 || size.height == 0 || (size.width, size.height) == current {
+            return false;
+        }
+        self.resize(size.width, size.height);
+        let _ = self
+            .out_events
+            .send(WindowEvent::FramebufferSize(size.width, size.height));
+        true
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         let width = width.max(1);
         let height = height.max(1);
@@ -1207,8 +1385,13 @@ impl WgpuCanvas {
             surface.configure(&ctxt.device, &self.surface_config);
         }
 
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, self.sample_count);
+        let (depth_texture, depth_view) = Self::create_depth_texture(
+            &ctxt.device,
+            width,
+            height,
+            self.sample_count,
+            self.depth_readable,
+        );
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
 
@@ -1226,6 +1409,27 @@ impl WgpuCanvas {
 
         // Dropped, not rebuilt: the next capture makes one at the new size.
         self.readback_texture.replace(None);
+    }
+
+    /// Make the depth buffer one an effect can read, or stop; a multisampled
+    /// one is rebuilt to match.
+    pub(crate) fn set_depth_readable(&mut self, readable: bool) {
+        if self.depth_readable == readable {
+            return;
+        }
+        self.depth_readable = readable;
+        if self.sample_count > 1 {
+            let ctxt = Context::get();
+            let (depth_texture, depth_view) = Self::create_depth_texture(
+                &ctxt.device,
+                self.surface_config.width.max(1),
+                self.surface_config.height.max(1),
+                self.sample_count,
+                readable,
+            );
+            self.depth_texture = depth_texture;
+            self.depth_view = depth_view;
+        }
     }
 
     /// Changes the MSAA sample count, recreating the size-dependent attachments
@@ -1246,8 +1450,13 @@ impl WgpuCanvas {
         let width = self.surface_config.width.max(1);
         let height = self.surface_config.height.max(1);
 
-        let (depth_texture, depth_view) =
-            Self::create_depth_texture(&ctxt.device, width, height, sample_count);
+        let (depth_texture, depth_view) = Self::create_depth_texture(
+            &ctxt.device,
+            width,
+            height,
+            sample_count,
+            self.depth_readable,
+        );
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
 
@@ -1273,8 +1482,16 @@ impl WgpuCanvas {
         width: u32,
         height: u32,
         sample_count: u32,
+        readable: bool,
     ) -> (wgpu::Texture, wgpu::TextureView) {
         let sample_count = sample_count.max(1);
+        // A multisampled depth is a texture only while an effect reads it: GLES
+        // makes it a multisampled texture then, which some drivers cannot attach.
+        let usage = if sample_count == 1 || readable {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        };
         // Ensure minimum dimensions of 1x1 to avoid wgpu validation errors
         let width = width.max(1);
         let height = height.max(1);
@@ -1289,7 +1506,7 @@ impl WgpuCanvas {
             sample_count,
             dimension: wgpu::TextureDimension::D2,
             format: Context::depth_format(),
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1365,9 +1582,9 @@ impl WgpuCanvas {
         })
     }
 
-    /// Polls events from the window system.
-    pub fn poll_events(&mut self) {
-        self.pump_events(Some(std::time::Duration::ZERO));
+    /// Polls events from the window system. Answers whether any arrived.
+    pub fn poll_events(&mut self) -> bool {
+        self.pump_events(Some(std::time::Duration::ZERO))
     }
 
     /// Blocks until the window system has an event, a [`Waker`] wakes it, or
@@ -1381,13 +1598,26 @@ impl WgpuCanvas {
     /// Something that ends a [`Self::wait_events`] from another thread.
     /// `None` where the loop is not kiss3d's to pump.
     pub fn waker(&self) -> Option<Waker> {
-        #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
-        {
-            EVENT_LOOP.with(|cell| cell.borrow().as_ref().map(|el| Waker(el.create_proxy())))
-        }
-        #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
-        {
-            None
+        loop_waker()
+    }
+
+    /// What a screen reader asked since the last call.
+    #[cfg(feature = "egui")]
+    pub fn take_access_events(&self) -> Vec<crate::window::AccessEvent> {
+        self.access
+            .as_ref()
+            .map_or_else(Vec::new, Access::take_events)
+    }
+
+    /// Hand a screen reader what changed. The platform drops it while none has
+    /// asked; the first update after [`AccessEvent::Activated`] has to be the
+    /// whole tree.
+    ///
+    /// [`AccessEvent::Activated`]: crate::window::AccessEvent::Activated
+    #[cfg(feature = "egui")]
+    pub fn update_access(&self, update: egui::accesskit::TreeUpdate) {
+        if let Some(access) = &self.access {
+            access.update(update);
         }
     }
 
@@ -1449,6 +1679,20 @@ impl WgpuCanvas {
                     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
                         self.arrived = true;
                     }
+
+                    fn device_event(
+                        &mut self,
+                        _event_loop: &ActiveEventLoop,
+                        _device_id: winit::event::DeviceId,
+                        event: winit::event::DeviceEvent,
+                    ) {
+                        if let winit::event::DeviceEvent::MouseMotion { delta } = event {
+                            RAW_MOTION.with(|motion| {
+                                let (x, y) = motion.get();
+                                motion.set((x + delta.0, y + delta.1));
+                            });
+                        }
+                    }
                 }
 
                 EVENT_LOOP.with(|event_loop_cell| {
@@ -1469,6 +1713,11 @@ impl WgpuCanvas {
                 let lifecycle: Vec<LifecycleEvent> =
                     LIFECYCLE_EVENTS.with(|events| events.borrow_mut().drain(..).collect());
                 for event in lifecycle {
+                    match event {
+                        LifecycleEvent::Suspended => self.suspended = true,
+                        LifecycleEvent::Resumed => self.suspended = false,
+                        LifecycleEvent::LowMemory => {}
+                    }
                     let _ = self.out_events.send(match event {
                         LifecycleEvent::LowMemory => WindowEvent::LowMemory,
                         LifecycleEvent::Suspended => WindowEvent::Iconify(true),
@@ -1488,12 +1737,12 @@ impl WgpuCanvas {
                                         .instance
                                         .create_surface(window.clone())
                                         .expect("Failed to recreate surface after resume");
-                                    let size = window.inner_size();
-                                    self.surface_config.width = size.width.max(1);
-                                    self.surface_config.height = size.height.max(1);
                                     surface.configure(&ctxt.device, &self.surface_config);
                                     self.surface = Some(surface);
                                 }
+                                // A rotation while away changed the size, and the
+                                // depth and MSAA targets have to follow it too.
+                                self.fit_to_window();
                             }
                         }
                     }
@@ -1536,17 +1785,20 @@ impl WgpuCanvas {
             for event in events {
                 match event {
                     PendingEvent::WindowEvent(we) => {
+                        self.note(&we);
                         // Winit reports modifiers separately from the events they apply to,
                         // so the mask is stamped in here, once the preceding
                         // `PendingEvent::Modifiers` of this batch have been applied.
                         let modifiers = translate_modifiers(self.modifiers_state);
-                        let _ = self.out_events.send(we.with_modifiers(modifiers));
+                        if let Some(we) = stamped(we, modifiers) {
+                            let _ = self.out_events.send(we);
+                        }
                     }
                     PendingEvent::ButtonState(button, action) => {
-                        self.button_states[button as usize] = action;
+                        self.held.set_button(button, action);
                     }
                     PendingEvent::KeyState(key, action) => {
-                        self.key_states[key as usize] = action;
+                        self.held.set_key(key, action);
                     }
                     PendingEvent::CursorPos(x, y) => {
                         self.cursor_pos = Some((x, y));
@@ -1554,98 +1806,29 @@ impl WgpuCanvas {
                     PendingEvent::Modifiers(m) => {
                         self.modifiers_state = m;
                     }
-                    PendingEvent::Resize { width, height } => {
-                        let ctxt = Context::get();
-
-                        // Resize surface
-                        self.surface_config.width = width;
-                        self.surface_config.height = height;
-                        if let Some(surface) = &self.surface {
-                            surface.configure(&ctxt.device, &self.surface_config);
-                        }
-
-                        // Recreate depth texture
-                        let (new_depth, new_depth_view) = Self::create_depth_texture(
-                            &ctxt.device,
-                            width,
-                            height,
-                            self.sample_count,
-                        );
-                        self.depth_texture = new_depth;
-                        self.depth_view = new_depth_view;
-
-                        // Recreate MSAA texture if needed
-                        if self.sample_count > 1 {
-                            let (new_msaa, new_msaa_view) = Self::create_msaa_texture(
-                                &ctxt.device,
-                                width,
-                                height,
-                                self.surface_config.format,
-                                self.sample_count,
-                            );
-                            self.msaa_texture = Some(new_msaa);
-                            self.msaa_view = Some(new_msaa_view);
-                        }
-
-                        // Dropped, not rebuilt: the next capture makes one
-                        // at the new size.
-                        self.readback_texture.replace(None);
+                    PendingEvent::Resize => {
+                        self.fit_to_window();
                     }
                 }
             }
+
+            let motion = RAW_MOTION.with(|motion| motion.replace((0.0, 0.0)));
+            if self.cursor_held.get() && motion != (0.0, 0.0) {
+                let _ = self
+                    .out_events
+                    .send(WindowEvent::MouseMotion(motion.0, motion.1));
+                arrived = true;
+            }
+        }
+
+        // A browser has no pump: it reports a canvas late, so every poll looks.
+        #[cfg(target_arch = "wasm32")]
+        {
+            arrived |= self.fit_to_window();
         }
 
         #[cfg(target_arch = "wasm32")]
         {
-            // Check for resize - compare current window size to surface config
-            let current_size = self.window.as_ref().unwrap().inner_size();
-            if current_size.width > 0
-                && current_size.height > 0
-                && (current_size.width != self.surface_config.width
-                    || current_size.height != self.surface_config.height)
-            {
-                let ctxt = Context::get();
-
-                // Resize surface
-                self.surface_config.width = current_size.width;
-                self.surface_config.height = current_size.height;
-                if let Some(surface) = &self.surface {
-                    surface.configure(&ctxt.device, &self.surface_config);
-                }
-
-                // Recreate depth texture
-                let (new_depth, new_depth_view) = Self::create_depth_texture(
-                    &ctxt.device,
-                    current_size.width,
-                    current_size.height,
-                    self.sample_count,
-                );
-                self.depth_texture = new_depth;
-                self.depth_view = new_depth_view;
-
-                // Recreate MSAA texture if needed
-                if self.sample_count > 1 {
-                    let (new_msaa, new_msaa_view) = Self::create_msaa_texture(
-                        &ctxt.device,
-                        current_size.width,
-                        current_size.height,
-                        self.surface_config.format,
-                        self.sample_count,
-                    );
-                    self.msaa_texture = Some(new_msaa);
-                    self.msaa_view = Some(new_msaa_view);
-                }
-
-                // Dropped, not rebuilt: the next capture makes one at the
-                // new size.
-                self.readback_texture.replace(None);
-
-                let _ = self.out_events.send(WindowEvent::FramebufferSize(
-                    current_size.width,
-                    current_size.height,
-                ));
-            }
-
             // Process pending events from web callbacks
             let events: Vec<WindowEvent> = self.pending_events.borrow_mut().drain(..).collect();
             arrived |= !events.is_empty();
@@ -1655,12 +1838,12 @@ impl WgpuCanvas {
                         self.cursor_pos = Some((*x, *y));
                     }
                     WindowEvent::MouseButton(button, action, _) => {
-                        self.button_states[*button as usize] = *action;
+                        self.held.set_button(*button, *action);
                     }
                     WindowEvent::Key(key, action, _) => {
-                        self.key_states[*key as usize] = *action;
+                        self.held.set_key(*key, *action);
                     }
-                    _ => {}
+                    other => self.note(other),
                 }
                 let _ = self.out_events.send(event);
             }
@@ -1669,13 +1852,19 @@ impl WgpuCanvas {
     }
 
     /// Gets the current surface texture for rendering.
-    pub fn get_current_texture(&self) -> Option<wgpu::SurfaceTexture> {
+    pub fn get_current_texture(&mut self) -> Option<wgpu::SurfaceTexture> {
+        if self.suspended {
+            return None;
+        }
         let surface = self.surface.as_ref()?;
         match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                // Reconfigure and retry once
+                // The window may have changed size with no event saying so:
+                // take its size before reconfiguring, then retry once.
+                self.fit_to_window();
+                let surface = self.surface.as_ref()?;
                 let ctxt = Context::get();
                 surface.configure(&ctxt.device, &self.surface_config);
                 match surface.get_current_texture() {
@@ -1949,6 +2138,18 @@ impl WgpuCanvas {
             .map_or(1.0, |window| window.scale_factor())
     }
 
+    /// The refresh rate of the display the window is on, in hertz, where the
+    /// system says.
+    pub fn refresh_rate(&self) -> Option<f32> {
+        let millihertz = self
+            .window
+            .as_ref()?
+            .current_monitor()?
+            .refresh_rate_millihertz()?;
+        #[allow(clippy::cast_precision_loss)]
+        Some(millihertz as f32 / 1000.0)
+    }
+
     /// Set the window title.
     pub fn set_title(&mut self, title: &str) {
         if let Some(window) = &self.window {
@@ -1979,6 +2180,7 @@ impl WgpuCanvas {
     pub fn set_keyboard_visible(&self, visible: bool) {
         #[cfg(target_os = "android")]
         {
+            KEYBOARD_ASKED.with(|asked| asked.set(visible));
             ANDROID_APP.with(|app| {
                 if let Some(app) = &*app.borrow() {
                     if visible {
@@ -1999,10 +2201,23 @@ impl WgpuCanvas {
 
     /// Enter or leave borderless fullscreen on the current monitor.
     pub fn set_fullscreen(&self, fullscreen: bool) {
-        if let Some(window) = &self.window {
-            let mode = fullscreen.then(|| winit::window::Fullscreen::Borderless(None));
+        self.change_window(|window| {
+            let mode = fullscreen.then_some(winit::window::Fullscreen::Borderless(None));
             window.set_fullscreen(mode);
-        }
+        });
+    }
+
+    /// Run `change` on the window inside a turn of its event loop where kiss3d
+    /// pumps one: winit on macOS drops an event raised while no handler is set,
+    /// and a resize or a focus change raised between pumps would be lost.
+    fn change_window(&self, change: impl FnOnce(&Window)) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+        with_active_loop(|_| change(window));
+        #[cfg(any(target_arch = "wasm32", target_os = "ios", target_os = "android"))]
+        change(window);
     }
 
     /// Enter exclusive fullscreen on the current monitor, in its largest
@@ -2010,33 +2225,38 @@ impl WgpuCanvas {
     /// Falls back to borderless where the platform offers no video modes, as
     /// the web does.
     pub fn set_exclusive_fullscreen(&self, exclusive: bool) {
-        let Some(window) = &self.window else {
-            return;
-        };
-        if !exclusive {
-            window.set_fullscreen(None);
-            return;
-        }
-        let mode = window.current_monitor().and_then(|monitor| {
-            monitor.video_modes().max_by_key(|mode| {
-                let size = mode.size();
-                (
-                    u64::from(size.width) * u64::from(size.height),
-                    mode.refresh_rate_millihertz(),
-                )
-            })
+        self.change_window(|window| {
+            if exclusive {
+                window.set_fullscreen(Some(exclusive_mode(window)));
+            } else {
+                window.set_fullscreen(None);
+            }
         });
-        window.set_fullscreen(Some(match mode {
-            Some(mode) => winit::window::Fullscreen::Exclusive(mode),
-            None => winit::window::Fullscreen::Borderless(None),
-        }));
     }
+}
 
+/// The current monitor's largest video mode at its highest refresh rate, or
+/// borderless where the platform offers no video modes, as the web does.
+fn exclusive_mode(window: &Window) -> winit::window::Fullscreen {
+    let mode = window.current_monitor().and_then(|monitor| {
+        monitor.video_modes().max_by_key(|mode| {
+            let size = mode.size();
+            (
+                u64::from(size.width) * u64::from(size.height),
+                mode.refresh_rate_millihertz(),
+            )
+        })
+    });
+    match mode {
+        Some(mode) => winit::window::Fullscreen::Exclusive(mode),
+        None => winit::window::Fullscreen::Borderless(None),
+    }
+}
+
+impl WgpuCanvas {
     /// Maximize the window, or restore it.
     pub fn set_maximized(&self, maximized: bool) {
-        if let Some(window) = &self.window {
-            window.set_maximized(maximized);
-        }
+        self.change_window(|window| window.set_maximized(maximized));
     }
 
     /// Whether the window is currently maximized.
@@ -2102,11 +2322,30 @@ impl WgpuCanvas {
         }
     }
 
-    /// Let the platform compose text through its input method.
+    /// Let the platform compose text through its input method. Not on Android
+    /// or iOS, where winit's switch is the on-screen keyboard itself (on iOS
+    /// it makes winit's `UIKeyInput` view first responder), which
+    /// [`set_keyboard_visible`](Self::set_keyboard_visible) shows with focus.
     pub fn set_ime_allowed(&self, allowed: bool) {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(window) = &self.window {
             window.set_ime_allowed(allowed);
         }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let _ = allowed;
+    }
+
+    /// The window's width and height and NativeActivity's content rect,
+    /// `[left, top, right, bottom]`, in pixels.
+    #[cfg(target_os = "android")]
+    fn android_content(&self) -> Option<(i32, i32, [i32; 4])> {
+        let size = self.window.as_ref()?.inner_size();
+        let content = ANDROID_APP.with(|app| app.borrow().as_ref().map(|a| a.content_rect()))?;
+        Some((
+            size.width as i32,
+            size.height as i32,
+            [content.left, content.top, content.right, content.bottom],
+        ))
     }
 
     /// How many pixels of the window the on-screen keyboard covers, from the
@@ -2114,16 +2353,10 @@ impl WgpuCanvas {
     pub fn keyboard_height(&self) -> f32 {
         #[cfg(target_os = "android")]
         {
-            let Some(window) = &self.window else {
+            let Some((_, height, [_, _, _, bottom])) = self.android_content() else {
                 return 0.0;
             };
-            let height = window.inner_size().height as i32;
-            let Some(content) =
-                ANDROID_APP.with(|app| app.borrow().as_ref().map(|a| a.content_rect()))
-            else {
-                return 0.0;
-            };
-            android_keyboard(height, height - content.bottom)
+            android_keyboard(height, height - bottom)
         }
         #[cfg(target_os = "ios")]
         {
@@ -2138,8 +2371,20 @@ impl WgpuCanvas {
         }
     }
 
-    /// `[left, top, right, bottom]` insets in pixels; zero everywhere but iOS.
+    /// `[left, top, right, bottom]` insets in pixels; zero on a desktop and
+    /// the web.
     pub fn safe_area(&self) -> [f32; 4] {
+        // What the content rect leaves uncovered, the bar's share alone at the
+        // bottom: the keyboard is `keyboard_height`'s.
+        #[cfg(target_os = "android")]
+        {
+            let Some((width, height, [left, top, right, bottom])) = self.android_content() else {
+                return [0.0; 4];
+            };
+            let covered = height - bottom;
+            let bar = android_bar(height).unwrap_or(covered).min(covered);
+            [left, top, width - right, bar].map(|inset| inset.max(0) as f32)
+        }
         #[cfg(target_os = "ios")]
         {
             let Some(window) = &self.window else {
@@ -2148,7 +2393,7 @@ impl WgpuCanvas {
             let scale = window.scale_factor();
             super::ios::safe_area(window).map(|points| (points * scale) as f32)
         }
-        #[cfg(not(target_os = "ios"))]
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
             [0.0; 4]
         }
@@ -2167,16 +2412,40 @@ impl WgpuCanvas {
         }
     }
 
-    /// Set the cursor grabbing behaviour.
+    /// Hold the cursor for mouse-look: kept inside the window where the
+    /// system allows that, else locked in place (macOS, the web). While it is
+    /// held the mouse's raw motion arrives as [`WindowEvent::MouseMotion`],
+    /// which keeps counting at the window's edge.
     pub fn set_cursor_grab(&self, grab: bool) {
         use winit::window::CursorGrabMode;
-        let mode = if grab {
-            CursorGrabMode::Confined
-        } else {
-            CursorGrabMode::None
+        let Some(window) = &self.window else {
+            return;
         };
+        let held = if grab {
+            window
+                .set_cursor_grab(CursorGrabMode::Confined)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked))
+                .is_ok()
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            false
+        };
+        self.cursor_held.set(held);
+    }
+
+    /// Whether a grab holds the cursor, so its motion arrives raw.
+    pub fn is_cursor_held(&self) -> bool {
+        self.cursor_held.get()
+    }
+
+    /// Where the text being composed sits, in physical pixels, so the system's
+    /// candidate window opens beside it rather than in a corner.
+    pub fn set_ime_cursor_area(&self, x: f64, y: f64, width: f64, height: f64) {
         if let Some(window) = &self.window {
-            let _ = window.set_cursor_grab(mode);
+            window.set_ime_cursor_area(
+                winit::dpi::PhysicalPosition::new(x, y),
+                winit::dpi::PhysicalSize::new(width, height),
+            );
         }
     }
 
@@ -2203,26 +2472,93 @@ impl WgpuCanvas {
 
     /// Hide the window.
     pub fn hide(&mut self) {
-        if let Some(window) = &self.window {
-            window.set_visible(false);
-        }
+        self.change_window(|window| window.set_visible(false));
     }
 
     /// Show the window.
     pub fn show(&mut self) {
-        if let Some(window) = &self.window {
-            window.set_visible(true);
-        }
+        self.change_window(|window| window.set_visible(true));
     }
 
     /// The state of a mouse button.
     pub fn get_mouse_button(&self, button: MouseButton) -> Action {
-        self.button_states[button as usize]
+        self.held.button(button)
     }
 
     /// The state of a key.
     pub fn get_key(&self, key: Key) -> Action {
-        self.key_states[key as usize]
+        self.held.key(key)
+    }
+
+    /// What an event changes in what the canvas holds besides keys and
+    /// buttons: losing focus lets go of everything, a pointer outside has no
+    /// position.
+    fn note(&mut self, event: &WindowEvent) {
+        match event {
+            WindowEvent::Focus(false) => self.let_go(),
+            WindowEvent::CursorEnter(false) => self.cursor_pos = None,
+            _ => {}
+        }
+    }
+
+    /// Releases everything still held, which no event will once the window
+    /// has lost focus: winit sends no releases on macOS, Wayland or the web.
+    fn let_go(&mut self) {
+        self.modifiers_state = ModifiersState::default();
+        for release in self.held.let_go() {
+            let _ = self.out_events.send(release);
+        }
+    }
+}
+
+/// The keys and mouse buttons held down, as their events left them.
+#[derive(Default)]
+struct Held {
+    keys: BTreeSet<Key>,
+    buttons: BTreeSet<MouseButton>,
+}
+
+fn held_state<T: Ord>(held: &BTreeSet<T>, item: &T) -> Action {
+    if held.contains(item) {
+        Action::Press
+    } else {
+        Action::Release
+    }
+}
+
+fn hold<T: Ord>(held: &mut BTreeSet<T>, item: T, action: Action) {
+    match action {
+        Action::Press => held.insert(item),
+        Action::Release => held.remove(&item),
+    };
+}
+
+impl Held {
+    fn key(&self, key: Key) -> Action {
+        held_state(&self.keys, &key)
+    }
+
+    fn button(&self, button: MouseButton) -> Action {
+        held_state(&self.buttons, &button)
+    }
+
+    fn set_key(&mut self, key: Key, action: Action) {
+        hold(&mut self.keys, key, action);
+    }
+
+    fn set_button(&mut self, button: MouseButton, action: Action) {
+        hold(&mut self.buttons, button, action);
+    }
+
+    /// A release for each thing held, leaving nothing held.
+    fn let_go(&mut self) -> Vec<WindowEvent> {
+        let buttons = std::mem::take(&mut self.buttons)
+            .into_iter()
+            .map(|button| WindowEvent::MouseButton(button, Action::Release, Modifiers::empty()));
+        let keys = std::mem::take(&mut self.keys)
+            .into_iter()
+            .map(|key| WindowEvent::Key(key, Action::Release, Modifiers::empty()));
+        buttons.chain(keys).collect()
     }
 }
 
@@ -2243,10 +2579,9 @@ fn translate_keyboard_input(
     ];
 
     if action == Action::Press {
-        // Prefer winit's `text` field: it is `None` when the keypress shouldn't
-        // produce text (e.g. Ctrl+A), so it naturally suppresses unwanted text
-        // input from shortcuts. Fall back to the logical key's character form
-        // for platforms or events where `text` is not populated.
+        // Prefer winit's `text` field, falling back to the logical key's
+        // character form where it is not populated. A shortcut's letter is
+        // dropped by `stamped`, once the modifiers are known.
         let chars = text.or_else(|| match logical_key {
             winit::keyboard::Key::Character(s) => Some(s.as_str()),
             _ => None,
@@ -2259,6 +2594,22 @@ fn translate_keyboard_input(
     }
 
     events
+}
+
+/// Whether a key pressed under `modifiers` is a shortcut, whose letter is not
+/// typed. winit has already taken AltGr out of Control on Windows.
+fn is_shortcut(modifiers: Modifiers) -> bool {
+    modifiers.intersects(Modifiers::Control | Modifiers::Super)
+}
+
+/// `event` as it leaves under `modifiers`, or nothing for a shortcut's letter:
+/// on macOS winit's `text` still holds the `c` of ⌘C.
+#[cfg(not(target_arch = "wasm32"))]
+fn stamped(event: WindowEvent, modifiers: Modifiers) -> Option<WindowEvent> {
+    if matches!(event, WindowEvent::Char(_)) && is_shortcut(modifiers) {
+        return None;
+    }
+    Some(event.with_modifiers(modifiers))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2297,6 +2648,23 @@ fn translate_mouse_button(button: winit::event::MouseButton) -> MouseButton {
         winit::event::MouseButton::Back => MouseButton::Button4,
         winit::event::MouseButton::Forward => MouseButton::Button5,
         winit::event::MouseButton::Other(_) => MouseButton::Button6,
+    }
+}
+
+/// The key a press names: its place on the keyboard, or what it means where
+/// the platform gives it no place. Android's Back has no physical code;
+/// winit names it only as the logical `BrowserBack`, and a script waiting for
+/// the back key would otherwise never hear it.
+#[cfg(not(target_arch = "wasm32"))]
+fn pressed_key(physical_key: PhysicalKey, logical_key: &winit::keyboard::Key) -> Key {
+    use winit::keyboard::{Key as WinitKey, NamedKey};
+    match translate_key(physical_key) {
+        Key::Unknown => match logical_key {
+            WinitKey::Named(NamedKey::BrowserBack) => Key::NavigateBackward,
+            WinitKey::Named(NamedKey::BrowserForward) => Key::NavigateForward,
+            _ => Key::Unknown,
+        },
+        key => key,
     }
 }
 
@@ -2515,6 +2883,32 @@ impl WebModifiers for web_sys::TouchEvent {
     }
 }
 
+/// Where a pointer event landed on the canvas, in canvas pixels.
+#[cfg(target_arch = "wasm32")]
+fn canvas_point(canvas: &web_sys::HtmlCanvasElement, event: &web_sys::MouseEvent) -> (f64, f64) {
+    canvas_point_at(
+        canvas,
+        f64::from(event.client_x()),
+        f64::from(event.client_y()),
+    )
+}
+
+/// A page position on the canvas, in canvas pixels: the CSS offset from its
+/// corner, scaled by how much the canvas is stretched.
+#[cfg(target_arch = "wasm32")]
+fn canvas_point_at(
+    canvas: &web_sys::HtmlCanvasElement,
+    client_x: f64,
+    client_y: f64,
+) -> (f64, f64) {
+    let rect = canvas.get_bounding_client_rect();
+    let css_x = client_x - rect.left();
+    let css_y = client_y - rect.top();
+    let scale_x = canvas.width() as f64 / rect.width();
+    let scale_y = canvas.height() as f64 / rect.height();
+    (css_x * scale_x, css_y * scale_y)
+}
+
 #[cfg(target_arch = "wasm32")]
 fn translate_web_mouse_button(button: i16) -> MouseButton {
     match button {
@@ -2716,7 +3110,89 @@ fn translate_web_key(code: &str) -> Key {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use winit::dpi::LogicalSize;
     use winit::keyboard::{Key as WinitKey, NamedKey, SmolStr};
+
+    #[test]
+    fn the_pointer_leaving_and_entering_the_window_is_told() {
+        let window = winit::window::WindowId::dummy();
+        let device_id = winit::event::DeviceId::dummy();
+        collect_window_event(window, WinitWindowEvent::CursorLeft { device_id });
+        collect_window_event(window, WinitWindowEvent::CursorEntered { device_id });
+        let pending = PENDING_WINDOW_EVENTS
+            .with(|storage| storage.borrow_mut().remove(&window).unwrap_or_default());
+        let told: Vec<bool> = pending
+            .iter()
+            .filter_map(|event| match event {
+                PendingEvent::WindowEvent(WindowEvent::CursorEnter(inside)) => Some(*inside),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told, [false, true]);
+    }
+
+    #[test]
+    fn the_system_turning_dark_and_light_is_told() {
+        use winit::window::Theme;
+        let window = winit::window::WindowId::dummy();
+        collect_window_event(window, WinitWindowEvent::ThemeChanged(Theme::Dark));
+        collect_window_event(window, WinitWindowEvent::ThemeChanged(Theme::Light));
+        let pending = PENDING_WINDOW_EVENTS
+            .with(|storage| storage.borrow_mut().remove(&window).unwrap_or_default());
+        let told: Vec<bool> = pending
+            .iter()
+            .filter_map(|event| match event {
+                PendingEvent::WindowEvent(WindowEvent::DarkMode(dark)) => Some(*dark),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told, [true, false]);
+    }
+
+    #[test]
+    fn losing_focus_releases_every_held_key_and_button_once() {
+        let mut held = Held::default();
+        held.set_key(Key::W, Action::Press);
+        held.set_key(Key::LWin, Action::Press);
+        held.set_key(Key::A, Action::Press);
+        held.set_key(Key::A, Action::Release);
+        held.set_button(MouseButton::Button1, Action::Press);
+
+        let released = held.let_go();
+        assert_eq!(released.len(), 3, "{released:?}");
+        assert!(released.iter().all(|event| matches!(
+            event,
+            WindowEvent::Key(_, Action::Release, _)
+                | WindowEvent::MouseButton(_, Action::Release, _)
+        )));
+        assert_eq!(held.key(Key::W), Action::Release);
+        assert_eq!(held.key(Key::LWin), Action::Release);
+        assert_eq!(held.button(MouseButton::Button1), Action::Release);
+        assert!(
+            held.let_go().is_empty(),
+            "a second loss has nothing to release"
+        );
+    }
+
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[test]
+    fn a_window_too_big_for_its_monitor_restores_to_what_the_monitor_holds() {
+        let laptop = LogicalSize::new(1512.0, 982.0);
+        assert!(held_size(LogicalSize::new(1280.0, 800.0), laptop).is_none());
+        assert_eq!(
+            held_size(LogicalSize::new(1600.0, 1000.0), laptop),
+            Some(laptop)
+        );
+        assert_eq!(
+            held_size(LogicalSize::new(1400.0, 1080.0), laptop),
+            Some(LogicalSize::new(1400.0, 982.0)),
+            "only the side that does not fit is cut"
+        );
+        assert!(
+            held_size(LogicalSize::new(1600.0, 1000.0), LogicalSize::new(0.0, 0.0)).is_none(),
+            "a monitor that reports no size leaves the window as asked"
+        );
+    }
 
     fn char_events(events: &[PendingEvent]) -> Vec<char> {
         events
@@ -2728,10 +3204,30 @@ mod tests {
             .collect()
     }
 
+    /// A height first seen with the keyboard asked for borrows the bar's share
+    /// from the height before it, so a turn while typing is not all bar.
+    #[test]
+    fn a_rotation_while_typing_still_reads_the_keyboard() {
+        assert_eq!(android_keyboard(1920, 60), 0.0, "upright, the bar alone");
+        KEYBOARD_ASKED.with(|asked| asked.set(true));
+        assert_eq!(android_keyboard(1920, 660), 600.0);
+        assert_eq!(
+            android_keyboard(1080, 460),
+            400.0,
+            "turned with the keyboard up, the cover is not all bar"
+        );
+        KEYBOARD_ASKED.with(|asked| asked.set(false));
+        assert_eq!(android_keyboard(1080, 60), 0.0, "down again");
+        assert_eq!(
+            android_keyboard(1920, 660),
+            600.0,
+            "and the first height is remembered"
+        );
+    }
+
     /// The navigation bar covers the window whether or not the keyboard is up,
     /// so the first cover seen at a height is taken as the bar alone and only
-    /// what a later one adds is the keyboard. A rotation changes the height,
-    /// which starts the measurement again.
+    /// what a later one adds is the keyboard.
     #[test]
     fn the_android_keyboard_is_what_covers_more_than_the_navigation_bar() {
         // 1080-tall window whose navigation bar takes the bottom 60.
@@ -2760,6 +3256,28 @@ mod tests {
         }
     }
 
+    /// Android's Back has no physical code, only the logical `BrowserBack`:
+    /// it arrives as the back key all the same. A key with a code keeps it.
+    #[test]
+    fn a_key_with_no_code_arrives_as_what_it_means() {
+        let unnamed = PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Android(4));
+        assert_eq!(
+            pressed_key(unnamed, &WinitKey::Named(NamedKey::BrowserBack)),
+            Key::NavigateBackward
+        );
+        assert_eq!(
+            pressed_key(unnamed, &WinitKey::Named(NamedKey::Shift)),
+            Key::Unknown
+        );
+        assert_eq!(
+            pressed_key(
+                PhysicalKey::Code(KeyCode::KeyA),
+                &WinitKey::Named(NamedKey::BrowserBack)
+            ),
+            Key::A
+        );
+    }
+
     /// Both keys reach the event as themselves. Folding them into one command
     /// modifier is the egui layer's job, in `egui_modifiers`.
     #[test]
@@ -2769,6 +3287,35 @@ mod tests {
         assert!(translate_modifiers(ModifiersState::CONTROL).contains(Modifiers::Control));
         let web = web_modifiers(|key| key == "Meta" || key == "Shift");
         assert!(web.contains(Modifiers::Super) && web.contains(Modifiers::Shift));
+    }
+
+    #[test]
+    fn a_shortcut_types_no_letter_and_still_reaches_the_keys() {
+        for held in [
+            Modifiers::Super,
+            Modifiers::Control,
+            Modifiers::Super | Modifiers::Shift,
+        ] {
+            assert!(stamped(WindowEvent::Char('c'), held).is_none());
+            let key = stamped(
+                WindowEvent::Key(Key::C, Action::Press, Modifiers::empty()),
+                held,
+            );
+            assert!(matches!(
+                key,
+                Some(WindowEvent::Key(Key::C, Action::Press, mask)) if mask == held
+            ));
+        }
+    }
+
+    #[test]
+    fn shift_and_option_still_type() {
+        for held in [Modifiers::empty(), Modifiers::Shift, Modifiers::Alt] {
+            assert!(matches!(
+                stamped(WindowEvent::Char('c'), held),
+                Some(WindowEvent::Char('c'))
+            ));
+        }
     }
 
     // Regression test for https://github.com/dimforge/kiss3d/issues/380:
@@ -2832,5 +3379,53 @@ mod tests {
         let logical = WinitKey::Character(SmolStr::new("z"));
         let press = translate_keyboard_input(Key::Z, Action::Press, &logical, None);
         assert_eq!(char_events(&press), vec!['z']);
+    }
+}
+
+/// The canvas's size in device pixels from its own layout. Winit learns the
+/// size from a `ResizeObserver`, which the browser delivers only when it next
+/// paints the page, and `inner_size` is zero until then; a page it has not
+/// painted yet has laid the canvas out all the same. The first frames went
+/// to a 1 by 1 surface before this, and a browser given a 1 by 1 present had
+/// nothing to paint again, so a page nothing touched stayed on the clear
+/// colour until the pointer moved (2026-10-20).
+#[cfg(target_arch = "wasm32")]
+fn canvas_layout_size(window: &winit::window::Window) -> Option<winit::dpi::PhysicalSize<u32>> {
+    use winit::platform::web::WindowExtWebSys;
+    let canvas = window.canvas()?;
+    let scale = window.scale_factor();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let width = (f64::from(canvas.client_width()) * scale).round() as u32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let height = (f64::from(canvas.client_height()) * scale).round() as u32;
+    (width > 0 && height > 0).then_some(winit::dpi::PhysicalSize::new(width, height))
+}
+
+/// The device pixels the window's surface covers. iOS's `inner_size` is the
+/// safe area; the surface covers the whole window, which `outer_size` is.
+fn drawable_size(window: &winit::window::Window) -> winit::dpi::PhysicalSize<u32> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        measured_size(window)
+    }
+    #[cfg(target_os = "ios")]
+    {
+        window.outer_size()
+    }
+    #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
+    {
+        window.inner_size()
+    }
+}
+
+/// What winit says the window is, or what the canvas measures while winit has
+/// not heard from its observer yet.
+#[cfg(target_arch = "wasm32")]
+fn measured_size(window: &winit::window::Window) -> winit::dpi::PhysicalSize<u32> {
+    let size = window.inner_size();
+    if size.width > 0 && size.height > 0 {
+        size
+    } else {
+        canvas_layout_size(window).unwrap_or(size)
     }
 }

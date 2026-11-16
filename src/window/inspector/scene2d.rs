@@ -82,7 +82,7 @@ fn tree_ui_2d(
     };
 
     let children: Vec<SceneNode2d> = node.data().children().to_vec();
-    let id = egui::Id::new(node.ptr_id());
+    let id = egui::Id::unique(node.ptr_id());
     let mut state =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, is_root);
 

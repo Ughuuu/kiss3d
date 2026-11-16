@@ -460,12 +460,15 @@ impl OrbitCamera3d {
             super::Projection::Perspective => {
                 opengl::perspective(self.fov, aspect, self.znear, self.zfar)
             }
-            super::Projection::Orthographic => {
-                // Derive the orthographic half-height from the orbit distance and
-                // field of view so it frames the focus point like the perspective
-                // view at the same distance — and so scroll-zoom (which changes
-                // `dist`) keeps working.
-                let half_h = self.dist * (self.fov * 0.5).tan();
+            super::Projection::Orthographic { height } => {
+                // Without a height, derive the half-height from the orbit distance
+                // and field of view so it frames the focus point like the
+                // perspective view at the same distance, and scroll-zoom (which
+                // changes `dist`) keeps working.
+                let half_h = match height {
+                    Some(height) => height * 0.5,
+                    None => self.dist * (self.fov * 0.5).tan(),
+                };
                 let half_w = half_h * aspect;
                 // `orthographic_rh` maps depth to wgpu's [0, 1] clip range. The GL
                 // variant (`_rh_gl`, [-1, 1]) maps depth linearly, so everything
@@ -497,8 +500,9 @@ impl OrbitCamera3d {
     /// Sets the projection mode (perspective or orthographic).
     ///
     /// In [`Orthographic`](super::Projection::Orthographic) mode the view is a
-    /// parallel projection sized from the orbit distance and field of view, so
-    /// scroll-zoom still frames the focus point as expected.
+    /// parallel projection of the given height, or, without one, sized from the
+    /// orbit distance and field of view so scroll-zoom still frames the focus
+    /// point. The default is [`Perspective`](super::Projection::Perspective).
     #[inline]
     pub fn set_projection(&mut self, projection: super::Projection) {
         self.projection = projection;
@@ -614,4 +618,39 @@ impl Camera3d for OrbitCamera3d {
     }
 
     fn update(&mut self, _: &Canvas) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OrbitCamera3d;
+    use crate::camera::Projection;
+    use crate::color::Color;
+    use crate::scene::SceneNode3d;
+    use crate::test_gpu::{luma_at, on_gpu};
+    use glamx::Vec3;
+
+    #[test]
+    fn an_orthographic_height_fixes_the_frame_whatever_the_distance() {
+        on_gpu(64, 64, async |surface| {
+            let mut scene = SceneNode3d::empty();
+            scene
+                .add_cube(2.0, 2.0, 2.0)
+                .set_emissive(Color::new(4.0, 4.0, 4.0, 1.0));
+            let mut camera = OrbitCamera3d::new(Vec3::new(0.0, 0.0, 6.0), Vec3::ZERO);
+            camera.set_projection(Projection::Orthographic { height: Some(4.0) });
+            surface.render_3d(&mut scene, &mut camera).await;
+            // The cube spans the middle half of a 4-unit-high frame.
+            assert!(luma_at(surface, 32, 20) > 0.3);
+            assert!(luma_at(surface, 32, 12) < 0.1);
+
+            camera.look_at(Vec3::new(0.0, 0.0, 60.0), Vec3::ZERO);
+            surface.render_3d(&mut scene, &mut camera).await;
+            assert!(luma_at(surface, 32, 20) > 0.3);
+            assert!(luma_at(surface, 32, 12) < 0.1);
+
+            camera.set_projection(Projection::Orthographic { height: None });
+            surface.render_3d(&mut scene, &mut camera).await;
+            assert!(luma_at(surface, 32, 20) < 0.1);
+        });
+    }
 }

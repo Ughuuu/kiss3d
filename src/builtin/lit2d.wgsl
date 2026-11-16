@@ -4,10 +4,11 @@ import package::common::{unpack_mat2, unpack_mat3};
 // normal-mapped sprite reacts with per-pixel shading; without a normal map the
 // surface is flat (+Z) and lights contribute a smooth radial falloff.
 
-const MAX_LIGHTS: u32 = 16u;
+// Must match `MAX_LIGHTS_2D` in light2d.rs.
+const MAX_LIGHTS: u32 = 64u;
 
 struct Light {
-    // position.xy, height, kind (0 = point, 1 = spot)
+    // position.xy, height, kind (0 = point, 1 = spot, 2 = directional)
     pos_height: vec4<f32>,
     // color.rgb, intensity
     color_intensity: vec4<f32>,
@@ -121,21 +122,29 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     for (var i = 0u; i < count; i = i + 1u) {
         let light = frame.lights[i];
-        let radius = light.radius.x;
-        let to_light = vec3<f32>(light.pos_height.xy, light.pos_height.z) - frag;
-        let planar_dist = length(to_light.xy);
-        if (planar_dist >= radius) {
-            continue;
+        let kind = u32(light.pos_height.w + 0.5);
+        var l: vec3<f32>;
+        var atten = 1.0;
+        if (kind == 2u) {
+            // Directional: from far away, against its travel direction, at an
+            // elevation of `height` rise over run.
+            l = normalize(vec3<f32>(-light.dir_cone.xy, light.pos_height.z));
+        } else {
+            let radius = light.radius.x;
+            let to_light = vec3<f32>(light.pos_height.xy, light.pos_height.z) - frag;
+            let planar_dist = length(to_light.xy);
+            if (planar_dist >= radius) {
+                continue;
+            }
+            l = normalize(to_light);
+            // Smooth distance attenuation (quadratic falloff to zero at the radius).
+            atten = clamp(1.0 - planar_dist / radius, 0.0, 1.0);
+            atten = atten * atten;
         }
-        let l = normalize(to_light);
 
-        // Smooth distance attenuation (quadratic falloff to zero at the radius).
-        var atten = clamp(1.0 - planar_dist / radius, 0.0, 1.0);
-        atten = atten * atten;
-
-        // Spot cone factor (1 for point lights).
+        // Spot cone factor (1 for point and directional lights).
         var cone = 1.0;
-        if (light.pos_height.w > 0.5) {
+        if (kind == 1u) {
             let spot_dir = normalize(light.dir_cone.xy);
             let frag_dir = normalize(in.world - light.pos_height.xy);
             let cos_ang = dot(frag_dir, spot_dir);

@@ -1,11 +1,13 @@
 //! Drawing methods for 2D and 3D primitives.
 
+#[cfg(feature = "text")]
 use std::sync::Arc;
 
 use glamx::{Vec2, Vec3};
 
 use crate::color::Color;
 use crate::renderer::{Polyline2d, Polyline3d};
+#[cfg(feature = "text")]
 use crate::text::Font;
 
 use super::Window;
@@ -161,6 +163,7 @@ impl Window {
     /// * `scale` - The text scale factor
     /// * `font` - A reference to the font to use
     /// * `color` - RGBA color (each component from 0.0 to 1.0)
+    #[cfg(feature = "text")]
     #[inline]
     pub fn draw_text(&mut self, text: &str, pos: Vec2, scale: f32, font: &Arc<Font>, color: Color) {
         self.text_renderer.draw_text(text, pos, scale, font, color);
