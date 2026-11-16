@@ -424,7 +424,7 @@ pub(crate) fn collect_window_event(window_id: winit::window::WindowId, event: Wi
         }
         WinitWindowEvent::KeyboardInput { event, .. } => {
             let action = translate_action(event.state);
-            let key = translate_key(event.physical_key);
+            let key = pressed_key(event.physical_key, &event.logical_key);
             translate_keyboard_input(key, action, &event.logical_key, event.text.as_deref())
         }
         WinitWindowEvent::ModifiersChanged(new_modifiers) => {
@@ -2651,6 +2651,23 @@ fn translate_mouse_button(button: winit::event::MouseButton) -> MouseButton {
     }
 }
 
+/// The key a press names: its place on the keyboard, or what it means where
+/// the platform gives it no place. Android's Back has no physical code;
+/// winit names it only as the logical `BrowserBack`, and a script waiting for
+/// the back key would otherwise never hear it.
+#[cfg(not(target_arch = "wasm32"))]
+fn pressed_key(physical_key: PhysicalKey, logical_key: &winit::keyboard::Key) -> Key {
+    use winit::keyboard::{Key as WinitKey, NamedKey};
+    match translate_key(physical_key) {
+        Key::Unknown => match logical_key {
+            WinitKey::Named(NamedKey::BrowserBack) => Key::NavigateBackward,
+            WinitKey::Named(NamedKey::BrowserForward) => Key::NavigateForward,
+            _ => Key::Unknown,
+        },
+        key => key,
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn translate_key(physical_key: PhysicalKey) -> Key {
     if let PhysicalKey::Code(key_code) = physical_key {
@@ -3237,6 +3254,28 @@ mod tests {
             assert_eq!(translate_key(PhysicalKey::Code(code)), want);
             assert_eq!(translate_web_key(web), want);
         }
+    }
+
+    /// Android's Back has no physical code, only the logical `BrowserBack`:
+    /// it arrives as the back key all the same. A key with a code keeps it.
+    #[test]
+    fn a_key_with_no_code_arrives_as_what_it_means() {
+        let unnamed = PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Android(4));
+        assert_eq!(
+            pressed_key(unnamed, &WinitKey::Named(NamedKey::BrowserBack)),
+            Key::NavigateBackward
+        );
+        assert_eq!(
+            pressed_key(unnamed, &WinitKey::Named(NamedKey::Shift)),
+            Key::Unknown
+        );
+        assert_eq!(
+            pressed_key(
+                PhysicalKey::Code(KeyCode::KeyA),
+                &WinitKey::Named(NamedKey::BrowserBack)
+            ),
+            Key::A
+        );
     }
 
     /// Both keys reach the event as themselves. Folding them into one command
